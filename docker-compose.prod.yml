@@ -63,6 +63,9 @@ services:
       retries: 12
       start_period: 300s
     stop_grace_period: 30s
+    networks:
+      - default
+      - web
 
   celery:
     build:
@@ -117,3 +120,7 @@ services:
 volumes:
   chiroflow_postgres_data:
   chiroflow_redis_data:
+
+networks:
+  web:
+    external: true
