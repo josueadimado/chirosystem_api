@@ -1,52 +1,49 @@
-# ChiroFlow API — production stack (build image, no bind mounts).
-# Copy .env from .env.example, set secrets and ALLOWED_HOSTS / CSRF_TRUSTED_ORIGINS for your domain.
-#
-#   docker compose -f docker-compose.prod.yml --env-file .env up -d --build
-#
-# Important: we set DATABASE_URL in `environment` so it overrides any DATABASE_URL in .env
-# (dev URLs often use localhost — inside Docker the DB host must be `db`).
-
 services:
   db:
     image: postgres:16-alpine
     container_name: chiroflow-db
-    restart: always
+    restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-chiroflow}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-chiroflow_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - chiroflow_postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 10s
       timeout: 5s
       retries: 5
+    stop_grace_period: 30s
 
   redis:
     image: redis:7-alpine
     container_name: chiroflow-redis
-    restart: always
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - chiroflow_redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
+    stop_grace_period: 10s
 
   api:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: chiroflow-api
-    restart: always
+    restart: unless-stopped
     env_file:
       - .env
     environment:
-      DJANGO_SETTINGS_MODULE: config.settings
+      DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-config.settings}
       DEBUG: "false"
       POSTGRES_HOST: db
       POSTGRES_PORT: "5432"
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-chiroflow}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chiroflow_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-chiroflow}
       CELERY_BROKER_URL: redis://redis:6379/0
     command: >
       sh -c "python manage.py migrate --noinput &&
@@ -58,29 +55,29 @@ services:
       redis:
         condition: service_healthy
     ports:
-      - "${API_HOST_PORT:-8000}:8000"
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
     healthcheck:
-      # Gunicorn listens only after migrate + collectstatic finish (first deploy can be slow).
       test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1',8000)); s.close()"]
       interval: 15s
       timeout: 5s
       retries: 12
       start_period: 300s
+    stop_grace_period: 30s
 
   celery:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: chiroflow-celery
-    restart: always
+    restart: unless-stopped
     env_file:
       - .env
     environment:
-      DJANGO_SETTINGS_MODULE: config.settings
+      DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-config.settings}
       DEBUG: "false"
       POSTGRES_HOST: db
       POSTGRES_PORT: "5432"
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-chiroflow}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chiroflow_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-chiroflow}
       CELERY_BROKER_URL: redis://redis:6379/0
     command: celery -A config worker -l info
     depends_on:
@@ -90,21 +87,22 @@ services:
         condition: service_healthy
       api:
         condition: service_healthy
+    stop_grace_period: 30s
 
   celery-beat:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: chiroflow-celery-beat
-    restart: always
+    restart: unless-stopped
     env_file:
       - .env
     environment:
-      DJANGO_SETTINGS_MODULE: config.settings
+      DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-config.settings}
       DEBUG: "false"
       POSTGRES_HOST: db
       POSTGRES_PORT: "5432"
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-chiroflow}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chiroflow_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-chiroflow}
       CELERY_BROKER_URL: redis://redis:6379/0
     command: celery -A config beat -l info
     depends_on:
@@ -114,6 +112,8 @@ services:
         condition: service_healthy
       api:
         condition: service_healthy
+    stop_grace_period: 30s
 
 volumes:
-  postgres_data:
+  chiroflow_postgres_data:
+  chiroflow_redis_data:
