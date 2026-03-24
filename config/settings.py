@@ -1,13 +1,22 @@
 import os
 from datetime import timedelta
 from pathlib import Path
-
+import dj_database_url
 from celery.schedules import crontab
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-secret-key")
-DEBUG = os.getenv("DJANGO_DEBUG", "1") == "1"
-ALLOWED_HOSTS = os.getenv("DJANGO_ALLOWED_HOSTS", "*").split(",")
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "django-insecure-dev-change-in-production")
+DEBUG = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes")
+
+ALLOWED_HOSTS = [h.strip() for h in os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if h.strip()]
+CSRF_TRUSTED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get(
+        "CSRF_TRUSTED_ORIGINS",
+        "http://localhost:8000,http://127.0.0.1:8000,http://localhost:3000,http://127.0.0.1:3000",
+    ).split(",")
+    if o.strip()
+]
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -27,6 +36,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -55,15 +65,25 @@ TEMPLATES = [
 WSGI_APPLICATION = "config.wsgi.application"
 ASGI_APPLICATION = "config.asgi.application"
 
+# ---------------------------------------------------------
+# Database
+# ---------------------------------------------------------
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    DATABASE_URL = (
+        f"postgresql://{os.environ.get('POSTGRES_USER', 'postgres')}:"
+        f"{os.environ.get('POSTGRES_PASSWORD', 'postgres')}@"
+        f"{os.environ.get('POSTGRES_HOST', 'localhost')}:"
+        f"{os.environ.get('POSTGRES_PORT', '5432')}/"
+        f"{os.environ.get('POSTGRES_DB', 'chiroflow')}"
+    )
+
 DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": os.getenv("POSTGRES_DB", "chiroflow"),
-        "USER": os.getenv("POSTGRES_USER", "postgres"),
-        "PASSWORD": os.getenv("POSTGRES_PASSWORD", "postgres"),
-        "HOST": os.getenv("POSTGRES_HOST", "localhost"),
-        "PORT": os.getenv("POSTGRES_PORT", "5432"),
-    }
+    "default": dj_database_url.config(
+        default=DATABASE_URL,
+        conn_max_age=30,
+        conn_health_checks=True,
+    )
 }
 
 AUTH_USER_MODEL = "accounts.User"
@@ -93,6 +113,7 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = "static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 CORS_ALLOW_ALL_ORIGINS = True
@@ -147,3 +168,15 @@ SQUARE_CHECKOUT_SEND_CANCEL_URL = os.getenv("SQUARE_CHECKOUT_SEND_CANCEL_URL", "
     "true",
     "yes",
 )
+
+
+# ---------------------------------------------------------
+# CORS
+# ---------------------------------------------------------
+CORS_ALLOW_ALL_ORIGINS = DEBUG
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+] + ([o for o in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if o] if not DEBUG else [])

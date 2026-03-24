@@ -1,67 +1,113 @@
-# Production API stack — no source bind mounts, Gunicorn.
-# From this folder:
-#   docker compose -f docker-compose.prod.yml up --build -d
-# Set strong POSTGRES_PASSWORD, DJANGO_DEBUG=0, DJANGO_ALLOWED_HOSTS in .env before deploy.
+# ChiroFlow API — production stack (build image, no bind mounts).
+# Copy .env from .env.example, set secrets and ALLOWED_HOSTS / CSRF_TRUSTED_ORIGINS for your domain.
+#
+#   docker compose -f docker-compose.prod.yml --env-file .env up -d --build
 
 services:
   db:
-    image: postgres:16
-    restart: unless-stopped
+    image: postgres:16-alpine
+    container_name: chiroflow-db
+    restart: always
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-chiroflow}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     volumes:
-      - postgres_data_prod:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis:
-    image: redis:7
-    restart: unless-stopped
+    image: redis:7-alpine
+    container_name: chiroflow-redis
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    command: >
-      gunicorn config.wsgi:application
-      --bind 0.0.0.0:8000
-      --workers 2
-      --access-logfile -
-      --error-logfile -
-    ports:
-      - "8000:8000"
+    container_name: chiroflow-api
+    restart: always
     env_file:
       - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings
+      DEBUG: "false"
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      CELERY_BROKER_URL: redis://redis:6379/0
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py collectstatic --noinput &&
+             gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 120"
     depends_on:
-      - db
-      - redis
-    restart: unless-stopped
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${API_HOST_PORT:-8000}:8000"
+    healthcheck:
+      # Gunicorn listens only after migrate + collectstatic finish.
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1',8000)); s.close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
 
   celery:
     build:
       context: .
       dockerfile: Dockerfile
-    command: celery -A config worker -l info
+    container_name: chiroflow-celery
+    restart: always
     env_file:
       - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings
+      DEBUG: "false"
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      CELERY_BROKER_URL: redis://redis:6379/0
+    command: celery -A config worker -l info
     depends_on:
-      - db
-      - redis
-      - api
-    restart: unless-stopped
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
 
   celery-beat:
     build:
       context: .
       dockerfile: Dockerfile
-    command: celery -A config beat -l info
+    container_name: chiroflow-celery-beat
+    restart: always
     env_file:
       - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings
+      DEBUG: "false"
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      CELERY_BROKER_URL: redis://redis:6379/0
+    command: celery -A config beat -l info
     depends_on:
-      - db
-      - redis
-      - api
-    restart: unless-stopped
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
 
 volumes:
-  postgres_data_prod:
+  postgres_data:

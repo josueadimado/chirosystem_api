@@ -14,3 +14,5 @@ twilio>=9.0,<10.0
 google-api-python-client>=2.150,<3.0
 google-auth-oauthlib>=1.2,<2.0
 google-auth-httplib2>=0.2,<1.0
+dj-database-url>=2.1
+whitenoise>=6.0,<7.0
