@@ -28,8 +28,10 @@ services:
       context: .
       dockerfile: Dockerfile
     # Apply migrations on every start so the database schema never lags behind the code.
+    # Optional: set DJANGO_ADMIN_USERNAME + DJANGO_ADMIN_PASSWORD in .env to create/update admin on start.
     command: >
       sh -c "python manage.py migrate --noinput &&
+             if [ -n \"$$DJANGO_ADMIN_USERNAME\" ] && [ -n \"$$DJANGO_ADMIN_PASSWORD\" ]; then python manage.py create_admin_from_env; fi &&
              python manage.py runserver 0.0.0.0:8000"
     # Default host 8001 avoids clash with other apps using 8000. Inside the container the app still listens on 8000.
     # To use host port 8000 instead: API_HOST_PORT=8000 (and point the web app at http://localhost:8000/api/v1).
