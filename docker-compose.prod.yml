@@ -2,6 +2,9 @@
 # Copy .env from .env.example, set secrets and ALLOWED_HOSTS / CSRF_TRUSTED_ORIGINS for your domain.
 #
 #   docker compose -f docker-compose.prod.yml --env-file .env up -d --build
+#
+# Important: we set DATABASE_URL in `environment` so it overrides any DATABASE_URL in .env
+# (dev URLs often use localhost — inside Docker the DB host must be `db`).
 
 services:
   db:
@@ -43,6 +46,7 @@ services:
       DEBUG: "false"
       POSTGRES_HOST: db
       POSTGRES_PORT: "5432"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-chiroflow}
       CELERY_BROKER_URL: redis://redis:6379/0
     command: >
       sh -c "python manage.py migrate --noinput &&
@@ -56,12 +60,12 @@ services:
     ports:
       - "${API_HOST_PORT:-8000}:8000"
     healthcheck:
-      # Gunicorn listens only after migrate + collectstatic finish.
+      # Gunicorn listens only after migrate + collectstatic finish (first deploy can be slow).
       test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1',8000)); s.close()"]
       interval: 15s
       timeout: 5s
-      retries: 5
-      start_period: 120s
+      retries: 12
+      start_period: 300s
 
   celery:
     build:
@@ -76,6 +80,7 @@ services:
       DEBUG: "false"
       POSTGRES_HOST: db
       POSTGRES_PORT: "5432"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-chiroflow}
       CELERY_BROKER_URL: redis://redis:6379/0
     command: celery -A config worker -l info
     depends_on:
@@ -99,6 +104,7 @@ services:
       DEBUG: "false"
       POSTGRES_HOST: db
       POSTGRES_PORT: "5432"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-chiroflow}
       CELERY_BROKER_URL: redis://redis:6379/0
     command: celery -A config beat -l info
     depends_on:
