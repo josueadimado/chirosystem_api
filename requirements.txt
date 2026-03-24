@@ -1,0 +1,16 @@
+Django>=5.1,<6.0
+djangorestframework>=3.15
+djangorestframework-simplejwt>=5.3
+drf-spectacular>=0.27
+django-cors-headers>=4.4
+psycopg2-binary>=2.9
+celery>=5.4
+redis>=5.0
+python-dotenv>=1.0
+gunicorn>=22.0
+phonenumbers>=8.13
+squareup>=43,<45
+twilio>=9.0,<10.0
+google-api-python-client>=2.150,<3.0
+google-auth-oauthlib>=1.2,<2.0
+google-auth-httplib2>=0.2,<1.0

@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Secrets and local config (use .env.example as a template)
+.env
+.env.local
+*.pem
+
+# Django
+*.log
+local_settings.py
+db.sqlite3
+media/
+staticfiles/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,73 @@
+# Django API stack (dev) — run from this folder: docker compose up --build
+# Or from repo root: docker compose up (root file includes this + apps/web).
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: chiroflow
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    # Host 5433 avoids clash with Postgres.app / Homebrew Postgres on 5432. Inside Docker, api still uses db:5432.
+    # Use POSTGRES_HOST_PORT=5432 if nothing else uses 5432 on your Mac and you prefer the default port.
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    # Host 6380 avoids clash when another Redis (or old compose stack) already uses 6379 on your Mac.
+    # API/Celery still use hostname `redis` port 6379 inside Docker.
+    ports:
+      - "6380:6379"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Apply migrations on every start so the database schema never lags behind the code.
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py runserver 0.0.0.0:8000"
+    # Default host 8001 avoids clash with other apps using 8000. Inside the container the app still listens on 8000.
+    # To use host port 8000 instead: API_HOST_PORT=8000 (and point the web app at http://localhost:8000/api/v1).
+    ports:
+      - "${API_HOST_PORT:-8001}:8000"
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+      - redis
+
+  celery:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: celery -A config worker -l info
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    depends_on:
+      - api
+      - redis
+
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: celery -A config beat -l info
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    depends_on:
+      - api
+      - redis
+
+volumes:
+  postgres_data:
