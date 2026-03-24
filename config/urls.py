@@ -4,7 +4,7 @@ from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import TokenRefreshView
 
-from apps.accounts.views import AuthViewSet
+from apps.accounts.views import AuthViewSet, TeamViewSet
 from apps.clinic.square_webhook import square_webhook
 from apps.clinic.voice_views import twilio_voice_gather, twilio_voice_incoming
 from apps.clinic.views import (
@@ -25,6 +25,7 @@ from apps.clinic.views import (
 
 router = DefaultRouter()
 router.register("auth", AuthViewSet, basename="auth")
+router.register("team", TeamViewSet, basename="team")
 router.register("booking-options", BookingOptionsViewSet, basename="booking-options")
 router.register("doctor", DoctorViewSet, basename="doctor")
 router.register("patients", PatientViewSet, basename="patients")
