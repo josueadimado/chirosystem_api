@@ -62,6 +62,10 @@ class Provider(TimeStampedModel):
         help_text="Doctor/staff mobile for alerts (E.164 e.g. +15551234567). Leave blank to skip.",
     )
 
+    class Meta:
+        verbose_name = "Doctor"
+        verbose_name_plural = "Doctors"
+
     def __str__(self) -> str:
         return self.user.full_name or self.user.username
 
