@@ -22,6 +22,10 @@ env/
 # Django
 *.log
 local_settings.py
+# Celery Beat (local state; do not commit)
+celerybeat-schedule
+celerybeat-schedule.db
+
 db.sqlite3
 media/
 staticfiles/

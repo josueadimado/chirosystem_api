@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 from django.conf import settings
 from django.core.signing import TimestampSigner
 from django.db import transaction
-from django.db.models import Prefetch
+from django.db.models import Case, IntegerField, Prefetch, Value, When
 from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -207,9 +207,20 @@ class BookingOptionsViewSet(viewsets.ViewSet):
     permission_classes = [permissions.AllowAny]
 
     def list(self, request):
-        bookable = Service.objects.filter(is_active=True, show_in_public_booking=True)
+        bookable = (
+            Service.objects.filter(is_active=True, show_in_public_booking=True)
+            .annotate(
+                _book_order=Case(
+                    When(service_type=Service.ServiceType.CHIROPRACTIC, then=Value(0)),
+                    When(service_type=Service.ServiceType.MASSAGE, then=Value(1)),
+                    default=Value(2),
+                    output_field=IntegerField(),
+                )
+            )
+            .order_by("_book_order", "name")
+        )
         services = list(
-            bookable.order_by("name").values("id", "name", "duration_minutes", "price", "service_type")
+            bookable.values("id", "name", "duration_minutes", "price", "service_type")
         )
         providers_by_service = {}
         for svc in bookable.prefetch_related("providers"):

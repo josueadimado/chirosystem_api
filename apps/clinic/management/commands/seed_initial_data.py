@@ -61,7 +61,7 @@ class Command(BaseCommand):
         owner.save(update_fields=["password"])
 
         # Chiropractor: single provider; booking UI hides provider choice for chiropractic services.
-        chiro_username, chiro_name = ("dr_russel_mead", "Dr. Russel Mead")
+        chiro_username, chiro_name = ("dr_russel_mead", "Dr. Russell Mead")
         chiro_user, _ = User.objects.update_or_create(
             username=chiro_username,
             defaults={
@@ -87,6 +87,12 @@ class Command(BaseCommand):
         massage_accounts = [
             ("mrs_natalie_peck", "Mrs. Natalie Peck"),
         ]
+        # Legacy service titles from older seeds — rename in place so we don’t duplicate rows.
+        for old_name, new_name in (
+            ("Chiropractic initial visit", "Initial visit"),
+            ("Chiropractic appointment (follow-up)", "Chiropractic appointment"),
+        ):
+            Service.objects.filter(name=old_name).update(name=new_name)
         for username, full_name in massage_accounts:
             u, _ = User.objects.update_or_create(
                 username=username,
@@ -109,9 +115,10 @@ class Command(BaseCommand):
                 },
             )
 
+        # Public booking labels (editable later in Admin → Services & codes).
         chiropractic_services = [
-            ("Chiropractic initial visit", "98940", 60, "105.00"),
-            ("Chiropractic appointment (follow-up)", "98941", 30, "55.00"),
+            ("Initial visit", "98940", 60, "105.00"),
+            ("Chiropractic appointment", "98941", 30, "55.00"),
         ]
         massage_services = [
             ("30 minute massage", "97140", 30, "65.00"),
@@ -185,5 +192,5 @@ class Command(BaseCommand):
 
         self.stdout.write(self.style.SUCCESS("Seeding complete."))
         self.stdout.write("Owner login: owner_admin / Admin123!")
-        self.stdout.write("Chiropractor login: dr_russel_mead / Doctor123!")
+        self.stdout.write("Chiropractor login: dr_russel_mead / Doctor123!  (display name: Dr. Russell Mead)")
         self.stdout.write("Massage therapist login: mrs_natalie_peck / Doctor123!")

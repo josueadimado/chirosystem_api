@@ -9,11 +9,19 @@ SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "django-insecure-dev-change-in-
 DEBUG = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes")
 
 ALLOWED_HOSTS = [h.strip() for h in os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if h.strip()]
+# Next.js in Docker proxies to this API using hostname `api` or `host.docker.internal` — those must be allowed or Django returns 400.
+_docker_env = os.environ.get("DOCKER_ENV", "").lower() in ("1", "true", "yes")
+if _docker_env or os.environ.get("ALLOWED_HOSTS_ALLOW_DOCKER", "").lower() in ("1", "true", "yes"):
+    for _h in ("api", "web", "host.docker.internal"):
+        if _h not in ALLOWED_HOSTS:
+            ALLOWED_HOSTS.append(_h)
+
 CSRF_TRUSTED_ORIGINS = [
     o.strip()
     for o in os.environ.get(
         "CSRF_TRUSTED_ORIGINS",
-        "http://localhost:8000,http://127.0.0.1:8000,http://localhost:3000,http://127.0.0.1:3000",
+        "http://localhost:8000,http://127.0.0.1:8000,http://localhost:3000,http://127.0.0.1:3000,"
+        "http://localhost:3001,http://127.0.0.1:3001",
     ).split(",")
     if o.strip()
 ]
@@ -118,8 +126,13 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 CORS_ALLOW_ALL_ORIGINS = True
 
-CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
-CELERY_RESULT_BACKEND = CELERY_BROKER_URL
+# In Docker, use redis://redis:6379/0 (Compose service name). Many .env files set REDIS_URL only.
+CELERY_BROKER_URL = (
+    os.getenv("CELERY_BROKER_URL", "").strip()
+    or os.getenv("REDIS_URL", "").strip()
+    or "redis://localhost:6379/0"
+)
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "").strip() or CELERY_BROKER_URL
 # Used for “tomorrow” appointment SMS reminders and Celery Beat crontab
 CLINIC_TIMEZONE = os.getenv("CLINIC_TIMEZONE", "America/Detroit")
 CELERY_TIMEZONE = CLINIC_TIMEZONE

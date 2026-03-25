@@ -27,6 +27,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    environment:
+      # So Django allows Host: api when Next.js (same Compose network) proxies to http://api:8000.
+      DOCKER_ENV: "true"
+      # Override .env defaults so Celery/Django never use localhost:6379 inside a container.
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
     # Apply migrations on every start so the database schema never lags behind the code.
     # Optional: set DJANGO_ADMIN_USERNAME + DJANGO_ADMIN_PASSWORD in .env to create/update admin on start.
     command: >
@@ -50,6 +56,9 @@ services:
       context: .
       dockerfile: Dockerfile
     command: celery -A config worker -l info
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
     env_file:
       - .env
     volumes:
@@ -63,6 +72,9 @@ services:
       context: .
       dockerfile: Dockerfile
     command: celery -A config beat -l info
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
     env_file:
       - .env
     volumes:
