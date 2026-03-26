@@ -58,7 +58,7 @@ class Provider(TimeStampedModel):
         "Service",
         related_name="providers",
         blank=True,
-        help_text="Visit types this doctor appears under on online booking. In-room billing uses the full clinic service list.",
+        help_text="Visit types this doctor appears under on online booking. In-room billing uses active services allowed for their role (see each service's staff visibility).",
     )
     # SMS (Twilio) alerts: check-in, new bookings, schedule/status changes — same env as patient SMS
     notification_phone = models.CharField(
@@ -90,12 +90,29 @@ class Service(TimeStampedModel):
     is_active = models.BooleanField(default=True)
     # If False: still billable in the doctor visit UI, but hidden from public online booking.
     show_in_public_booking = models.BooleanField(default=True)
+    # In-room bill picker: which provider roles may add this line (owner/staff still see all in admin).
+    visible_to_chiropractic_staff = models.BooleanField(
+        default=True,
+        help_text="If True, chiropractic doctors see this service when completing a visit.",
+    )
+    visible_to_massage_staff = models.BooleanField(
+        default=True,
+        help_text="If True, massage therapists see this service when completing a visit.",
+    )
     service_type = models.CharField(
         max_length=20,
         choices=ServiceType.choices,
         default=ServiceType.CHIROPRACTIC,
         help_text="Chiropractic: one doctor assigned by admin, no choice. Massage: patient chooses from assigned providers.",
     )
+
+    def visible_for_primary_service_type(self, primary_service_type: str) -> bool:
+        """Whether this service may appear on the in-room bill for a provider with the given booking category."""
+        if primary_service_type == self.ServiceType.CHIROPRACTIC:
+            return self.visible_to_chiropractic_staff
+        if primary_service_type == self.ServiceType.MASSAGE:
+            return self.visible_to_massage_staff
+        return True
 
     def __str__(self) -> str:
         return self.name

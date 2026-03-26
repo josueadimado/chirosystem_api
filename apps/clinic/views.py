@@ -522,6 +522,21 @@ class ServiceViewSet(viewsets.ModelViewSet):
     serializer_class = ServiceSerializer
     permission_classes = [IsOwnerOrDoctor]
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        role = getattr(self.request.user, "role", None)
+        if role in ("owner_admin", "staff"):
+            return qs
+        if role == "doctor":
+            provider = Provider.objects.filter(user=self.request.user).first()
+            if not provider:
+                return qs.none()
+            if provider.primary_service_type == Service.ServiceType.CHIROPRACTIC:
+                return qs.filter(visible_to_chiropractic_staff=True)
+            if provider.primary_service_type == Service.ServiceType.MASSAGE:
+                return qs.filter(visible_to_massage_staff=True)
+        return qs
+
 
 class AppointmentViewSet(viewsets.ModelViewSet):
     queryset = _defer_patient_card_fields(
@@ -1541,6 +1556,16 @@ class DoctorViewSet(viewsets.ViewSet):
         rendered_payload = []
         for line in data["rendered_services"]:
             svc = Service.objects.get(pk=line["service_id"])
+            if not svc.is_active or not svc.visible_for_primary_service_type(provider.primary_service_type):
+                return Response(
+                    {
+                        "detail": (
+                            f'Service "{svc.name}" is not available for your provider type '
+                            "or is inactive. Refresh the visit page and pick from the allowed list."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             unit = line["unit_price"] if line.get("unit_price") is not None else svc.price
             rendered_payload.append(
                 {

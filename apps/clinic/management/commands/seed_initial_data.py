@@ -40,6 +40,16 @@ def _bill_only_rows():
     ]
 
 
+def _staff_visibility_for_bill_row(title: str) -> tuple[bool, bool]:
+    """(visible_to_chiropractic_staff, visible_to_massage_staff) for seeded bill-only rows."""
+    t = title.lower()
+    if "no show" in t and "chiropractic visit" in t:
+        return (True, False)
+    if "no show" in t and "min massage" in t:
+        return (False, True)
+    return (True, True)
+
+
 class Command(BaseCommand):
     help = "Seed initial doctors, services, and owner admin account."
 
@@ -160,6 +170,7 @@ class Command(BaseCommand):
             svc.providers.set(massage_providers)
 
         for code, title, desc, price, dur in _bill_only_rows():
+            vis_chiro, vis_massage = _staff_visibility_for_bill_row(title)
             svc, _ = Service.objects.update_or_create(
                 name=title,
                 defaults={
@@ -170,6 +181,8 @@ class Command(BaseCommand):
                     "is_active": True,
                     "show_in_public_booking": False,
                     "service_type": Service.ServiceType.CHIROPRACTIC,
+                    "visible_to_chiropractic_staff": vis_chiro,
+                    "visible_to_massage_staff": vis_massage,
                 },
             )
             # Bill-only lines: not linked to providers (still billable on any visit).
