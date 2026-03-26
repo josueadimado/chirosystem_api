@@ -30,6 +30,11 @@ def login_email_verification_enabled() -> bool:
 def should_send_login_otp(user: "User") -> bool:
     if not login_email_verification_enabled():
         return False
+    # Clinic owner/admin signs in with password only (no email code).
+    from .models import User as UserModel
+
+    if getattr(user, "role", None) == UserModel.Roles.OWNER_ADMIN:
+        return False
     email = (user.email or "").strip()
     if not email:
         return False

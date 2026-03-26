@@ -31,7 +31,8 @@ class AuthViewSet(viewsets.GenericViewSet):
     queryset = User.objects.all()
 
     def get_permissions(self):
-        if self.action in ("register", "login"):
+        # login_verify must be anonymous — user only has password + emailed code, no JWT yet.
+        if self.action in ("register", "login", "login_verify"):
             return [permissions.AllowAny()]
         return [permissions.IsAuthenticated()]
 
