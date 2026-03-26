@@ -65,6 +65,11 @@ from .google_calendar_sync import (
     exchange_oauth_code,
     google_oauth_configured,
 )
+from .square_pos import (
+    build_android_square_pos_intent,
+    build_ios_square_pos_url,
+    pos_callback_configured,
+)
 from .square_payment import (
     build_invoice_payment_followup_dict,
     create_terminal_checkout_for_invoice,
@@ -1608,6 +1613,61 @@ class DoctorViewSet(viewsets.ViewSet):
                 "device_id_configured": bool(dev),
             }
         )
+
+    @action(detail=False, methods=["get"], url_path="square_pos_config")
+    def square_pos_config(self, request):
+        """Whether Square POS (Stand + reader via Square POS app) launch URLs can be built."""
+        provider = self._get_provider(request)
+        if not provider:
+            return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
+        if not square_configured():
+            return Response({"detail": "Square is not configured."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return Response(
+            {
+                "pos_callback_configured": pos_callback_configured(),
+                "has_location": bool(get_location_id()),
+                "has_application_id": bool(get_application_id()),
+            }
+        )
+
+    @action(detail=False, methods=["get"], url_path="square_pos_launch")
+    def square_pos_launch(self, request):
+        """
+        Returns URLs to open Square Point of Sale on iPad/Android (tap/insert card on reader).
+        Register SQUARE_POS_CALLBACK_URL in .env and in Square Developer Console (POS web callback).
+        """
+        provider = self._get_provider(request)
+        if not provider:
+            return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
+        if not square_configured():
+            return Response({"detail": "Square is not configured."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        if not pos_callback_configured():
+            return Response(
+                {"detail": "Square POS callback URL is not configured (SQUARE_POS_CALLBACK_URL)."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        ser = TerminalCheckoutSerializer(data={"invoice_id": request.query_params.get("invoice_id")})
+        ser.is_valid(raise_exception=True)
+        inv = (
+            Invoice.objects.select_related("appointment")
+            .filter(pk=ser.validated_data["invoice_id"])
+            .first()
+        )
+        if not inv:
+            return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
+        if inv.appointment.provider_id != provider.id:
+            return Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
+        if inv.status != Invoice.Status.ISSUED:
+            return Response(
+                {"detail": "Invoice is not awaiting payment."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            ios_url = build_ios_square_pos_url(inv)
+            android_intent = build_android_square_pos_intent(inv)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"ios_url": ios_url, "android_intent_url": android_intent})
 
     @action(detail=False, methods=["post"], url_path="terminal_checkout")
     def terminal_checkout(self, request):

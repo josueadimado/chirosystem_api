@@ -49,6 +49,7 @@ class ProviderSerializer(serializers.ModelSerializer):
             "provider_name",
             "title",
             "specialty",
+            "primary_service_type",
             "active",
             "notification_phone",
             "services",
@@ -122,6 +123,13 @@ class ProviderSerializer(serializers.ModelSerializer):
         provider = Provider.objects.create(**validated_data)
         if services is not None:
             provider.services.set(services)
+        else:
+            from apps.accounts.team_helpers import ensure_provider_for_doctor
+
+            ensure_provider_for_doctor(
+                provider.user,
+                primary_service_type=provider.primary_service_type,
+            )
         return provider
 
     def update(self, instance, validated_data):

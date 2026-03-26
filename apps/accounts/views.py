@@ -1,18 +1,30 @@
+import logging
+
 from django.db import transaction
 from rest_framework import filters, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 
+from .login_email_otp import (
+    create_login_challenge,
+    mask_email,
+    send_login_code_email,
+    should_send_login_otp,
+    verify_login_challenge,
+)
 from .models import User
 from .permissions import IsOwnerAdmin
 from .serializers import (
     ClinicTeamMemberSerializer,
+    LoginVerifySerializer,
     RegisterSerializer,
     RoleTokenSerializer,
     UserSerializer,
 )
 from .team_helpers import set_provider_inactive
+
+logger = logging.getLogger(__name__)
 
 
 class AuthViewSet(viewsets.GenericViewSet):
@@ -35,9 +47,54 @@ class AuthViewSet(viewsets.GenericViewSet):
         serializer = RoleTokenSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.user
+        if should_send_login_otp(user):
+            try:
+                vtoken, code = create_login_challenge(user)
+                send_login_code_email(user=user, code=code)
+            except Exception:
+                logger.exception("Failed to send login verification email for user %s", user.pk)
+                return Response(
+                    {"detail": "Could not send verification email. Check EMAIL_* settings on the server."},
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+            return Response(
+                {
+                    "verification_required": True,
+                    "email_masked": mask_email(user.email),
+                    "verification_token": vtoken,
+                },
+                status=status.HTTP_200_OK,
+            )
         return Response(
             {
                 **serializer.validated_data,
+                "user": UserSerializer(user).data,
+            }
+        )
+
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="login/verify",
+        permission_classes=[permissions.AllowAny],
+    )
+    def login_verify(self, request):
+        ser = LoginVerifySerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        user = verify_login_challenge(
+            ser.validated_data["verification_token"],
+            ser.validated_data["code"],
+        )
+        if not user:
+            return Response(
+                {"detail": "Invalid or expired code. Request a new code by signing in again."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        refresh = RoleTokenSerializer.get_token(user)
+        return Response(
+            {
+                "refresh": str(refresh),
+                "access": str(refresh.access_token),
                 "user": UserSerializer(user).data,
             }
         )

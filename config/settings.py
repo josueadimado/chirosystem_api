@@ -124,8 +124,6 @@ STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-CORS_ALLOW_ALL_ORIGINS = True
-
 # In Docker, use redis://redis:6379/0 (Compose service name). Many .env files set REDIS_URL only.
 CELERY_BROKER_URL = (
     os.getenv("CELERY_BROKER_URL", "").strip()
@@ -175,12 +173,27 @@ SQUARE_WEBHOOK_SIGNATURE_KEY = os.getenv("SQUARE_WEBHOOK_SIGNATURE_KEY", "").str
 SQUARE_WEBHOOK_NOTIFICATION_URL = os.getenv("SQUARE_WEBHOOK_NOTIFICATION_URL", "").strip()
 # Used for Square payment link redirect (no trailing slash)
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3001")
+# Point of Sale API (iPad/Android): must match Web callback URL in Square Developer Console exactly (usually https://<api>/api/v1/square/pos-callback/)
+SQUARE_POS_CALLBACK_URL = os.getenv("SQUARE_POS_CALLBACK_URL", "").strip()
 # If Square adds cancel_url to CheckoutOptions, set to true to send it (default off — avoids API errors)
 SQUARE_CHECKOUT_SEND_CANCEL_URL = os.getenv("SQUARE_CHECKOUT_SEND_CANCEL_URL", "").strip().lower() in (
     "1",
     "true",
     "yes",
 )
+
+# Email (login verification codes, optional other mail)
+EMAIL_HOST = os.environ.get("EMAIL_HOST", "").strip()
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "587") or "587")
+EMAIL_USE_TLS = os.environ.get("EMAIL_USE_TLS", "true").lower() in ("1", "true", "yes")
+EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "").strip()
+EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "").strip()
+DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "noreply@localhost").strip()
+SERVER_EMAIL = DEFAULT_FROM_EMAIL
+if EMAIL_HOST:
+    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+else:
+    EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
 
 
 # ---------------------------------------------------------

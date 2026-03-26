@@ -11,6 +11,7 @@ class UserAdmin(DjangoUserAdmin):
     list_display = (
         "username",
         "email",
+        "phone",
         "full_name",
         "role",
         "is_active",
@@ -26,7 +27,7 @@ class UserAdmin(DjangoUserAdmin):
         (None, {"fields": ("username", "password")}),
         (
             "Personal",
-            {"fields": ("email", "full_name", "first_name", "last_name")},
+            {"fields": ("email", "full_name", "phone", "first_name", "last_name")},
         ),
         ("Clinic", {"fields": ("role",)}),
         (

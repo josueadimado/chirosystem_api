@@ -5,6 +5,7 @@ from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import TokenRefreshView
 
 from apps.accounts.views import AuthViewSet, TeamViewSet
+from apps.clinic.square_pos_callback import square_pos_callback
 from apps.clinic.square_webhook import square_webhook
 from apps.clinic.voice_views import twilio_voice_gather, twilio_voice_incoming
 from apps.clinic.views import (
@@ -47,6 +48,7 @@ router.register("admin", AdminViewSet, basename="admin")
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/v1/square/webhook/", square_webhook, name="square-webhook"),
+    path("api/v1/square/pos-callback/", square_pos_callback, name="square-pos-callback"),
     path("api/v1/voice/twilio/incoming/", twilio_voice_incoming, name="twilio_voice_incoming"),
     path("api/v1/voice/twilio/gather/", twilio_voice_gather, name="twilio_voice_gather"),
     path("api/v1/schema/", SpectacularAPIView.as_view(), name="schema"),

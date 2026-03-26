@@ -39,7 +39,7 @@ class ProviderAdmin(admin.ModelAdmin):
     readonly_fields = ("created_at", "updated_at")
     fieldsets = (
         (None, {"fields": ("user", "active")}),
-        ("Profile", {"fields": ("title", "specialty", "notification_phone")}),
+        ("Profile", {"fields": ("title", "specialty", "primary_service_type", "notification_phone")}),
         (
             "Google Calendar",
             {

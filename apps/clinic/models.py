@@ -37,6 +37,12 @@ class Provider(TimeStampedModel):
     title = models.CharField(max_length=100, blank=True)
     specialty = models.CharField(max_length=100, blank=True)
     active = models.BooleanField(default=True)
+    primary_service_type = models.CharField(
+        max_length=20,
+        choices=[("chiropractic", "Chiropractic"), ("massage", "Massage")],
+        default="chiropractic",
+        help_text="Default online booking category: chiropractic vs massage visit types.",
+    )
     # Personal Google Calendar (OAuth) — each doctor connects their own account
     google_refresh_token = models.TextField(
         blank=True, help_text="OAuth refresh token for personal Google Calendar"
