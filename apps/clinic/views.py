@@ -1031,6 +1031,16 @@ class AdminViewSet(viewsets.ViewSet):
             "business_hours": list(solo.business_hours or []),
         })
 
+    @action(detail=False, methods=["get"], url_path="payment_connection_status")
+    def payment_connection_status(self, request):
+        """Owner/staff: whether Square env vars look right + optional live API ping (no secrets returned)."""
+        denied = self._admin_staff_only(request)
+        if denied:
+            return denied
+        from .square_helpers import get_square_payment_status_for_admin
+
+        return Response(get_square_payment_status_for_admin())
+
     @action(detail=False, methods=["get"], url_path="billing_invoices")
     def billing_invoices(self, request):
         """Invoices for admin billing UI (patient name + totals)."""
