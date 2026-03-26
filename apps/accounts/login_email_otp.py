@@ -81,14 +81,16 @@ def verify_login_challenge(verification_token: str, code: str) -> "User | None":
     except signing.BadSignature:
         return None
     uid = data.get("uid")
-    if not isinstance(uid, int):
+    try:
+        uid_int = int(uid)
+    except (TypeError, ValueError):
         return None
-    cached = cache.get(f"{_CACHE_PREFIX}{uid}")
+    cached = cache.get(f"{_CACHE_PREFIX}{uid_int}")
     if not cached or (code or "").strip() != str(cached).strip():
         return None
-    cache.delete(f"{_CACHE_PREFIX}{uid}")
+    cache.delete(f"{_CACHE_PREFIX}{uid_int}")
     try:
-        return User.objects.get(pk=uid, is_active=True)
+        return User.objects.get(pk=uid_int, is_active=True)
     except User.DoesNotExist:
         return None
 

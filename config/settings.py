@@ -125,12 +125,29 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # In Docker, use redis://redis:6379/0 (Compose service name). Many .env files set REDIS_URL only.
-CELERY_BROKER_URL = (
-    os.getenv("CELERY_BROKER_URL", "").strip()
-    or os.getenv("REDIS_URL", "").strip()
-    or "redis://localhost:6379/0"
-)
+_REDIS_URL_RAW = os.getenv("REDIS_URL", "").strip()
+_CELERY_BROKER_RAW = os.getenv("CELERY_BROKER_URL", "").strip()
+CELERY_BROKER_URL = _CELERY_BROKER_RAW or _REDIS_URL_RAW or "redis://localhost:6379/0"
 CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "").strip() or CELERY_BROKER_URL
+
+# Django cache: login email OTP, webhook dedupe, voice rate limits. LocMem is NOT shared between
+# Gunicorn/uWSGI workers — OTP set on worker A is invisible to verify on worker B → “invalid code”.
+# When Redis is explicitly configured (env or Docker Compose CELERY_BROKER_URL), use it for cache.
+_CACHE_REDIS_URL = os.getenv("CACHE_REDIS_URL", "").strip() or _REDIS_URL_RAW or _CELERY_BROKER_RAW
+if _CACHE_REDIS_URL:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": _CACHE_REDIS_URL,
+        }
+    }
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "chiroflow",
+        }
+    }
 # Used for “tomorrow” appointment SMS reminders and Celery Beat crontab
 CLINIC_TIMEZONE = os.getenv("CLINIC_TIMEZONE", "America/Detroit")
 CELERY_TIMEZONE = CLINIC_TIMEZONE
