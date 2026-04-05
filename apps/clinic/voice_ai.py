@@ -46,6 +46,40 @@ def _booking_catalog_json() -> dict[str, Any]:
     return {"services": services, "providers_by_service": providers_by_service}
 
 
+def openai_extract_field(transcript: str, *, field: str, instruction: str) -> dict[str, Any] | None:
+    """Lightweight OpenAI call to extract a single field from speech. Returns parsed JSON dict or None."""
+    key = getattr(settings, "OPENAI_API_KEY", "") or ""
+    if not key.strip():
+        return None
+
+    body = json.dumps(
+        {
+            "model": getattr(settings, "OPENAI_VOICE_MODEL", "gpt-4o-mini"),
+            "messages": [
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": transcript},
+            ],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.1,
+        }
+    ).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=body,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+        content = raw["choices"][0]["message"]["content"]
+        return json.loads(content)
+    except Exception as e:
+        logger.warning("OpenAI extract_field (%s) failed: %s", field, e)
+        return None
+
+
 def openai_parse_booking_intent(*, transcript: str, today_iso: str, catalog: dict[str, Any]) -> dict[str, Any] | None:
     """Call OpenAI; return parsed JSON dict or None on failure."""
     key = getattr(settings, "OPENAI_API_KEY", "") or ""

@@ -1,6 +1,13 @@
 """
 Twilio Programmable Voice webhooks for AI-assisted phone booking.
 
+Multi-step conversational flow:
+  1. Greeting → ask name
+  2. Confirm name → list services → ask choice
+  3. If multiple providers → ask which one (skip if only one)
+  4. Ask date and time
+  5. Confirm everything → book
+
 Configure your Twilio phone number "A call comes in" webhook to POST to:
   {TWILIO_VOICE_PUBLIC_BASE_URL}/api/v1/voice/twilio/incoming/
 
@@ -9,6 +16,7 @@ Requires: TWILIO_AUTH_TOKEN (signature validation), OPENAI_API_KEY (speech → b
 
 from __future__ import annotations
 
+import json
 import logging
 from xml.sax.saxutils import escape
 
@@ -25,11 +33,18 @@ from zoneinfo import ZoneInfo
 from .models import ClinicSettings, VoiceCallLog
 from .public_booking_service import create_appointment_from_public_booking
 from .serializers import PublicBookingSerializer
-from .voice_ai import _booking_catalog_json, intent_to_booking_payload, openai_parse_booking_intent
+from .voice_ai import (
+    _booking_catalog_json,
+    openai_extract_field,
+)
 from .voice_logging import upsert_voice_call_log
 
 logger = logging.getLogger(__name__)
 
+CONV_TTL = 900  # 15-minute conversation timeout
+
+
+# ─── Helpers ───────────────────────────────────────────────────────────
 
 def _voice_absolute_url(request, named_route: str) -> str:
     path = reverse(named_route)
@@ -62,41 +77,64 @@ def _say(text: str) -> str:
     return f'<Say voice="Polly.Joanna">{escape(text)}</Say>'
 
 
-def _gather_followup(request, prompt: str) -> HttpResponse:
+def _gather_speech(request, prompt: str, *, hint: str = "") -> HttpResponse:
+    """Return TwiML that says a prompt then listens for speech."""
     action = _voice_absolute_url(request, "twilio_voice_gather").replace("&", "&amp;")
+    hints_attr = f' hints="{escape(hint)}"' if hint else ""
     inner = (
         _say(prompt)
-        + f'<Gather input="speech" action="{action}" method="POST" speechTimeout="auto" language="en-US">'
-        + _say("Go ahead.")
+        + f'<Gather input="speech" action="{action}" method="POST" '
+        f'speechTimeout="auto" language="en-US"{hints_attr}>'
+        + _say("Go ahead, I'm listening.")
         + "</Gather>"
-        + _say("Goodbye.")
+        + _say("I didn't catch that. Please call back when you're ready. Goodbye.")
     )
     return _twiml_response(inner)
 
 
-def _retry_or_goodbye(
-    request,
-    call_sid: str,
-    prompt: str,
-    *,
-    from_num: str = "",
-    abandon_outcome: str = VoiceCallLog.Outcome.ABANDONED_RETRIES,
-    abandon_detail: str = "",
-) -> HttpResponse:
-    key = f"voice_gather_retry:{call_sid}"
-    n = cache.get(key, 0)
-    if n >= 2:
-        cache.delete(key)
-        upsert_voice_call_log(
-            call_sid=call_sid,
-            from_number=from_num,
-            outcome=abandon_outcome,
-            detail=(abandon_detail or prompt)[:2000],
-        )
-        return _twiml_response(_say("Please call back later or book online. Goodbye."))
-    cache.set(key, int(n) + 1, 600)
-    return _gather_followup(request, prompt)
+def _conv_key(call_sid: str) -> str:
+    return f"voice_conv:{call_sid}"
 
+
+def _get_conv(call_sid: str) -> dict:
+    return cache.get(_conv_key(call_sid)) or {"step": "name", "retries": 0}
+
+
+def _set_conv(call_sid: str, data: dict):
+    cache.set(_conv_key(call_sid), data, CONV_TTL)
+
+
+def _clear_conv(call_sid: str):
+    cache.delete(_conv_key(call_sid))
+
+
+def _format_service_list(catalog: dict) -> str:
+    """Build a spoken list of service categories and names."""
+    services = catalog.get("services") or []
+    chiro = [s for s in services if s.get("service_type") == "chiropractic"]
+    massage = [s for s in services if s.get("service_type") == "massage"]
+
+    parts = []
+    if chiro:
+        names = ", ".join(s["name"] for s in chiro)
+        parts.append(f"For chiropractic, we have: {names}")
+    if massage:
+        names = ", ".join(s["name"] for s in massage)
+        parts.append(f"For massage, we have: {names}")
+    if not parts:
+        names = ", ".join(s["name"] for s in services)
+        parts.append(f"We offer: {names}")
+    return ". ".join(parts)
+
+
+def _format_provider_list(providers: list[dict]) -> str:
+    if len(providers) <= 2:
+        return " or ".join(p["provider_name"] for p in providers)
+    names = ", ".join(p["provider_name"] for p in providers[:-1])
+    return f"{names}, or {providers[-1]['provider_name']}"
+
+
+# ─── Incoming call (step 0) ────────────────────────────────────────────
 
 @csrf_exempt
 @require_POST
@@ -108,20 +146,19 @@ def twilio_voice_incoming(request):
     from_num = (request.POST.get("From") or "").strip()
     upsert_voice_call_log(call_sid=call_sid, from_number=from_num, outcome=VoiceCallLog.Outcome.PROMPTED)
 
+    _set_conv(call_sid, {"step": "name", "retries": 0, "from_num": from_num})
+
     clinic = ClinicSettings.get_solo()
     cn = escape(clinic.clinic_name)
-    action = _voice_absolute_url(request, "twilio_voice_gather").replace("&", "&amp;")
-    inner = (
-        f'<Say voice="Polly.Joanna">Thank you for calling {cn}. '
-        "After the tone, say your first and last name, the type of visit, the date, and time. "
-        "For example: Jane Doe, sixty minute massage, March twenty second at two thirty P M.</Say>"
-        f'<Gather input="speech" action="{action}" method="POST" speechTimeout="auto" language="en-US">'
-        + _say("Whenever you are ready.")
-        + "</Gather>"
-        + _say("I did not hear anything. Please call again. Goodbye.")
+    prompt = (
+        f"Thank you for calling {cn}! "
+        "I'd be happy to help you book an appointment. "
+        "May I have your first and last name, please?"
     )
-    return _twiml_response(inner)
+    return _gather_speech(request, prompt)
 
+
+# ─── Gather handler (routes based on conversation step) ────────────────
 
 @csrf_exempt
 @require_POST
@@ -148,95 +185,391 @@ def twilio_voice_gather(request):
             )
         )
 
-    if not speech:
-        return _retry_or_goodbye(
-            request,
-            call_sid,
-            "I did not catch that. Please say your first and last name, the service, date, and time.",
-            from_num=from_num,
-            abandon_outcome=VoiceCallLog.Outcome.EMPTY_SPEECH,
-            abandon_detail="No speech after retries",
-        )
+    conv = _get_conv(call_sid)
+    if from_num:
+        conv["from_num"] = from_num
 
+    if not speech:
+        conv["retries"] = conv.get("retries", 0) + 1
+        if conv["retries"] >= 3:
+            _clear_conv(call_sid)
+            upsert_voice_call_log(
+                call_sid=call_sid, from_number=from_num,
+                outcome=VoiceCallLog.Outcome.EMPTY_SPEECH,
+                detail="No speech after retries",
+            )
+            return _twiml_response(_say("I didn't hear anything. Please call back when you're ready. Goodbye."))
+        _set_conv(call_sid, conv)
+        return _gather_speech(request, "Sorry, I didn't catch that. Could you please repeat?")
+
+    conv["retries"] = 0
     upsert_voice_call_log(call_sid=call_sid, from_number=from_num, transcript=speech)
 
-    tz_name = getattr(settings, "CLINIC_TIMEZONE", "America/Detroit")
-    today = timezone.now().astimezone(ZoneInfo(tz_name)).date().isoformat()
+    step = conv.get("step", "name")
+    handler = {
+        "name": _handle_name_step,
+        "service": _handle_service_step,
+        "provider": _handle_provider_step,
+        "datetime": _handle_datetime_step,
+        "confirm": _handle_confirm_step,
+    }.get(step, _handle_name_step)
+
+    return handler(request, call_sid, from_num, speech, conv)
+
+
+# ─── Step handlers ─────────────────────────────────────────────────────
+
+def _handle_name_step(request, call_sid, from_num, speech, conv):
+    result = openai_extract_field(
+        speech,
+        field="name",
+        instruction='Extract first_name and last_name from what the caller said. Return JSON: {"first_name": "...", "last_name": "..."}. If you only hear one name, put it in first_name and leave last_name empty.',
+    )
+    fn = (result.get("first_name") or "").strip() if result else ""
+    ln = (result.get("last_name") or "").strip() if result else ""
+
+    if not fn:
+        conv["retries"] = conv.get("retries", 0) + 1
+        if conv["retries"] >= 3:
+            _clear_conv(call_sid)
+            upsert_voice_call_log(
+                call_sid=call_sid, from_number=from_num,
+                outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES,
+                detail="Could not get name",
+            )
+            return _twiml_response(_say("I'm having trouble hearing your name. Please try again later or book online. Goodbye."))
+        _set_conv(call_sid, conv)
+        return _gather_speech(request, "I didn't quite get that. Could you say your first and last name again?")
+
+    conv["first_name"] = fn
+    conv["last_name"] = ln
+    conv["step"] = "service"
+    conv["retries"] = 0
+
     catalog = _booking_catalog_json()
-    intent = openai_parse_booking_intent(transcript=speech, today_iso=today, catalog=catalog)
-    if not intent:
-        return _retry_or_goodbye(
+    conv["_catalog"] = catalog
+    _set_conv(call_sid, conv)
+
+    name_display = f"{fn} {ln}".strip()
+    service_list = _format_service_list(catalog)
+    prompt = (
+        f"Nice to meet you, {name_display}! "
+        f"{service_list}. "
+        "Which service would you like to book?"
+    )
+    hints = ", ".join(s["name"] for s in catalog.get("services", []))
+    return _gather_speech(request, prompt, hint=hints)
+
+
+def _handle_service_step(request, call_sid, from_num, speech, conv):
+    catalog = conv.get("_catalog") or _booking_catalog_json()
+    services = catalog.get("services") or []
+    service_names = [s["name"] for s in services]
+
+    result = openai_extract_field(
+        speech,
+        field="service",
+        instruction=(
+            f'The caller is choosing a service. Available services: {json.dumps(service_names)}. '
+            'Return JSON: {"service_name": "exact service name from the list"}. '
+            'Match the closest service to what they said.'
+        ),
+    )
+    chosen_name = (result.get("service_name") or "").strip().lower() if result else ""
+
+    matched = None
+    for s in services:
+        if s["name"].lower() == chosen_name:
+            matched = s
+            break
+    if not matched:
+        for s in services:
+            if chosen_name and (chosen_name in s["name"].lower() or s["name"].lower() in chosen_name):
+                matched = s
+                break
+    if not matched and chosen_name:
+        for s in services:
+            if any(w in s["name"].lower() for w in chosen_name.split() if len(w) > 3):
+                matched = s
+                break
+
+    if not matched:
+        conv["retries"] = conv.get("retries", 0) + 1
+        if conv["retries"] >= 3:
+            _clear_conv(call_sid)
+            upsert_voice_call_log(
+                call_sid=call_sid, from_number=from_num,
+                outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES,
+                detail="Could not match service",
+            )
+            return _twiml_response(_say("I'm having trouble finding that service. Please book online or call the front desk. Goodbye."))
+        _set_conv(call_sid, conv)
+        service_list = _format_service_list(catalog)
+        return _gather_speech(
             request,
-            call_sid,
-            "Sorry, I could not understand. Please repeat a little slower.",
-            from_num=from_num,
-            abandon_outcome=VoiceCallLog.Outcome.OPENAI_FAILED,
-            abandon_detail="OpenAI returned no parseable JSON",
+            f"I didn't find that one. Let me repeat: {service_list}. Which would you like?",
+            hint=", ".join(service_names),
         )
 
-    payload, err = intent_to_booking_payload(intent, caller_e164=from_num, catalog=catalog)
-    err_msgs = {
-        "missing_name": "Please say your first and last name clearly.",
-        "missing_service": "Which visit type do you want? For example initial visit or massage.",
-        "missing_provider": "Which therapist would you like? Say their name.",
-        "bad_date": "What date works for you?",
-        "bad_time": "What time would you like?",
-    }
-    if err:
-        if err in err_msgs:
-            return _retry_or_goodbye(
-                request,
-                call_sid,
-                err_msgs[err],
-                from_num=from_num,
-                abandon_outcome=VoiceCallLog.Outcome.INTENT_INCOMPLETE,
-                abandon_detail=err,
-            )
-        upsert_voice_call_log(
-            call_sid=call_sid,
-            from_number=from_num,
-            transcript=speech,
-            outcome=VoiceCallLog.Outcome.INTENT_INCOMPLETE,
-            detail=err[:2000],
+    conv["service_id"] = matched["id"]
+    conv["service_name"] = matched["name"]
+    conv["service_duration"] = matched["duration_minutes"]
+    conv["service_price"] = matched["price"]
+    conv["retries"] = 0
+
+    pbs = catalog.get("providers_by_service") or {}
+    providers = pbs.get(matched["id"]) or []
+
+    if len(providers) > 1:
+        conv["step"] = "provider"
+        conv["_providers"] = providers
+        _set_conv(call_sid, conv)
+        plist = _format_provider_list(providers)
+        prompt = (
+            f"Great choice! For {matched['name']}, we have {plist}. "
+            "Who would you prefer?"
         )
-        return _twiml_response(_say(f"Sorry, {err} Goodbye."))
+        hints = ", ".join(p["provider_name"] for p in providers)
+        return _gather_speech(request, prompt, hint=hints)
+    elif len(providers) == 1:
+        conv["provider_id"] = providers[0]["id"]
+        conv["provider_name"] = providers[0]["provider_name"]
+    conv["step"] = "datetime"
+    _set_conv(call_sid, conv)
+    return _gather_speech(
+        request,
+        f"When would you like to come in for your {matched['name']}? "
+        "Please say the date and time, like next Tuesday at 2:30 PM.",
+    )
+
+
+def _handle_provider_step(request, call_sid, from_num, speech, conv):
+    providers = conv.get("_providers") or []
+    provider_names = [p["provider_name"] for p in providers]
+
+    result = openai_extract_field(
+        speech,
+        field="provider",
+        instruction=(
+            f'The caller is choosing a provider. Available: {json.dumps(provider_names)}. '
+            'Return JSON: {"provider_name": "exact name from the list"}. Match closest.'
+        ),
+    )
+    chosen = (result.get("provider_name") or "").strip().lower() if result else ""
+
+    matched = None
+    for p in providers:
+        if chosen and chosen in p["provider_name"].lower():
+            matched = p
+            break
+
+    if not matched:
+        conv["retries"] = conv.get("retries", 0) + 1
+        if conv["retries"] >= 3:
+            if providers:
+                matched = providers[0]
+            else:
+                _clear_conv(call_sid)
+                return _twiml_response(_say("I'm having trouble. Please book online. Goodbye."))
+
+    if not matched:
+        _set_conv(call_sid, conv)
+        plist = _format_provider_list(providers)
+        return _gather_speech(
+            request,
+            f"I didn't catch that. We have {plist}. Who would you prefer?",
+            hint=", ".join(provider_names),
+        )
+
+    conv["provider_id"] = matched["id"]
+    conv["provider_name"] = matched["provider_name"]
+    conv["step"] = "datetime"
+    conv["retries"] = 0
+    _set_conv(call_sid, conv)
+    return _gather_speech(
+        request,
+        f"You'll be seeing {matched['provider_name']}. "
+        "What date and time works for you? For example, next Friday at 10:15 AM.",
+    )
+
+
+def _handle_datetime_step(request, call_sid, from_num, speech, conv):
+    tz_name = getattr(settings, "CLINIC_TIMEZONE", "America/Detroit")
+    today = timezone.now().astimezone(ZoneInfo(tz_name)).date().isoformat()
+
+    result = openai_extract_field(
+        speech,
+        field="datetime",
+        instruction=(
+            f'The caller wants to book an appointment. Today is {today}. '
+            'Parse what they said into a date and time. '
+            'Return JSON: {"appointment_date": "YYYY-MM-DD", "start_time": "H:MM AM/PM"}. '
+            'Interpret "next Tuesday", "tomorrow", "this Friday" etc. relative to today.'
+        ),
+    )
+    appt_date = (result.get("appointment_date") or "").strip() if result else ""
+    start_time = (result.get("start_time") or "").strip() if result else ""
+
+    if not appt_date or not start_time:
+        conv["retries"] = conv.get("retries", 0) + 1
+        if conv["retries"] >= 3:
+            _clear_conv(call_sid)
+            upsert_voice_call_log(
+                call_sid=call_sid, from_number=from_num,
+                outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES,
+                detail="Could not parse date/time",
+            )
+            return _twiml_response(_say("I'm having trouble with the date and time. Please book online or call the front desk. Goodbye."))
+        _set_conv(call_sid, conv)
+        return _gather_speech(
+            request,
+            "I didn't catch the date and time clearly. "
+            "Could you say it again? Like April tenth at 2:30 PM.",
+        )
+
+    conv["appointment_date"] = appt_date
+    conv["start_time"] = start_time
+    conv["step"] = "confirm"
+    conv["retries"] = 0
+    _set_conv(call_sid, conv)
+
+    from .voice_ai import _parse_time_12h
+    from datetime import date as date_type
+
+    try:
+        d = date_type.fromisoformat(appt_date)
+        date_display = d.strftime("%A, %B %d")
+    except ValueError:
+        date_display = appt_date
+
+    t = _parse_time_12h(start_time)
+    time_display = t.strftime("%I:%M %p") if t else start_time
+
+    name = f"{conv.get('first_name', '')} {conv.get('last_name', '')}".strip()
+    service = conv.get("service_name", "your visit")
+    provider_part = ""
+    if conv.get("provider_name"):
+        provider_part = f" with {conv['provider_name']}"
+
+    prompt = (
+        f"Let me confirm: {name}, {service}{provider_part}, "
+        f"on {date_display} at {time_display}. "
+        "Does that sound right? Say yes to confirm or no to start over."
+    )
+    return _gather_speech(request, prompt, hint="yes, no, correct, that's right")
+
+
+def _handle_confirm_step(request, call_sid, from_num, speech, conv):
+    lower = speech.lower().strip()
+    affirmatives = {"yes", "yeah", "yep", "yup", "correct", "that's right", "right", "sure", "ok", "okay", "confirm", "please", "go ahead", "book it", "sounds good", "perfect"}
+    negatives = {"no", "nope", "nah", "wrong", "start over", "cancel", "not right", "incorrect"}
+
+    is_yes = any(w in lower for w in affirmatives)
+    is_no = any(w in lower for w in negatives)
+
+    if is_no and not is_yes:
+        conv["step"] = "name"
+        conv["retries"] = 0
+        for k in ["first_name", "last_name", "service_id", "service_name", "provider_id",
+                   "provider_name", "appointment_date", "start_time", "_catalog", "_providers",
+                   "service_duration", "service_price"]:
+            conv.pop(k, None)
+        _set_conv(call_sid, conv)
+        return _gather_speech(
+            request,
+            "No problem! Let's start over. What is your first and last name?",
+        )
+
+    if not is_yes:
+        conv["retries"] = conv.get("retries", 0) + 1
+        if conv["retries"] >= 3:
+            _clear_conv(call_sid)
+            upsert_voice_call_log(
+                call_sid=call_sid, from_number=from_num,
+                outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES,
+                detail="Could not confirm",
+            )
+            return _twiml_response(_say("I'm having trouble confirming. Please try booking online. Goodbye."))
+        _set_conv(call_sid, conv)
+        return _gather_speech(
+            request,
+            "Just say yes to confirm the booking, or no to start over.",
+            hint="yes, no",
+        )
+
+    # ── Confirmed: build payload and book ──
+    from .voice_ai import _parse_time_12h
+    from datetime import date as date_type
+    from decimal import Decimal
+
+    phone = conv.get("from_num", from_num)
+    if phone.startswith("tel:"):
+        phone = phone[4:]
+
+    try:
+        appt_date = date_type.fromisoformat(conv["appointment_date"])
+    except (ValueError, KeyError):
+        _clear_conv(call_sid)
+        return _twiml_response(_say("Something went wrong with the date. Please call back. Goodbye."))
+
+    t = _parse_time_12h(conv.get("start_time", ""))
+    if not t:
+        _clear_conv(call_sid)
+        return _twiml_response(_say("Something went wrong with the time. Please call back. Goodbye."))
+
+    payload = {
+        "first_name": conv.get("first_name", "")[:100],
+        "last_name": conv.get("last_name", "")[:100],
+        "phone": phone,
+        "email": "",
+        "service_id": conv.get("service_id"),
+        "service_duration_minutes": int(conv.get("service_duration", 15)),
+        "service_price": Decimal(str(conv.get("service_price", "0"))),
+        "appointment_date": appt_date,
+        "start_time": t,
+    }
+    if conv.get("provider_id"):
+        payload["provider_id"] = int(conv["provider_id"])
+
+    transcript = f"Name: {conv.get('first_name')} {conv.get('last_name')}, Service: {conv.get('service_name')}, Date: {conv.get('appointment_date')}, Time: {conv.get('start_time')}"
 
     ser = PublicBookingSerializer(data=payload)
     if not ser.is_valid():
         logger.info("Voice booking serializer errors: %s", ser.errors)
-        return _retry_or_goodbye(
-            request,
-            call_sid,
-            "Something did not match. Please repeat your name, service, date, and time.",
-            from_num=from_num,
-            abandon_outcome=VoiceCallLog.Outcome.SERIALIZER_REJECTED,
-            abandon_detail=str(ser.errors)[:2000],
+        _clear_conv(call_sid)
+        upsert_voice_call_log(
+            call_sid=call_sid, from_number=from_num, transcript=transcript,
+            outcome=VoiceCallLog.Outcome.SERIALIZER_REJECTED,
+            detail=str(ser.errors)[:2000],
+        )
+        return _twiml_response(
+            _say("I'm sorry, something didn't work out. That time slot may not be available. Please try another time or book online. Goodbye.")
         )
 
     appt, book_err = create_appointment_from_public_booking(ser.validated_data)
     if book_err:
+        _clear_conv(call_sid)
         upsert_voice_call_log(
-            call_sid=call_sid,
-            from_number=from_num,
-            transcript=speech,
+            call_sid=call_sid, from_number=from_num, transcript=transcript,
             outcome=VoiceCallLog.Outcome.SLOT_OR_RULE_ERROR,
             detail=book_err[:2000],
         )
-        return _twiml_response(_say(f"Sorry. {book_err} Goodbye."))
+        return _twiml_response(
+            _say(f"I'm sorry, that didn't work. {book_err} Please try a different time or book online. Goodbye.")
+        )
 
-    cache.delete(f"voice_gather_retry:{call_sid}")
+    _clear_conv(call_sid)
     upsert_voice_call_log(
-        call_sid=call_sid,
-        from_number=from_num,
-        transcript=speech,
-        outcome=VoiceCallLog.Outcome.BOOKED,
-        appointment=appt,
+        call_sid=call_sid, from_number=from_num, transcript=transcript,
+        outcome=VoiceCallLog.Outcome.BOOKED, appointment=appt,
     )
     t_disp = appt.start_time.strftime("%I:%M %p")
     d_disp = appt.appointment_date.strftime("%A, %B %d")
     return _twiml_response(
         _say(
-            f"Your visit is booked for {d_disp} at {t_disp}. "
-            "You should receive a text confirmation shortly. Goodbye."
+            f"You're all set! Your {conv.get('service_name', 'appointment')} is booked for "
+            f"{d_disp} at {t_disp}. "
+            "You'll receive a text confirmation shortly. "
+            "Thank you for choosing Relief Chiropractic. Have a great day!"
         )
     )
