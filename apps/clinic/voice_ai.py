@@ -53,35 +53,52 @@ def _booking_catalog_json() -> dict[str, Any]:
 
 _NAME_PREFIXES = [
     "hi my name is", "hello my name is", "hey my name is",
-    "yes my name is", "yeah my name is", "my name is",
-    "hi this is", "hello this is", "hey this is",
-    "this is", "hi i'm", "hello i'm", "hey i'm",
-    "i'm", "i am", "it's", "hi it's",
-    "hi i am", "hello i am", "yes this is",
-    "hi", "hello", "hey", "yes", "yeah",
+    "good morning my name is", "good afternoon my name is",
+    "yes my name is", "yeah my name is", "so my name is",
+    "um my name is", "uh my name is", "my name is",
+    "hi this is", "hello this is", "hey this is", "yes this is",
+    "hi i'm", "hello i'm", "hey i'm", "good morning i'm",
+    "i'm calling my name is", "i'm calling this is",
+    "this is", "i'm", "i am", "it's",
+    "hi it's", "hi i am", "hello i am",
+    "the name is", "name is", "you can call me",
+    "hi", "hello", "hey", "yes", "yeah", "um", "uh", "so",
+    "good morning", "good afternoon", "good evening",
+]
+
+_NAME_SUFFIXES = [
+    "please", "thank you", "thanks", "i'd like to book",
+    "i want to book", "booking", "appointment", "i need an appointment",
+    "calling to book", "calling to make", "calling for",
+    "i'm calling to", "i'm calling for",
 ]
 
 def extract_name_from_speech(speech: str) -> tuple[str, str]:
     """
-    Pull first + last name from raw speech text.
-    Handles "My name is John Smith", "Hi, this is Jane Doe", or just "John Smith".
-    Returns (first_name, last_name). last_name may be empty.
+    Pull first + last name from raw speech. Very forgiving — if there's
+    any recognizable word left after stripping filler, it's treated as a name.
     """
     text = speech.strip()
-    text = re.sub(r"[.,!?]+$", "", text).strip()
+    text = re.sub(r"[.,!?;:]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
 
     lower = text.lower()
     for prefix in _NAME_PREFIXES:
         if lower.startswith(prefix):
             text = text[len(prefix):].strip()
-            text = text.lstrip(",").strip()
+            text = text.lstrip(",").lstrip("-").strip()
+            lower = text.lower()
             break
 
-    for suffix in ["please", "thank you", "thanks"]:
-        if text.lower().endswith(suffix):
-            text = text[: -len(suffix)].strip().rstrip(",").strip()
+    for suffix in _NAME_SUFFIXES:
+        if lower.endswith(suffix):
+            text = text[: -len(suffix)].strip().rstrip(",").rstrip("-").strip()
+            lower = text.lower()
 
-    parts = text.split()
+    text = re.sub(r"\b(um|uh|like|so|well|and|the)\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    parts = [p for p in text.split() if len(p) > 0]
     if len(parts) >= 2:
         return parts[0].title(), " ".join(parts[1:]).title()
     if parts:
