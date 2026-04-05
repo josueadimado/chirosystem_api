@@ -262,14 +262,15 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         if not provider.services.filter(pk=service.id).exists():
             return Response({"detail": "Provider does not offer this service."}, status=status.HTTP_400_BAD_REQUEST)
 
-        all_slots = [
-            ("9:00 AM", (9, 0)),
-            ("10:15 AM", (10, 15)),
-            ("2:30 PM", (14, 30)),
-            ("3:45 PM", (15, 45)),
-            ("5:15 PM", (17, 15)),
-        ]
+        from datetime import time as time_cls
+
+        DAY_START_HOUR, DAY_START_MIN = 9, 0
+        DAY_END_HOUR, DAY_END_MIN = 18, 0
+
         duration = service.duration_minutes
+        SLOT_INTERVAL = 15 if service.service_type == "chiropractic" else max(duration, 15)
+        day_start = DAY_START_HOUR * 60 + DAY_START_MIN
+        day_end = DAY_END_HOUR * 60 + DAY_END_MIN
 
         taken = set()
         for a in (
@@ -285,24 +286,24 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             for m in range(start_min, end_min):
                 taken.add(m)
 
-        from datetime import time as time_cls
-
         available = []
-        for label, (h, m) in all_slots:
-            slot_start = h * 60 + m
-            slot_end = slot_start + duration
-            if any(slot_start <= t < slot_end for t in taken):
-                continue
-            slot_start_time = time_cls(hour=h, minute=m)
-            total_end_min = slot_start + duration
-            end_h = total_end_min // 60
-            end_mm = total_end_min % 60
-            if end_h >= 24:
-                end_h, end_mm = 23, 59
-            slot_end_time = time_cls(hour=end_h, minute=end_mm)
-            if provider_interval_blocked_online(provider.pk, appt_date, slot_start_time, slot_end_time):
-                continue
-            available.append(label)
+        cursor = day_start
+        while cursor + duration <= day_end:
+            if not any(cursor <= t < cursor + duration for t in taken):
+                h, m = divmod(cursor, 60)
+                slot_start_time = time_cls(hour=h, minute=m)
+                end_total = cursor + duration
+                end_h, end_m = divmod(end_total, 60)
+                if end_h >= 24:
+                    end_h, end_m = 23, 59
+                slot_end_time = time_cls(hour=end_h, minute=end_m)
+                if not provider_interval_blocked_online(provider.pk, appt_date, slot_start_time, slot_end_time):
+                    suffix = "AM" if h < 12 else "PM"
+                    display_h = h if 1 <= h <= 12 else (h - 12 if h > 12 else 12)
+                    label = f"{display_h}:{m:02d} {suffix}"
+                    available.append(label)
+            cursor += SLOT_INTERVAL
+
         return Response({"available_slots": available})
 
     @action(detail=False, methods=["get"], url_path="patient-lookup")

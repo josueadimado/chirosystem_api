@@ -111,15 +111,34 @@ def create_appointment_from_public_booking(validated: dict) -> tuple[Appointment
     )
 
     def queue_after_book():
+        import logging as _log
+
         from apps.notifications.tasks import (
             notify_provider_new_booking_task,
+            send_booking_confirmation_email_task,
             send_booking_confirmation_sms_task,
             sync_appointment_google_calendar_task,
         )
 
-        send_booking_confirmation_sms_task.delay(appointment.id)
-        notify_provider_new_booking_task.delay(appointment.id)
-        sync_appointment_google_calendar_task.delay(appointment.id)
+        _logger = _log.getLogger(__name__)
+        tasks = [
+            ("sms", send_booking_confirmation_sms_task),
+            ("email", send_booking_confirmation_email_task),
+            ("provider_notify", notify_provider_new_booking_task),
+            ("gcal", sync_appointment_google_calendar_task),
+        ]
+        for label, task_fn in tasks:
+            try:
+                task_fn.delay(appointment.id)
+            except Exception:
+                _logger.warning(
+                    "Celery dispatch failed for %s (appt %s), running synchronously",
+                    label, appointment.id,
+                )
+                try:
+                    task_fn(appointment.id)
+                except Exception:
+                    _logger.exception("Sync fallback also failed for %s (appt %s)", label, appointment.id)
 
     def queue_in_app():
         from apps.clinic.in_app_notify import create_new_booking_in_app_notification

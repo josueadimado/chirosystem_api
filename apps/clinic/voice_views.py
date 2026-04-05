@@ -42,7 +42,6 @@ from .voice_ai import (
     _booking_catalog_json,
     _parse_time_12h,
     extract_name_from_speech,
-    match_provider_from_speech,
     match_service_from_speech,
     openai_parse_datetime,
     parse_datetime_from_speech,
@@ -140,13 +139,6 @@ def _format_service_list(catalog: dict) -> str:
     return ". ".join(parts)
 
 
-def _format_provider_list(providers: list[dict]) -> str:
-    if len(providers) <= 2:
-        return " or ".join(p["provider_name"] for p in providers)
-    names = ", ".join(p["provider_name"] for p in providers[:-1])
-    return f"{names}, or {providers[-1]['provider_name']}"
-
-
 # ─── Incoming call ─────────────────────────────────────────────────────
 
 @csrf_exempt
@@ -207,7 +199,6 @@ def twilio_voice_gather(request):
         step_prompts = {
             "name": "I didn't hear your name. Could you say your first and last name?",
             "service": "Which service would you like? You can say chiropractic or massage.",
-            "provider": "Which therapist would you prefer?",
             "datetime": "What date and time would you like? For example, next Monday at 3 PM.",
             "confirm": "Would you like to confirm this booking? Just say yes or no.",
         }
@@ -219,7 +210,6 @@ def twilio_voice_gather(request):
     handler = {
         "name": _handle_name_step,
         "service": _handle_service_step,
-        "provider": _handle_provider_step,
         "datetime": _handle_datetime_step,
         "confirm": _handle_confirm_step,
     }.get(step, _handle_name_step)
@@ -311,20 +301,7 @@ def _handle_service_step(request, call_sid, from_num, speech, conv):
 
     pbs = catalog.get("providers_by_service") or {}
     providers = pbs.get(matched["id"]) or []
-
-    if len(providers) > 1:
-        conv["step"] = "provider"
-        conv["_providers"] = providers
-        _set_conv(call_sid, conv)
-        plist = _format_provider_list(providers)
-        prompt = (
-            f"Great choice! For {matched['name']}, we have {plist}. "
-            "Who would you prefer?"
-        )
-        hints = ", ".join(p["provider_name"] for p in providers)
-        return _gather_speech(request, prompt, hint=hints)
-
-    if len(providers) == 1:
+    if providers:
         conv["provider_id"] = providers[0]["id"]
         conv["provider_name"] = providers[0]["provider_name"]
 
@@ -332,52 +309,12 @@ def _handle_service_step(request, call_sid, from_num, speech, conv):
     _set_conv(call_sid, conv)
     return _gather_speech(
         request,
-        f"When would you like to come in for your {matched['name']}? "
+        f"Great choice! When would you like to come in for your {matched['name']}? "
         "Please say the date and time, like next Tuesday at 2:30 PM.",
     )
 
 
-# ─── Step 3: Provider (instant — no AI) ───────────────────────────────
-
-def _handle_provider_step(request, call_sid, from_num, speech, conv):
-    providers = conv.get("_providers") or []
-
-    matched = match_provider_from_speech(speech, providers)
-    logger.info("Voice [%s] provider matched: %s", call_sid[:8], matched["provider_name"] if matched else "NONE")
-
-    if not matched:
-        conv["retries"] = conv.get("retries", 0) + 1
-        if conv["retries"] >= 3:
-            if providers:
-                matched = providers[0]
-                logger.info("Voice [%s] defaulting to first provider: %s", call_sid[:8], matched["provider_name"])
-            else:
-                _clear_conv(call_sid)
-                return _twiml_response(_say("I'm having trouble. Please book online. Goodbye."))
-
-    if not matched:
-        _set_conv(call_sid, conv)
-        plist = _format_provider_list(providers)
-        provider_names = [p["provider_name"] for p in providers]
-        return _gather_speech(
-            request,
-            f"I didn't catch which one. We have {plist}. Who would you prefer?",
-            hint=", ".join(provider_names),
-        )
-
-    conv["provider_id"] = matched["id"]
-    conv["provider_name"] = matched["provider_name"]
-    conv["step"] = "datetime"
-    conv["retries"] = 0
-    _set_conv(call_sid, conv)
-    return _gather_speech(
-        request,
-        f"You'll be seeing {matched['provider_name']}. "
-        "What date and time works for you? For example, next Friday at 10:15 AM.",
-    )
-
-
-# ─── Step 4: Date & time (local parser → OpenAI fallback) ─────────────
+# ─── Step 3: Date & time (local parser → OpenAI fallback) ─────────────
 
 def _handle_datetime_step(request, call_sid, from_num, speech, conv):
     tz_name = getattr(settings, "CLINIC_TIMEZONE", "America/Detroit")
@@ -431,12 +368,9 @@ def _handle_datetime_step(request, call_sid, from_num, speech, conv):
 
     name = f"{conv.get('first_name', '')} {conv.get('last_name', '')}".strip()
     service = conv.get("service_name", "your visit")
-    provider_part = ""
-    if conv.get("provider_name"):
-        provider_part = f" with {conv['provider_name']}"
 
     prompt = (
-        f"Let me confirm: {name}, {service}{provider_part}, "
+        f"Let me confirm: {name}, {service}, "
         f"on {date_display} at {time_display}. "
         "Does that sound right? Say yes to confirm or no to start over."
     )
@@ -462,7 +396,7 @@ def _handle_confirm_step(request, call_sid, from_num, speech, conv):
         conv["step"] = "name"
         conv["retries"] = 0
         for k in ["first_name", "last_name", "service_id", "service_name", "provider_id",
-                   "provider_name", "appointment_date", "start_time", "_catalog", "_providers",
+                   "provider_name", "appointment_date", "start_time", "_catalog",
                    "service_duration", "service_price"]:
             conv.pop(k, None)
         _set_conv(call_sid, conv)

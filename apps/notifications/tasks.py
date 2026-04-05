@@ -1,4 +1,4 @@
-"""Celery tasks: Twilio SMS (patients + doctor alerts, Google Calendar sync)."""
+"""Celery tasks: SMS, email, Google Calendar sync for bookings."""
 
 from __future__ import annotations
 
@@ -47,7 +47,64 @@ def send_booking_confirmation_sms_task(appointment_id: int) -> str:
         provider_display=str(appt.provider),
     )
     sid = send_sms(to_e164=to, body=body)
+    logger.info("Booking SMS result: appt=%s to=%s sid=%s", appointment_id, to, sid)
     return sid or "send_failed"
+
+
+@shared_task
+def send_booking_confirmation_email_task(appointment_id: int) -> str:
+    """Send a booking confirmation email right after booking commits."""
+    from django.conf import settings as django_settings
+    from django.core.mail import send_mail
+
+    from apps.clinic.models import Appointment
+
+    if not (getattr(django_settings, "EMAIL_HOST", "") or "").strip():
+        return "email_not_configured"
+
+    appt = (
+        Appointment.objects.select_related("patient", "provider", "booked_service")
+        .filter(pk=appointment_id)
+        .first()
+    )
+    if not appt:
+        return "appointment_missing"
+
+    email = (appt.patient.email or "").strip()
+    if not email:
+        return "no_email"
+
+    first_name = appt.patient.first_name.strip() or "there"
+    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    date_disp = appt.appointment_date.strftime("%A, %B %d, %Y")
+    time_disp = format_time_12h(appt.start_time)
+
+    subject = f"Booking Confirmed — {service_name} on {date_disp}"
+    body = (
+        f"Hi {first_name},\n\n"
+        f"Your appointment at Relief Chiropractic has been confirmed!\n\n"
+        f"  Service: {service_name}\n"
+        f"  Date: {date_disp}\n"
+        f"  Time: {time_disp}\n\n"
+        f"We'll send you a reminder the day before your visit.\n\n"
+        f"If you need to reschedule or cancel, please call us or visit our website.\n\n"
+        f"Thank you for choosing Relief Chiropractic!\n"
+        f"— Relief Chiropractic Team"
+    )
+
+    try:
+        send_mail(
+            subject=subject,
+            message=body,
+            from_email=django_settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email],
+            fail_silently=False,
+        )
+        logger.info("Booking email sent: appt=%s to=%s", appointment_id, email)
+        return "sent"
+    except Exception:
+        logger.exception("Booking email failed: appt=%s to=%s", appointment_id, email)
+        return "send_failed"
 
 
 @shared_task
