@@ -50,7 +50,10 @@ def openai_extract_field(transcript: str, *, field: str, instruction: str) -> di
     """Lightweight OpenAI call to extract a single field from speech. Returns parsed JSON dict or None."""
     key = getattr(settings, "OPENAI_API_KEY", "") or ""
     if not key.strip():
+        logger.warning("OpenAI extract_field (%s): OPENAI_API_KEY not set", field)
         return None
+
+    logger.info("OpenAI extract_field (%s): transcript=%r", field, transcript[:200])
 
     body = json.dumps(
         {
@@ -71,10 +74,12 @@ def openai_extract_field(transcript: str, *, field: str, instruction: str) -> di
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             raw = json.loads(resp.read().decode("utf-8"))
         content = raw["choices"][0]["message"]["content"]
-        return json.loads(content)
+        parsed = json.loads(content)
+        logger.info("OpenAI extract_field (%s): result=%r", field, parsed)
+        return parsed
     except Exception as e:
         logger.warning("OpenAI extract_field (%s) failed: %s", field, e)
         return None
