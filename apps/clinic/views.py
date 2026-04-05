@@ -1066,6 +1066,62 @@ class AdminViewSet(viewsets.ViewSet):
             ]
         )
 
+    @action(detail=False, methods=["get"], url_path="invoice_bill")
+    def admin_invoice_bill(self, request):
+        """Print-ready patient bill for admin. Only after payment."""
+        invoice_id = request.query_params.get("invoice_id")
+        if not invoice_id:
+            return Response({"detail": "invoice_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+        inv = (
+            Invoice.objects.select_related("patient", "appointment", "visit")
+            .prefetch_related("visit__rendered_services__service")
+            .filter(pk=invoice_id)
+            .first()
+        )
+        if not inv:
+            return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
+        if inv.status != Invoice.Status.PAID:
+            return Response(
+                {"detail": "Patient bill is available only after the invoice is paid.", "invoice_status": inv.status},
+                status=status.HTTP_409_CONFLICT,
+            )
+        visit = inv.visit
+        header = _clinic_settings_bill_header()
+        lines = []
+        for rs in visit.rendered_services.all().order_by("id"):
+            svc = rs.service
+            lines.append(
+                {
+                    "service_offered": svc.name,
+                    "cpt_code": svc.billing_code or "\u2014",
+                    "description": (svc.description or svc.name)[:120],
+                    "fees": str(rs.unit_price),
+                    "units": str(rs.quantity),
+                    "pos": header["pos_default"],
+                    "line_total": str(rs.total_price),
+                }
+            )
+        pat = inv.patient
+        addr_display = pat.city_state_zip or "St Joseph, MI 49085"
+        if pat.address_line1:
+            addr_display = ", ".join(filter(None, [pat.address_line1, pat.city_state_zip])) or addr_display
+        return Response(
+            {
+                **header,
+                "bill_title": "Patient Bill",
+                "invoice_number": inv.invoice_number,
+                "date_of_service": str(inv.appointment.appointment_date),
+                "patient_name": f"{pat.first_name} {pat.last_name}",
+                "patient_address": addr_display,
+                "diagnosis": (visit.diagnosis or "").strip() or "\u2014",
+                "lines": lines,
+                "subtotal": str(inv.subtotal),
+                "tax": str(inv.tax),
+                "total_amount": str(inv.total_amount),
+                "status": inv.status,
+            }
+        )
+
     @action(detail=False, methods=["get"])
     def patients(self, request):
         """List all patients with last_visit and balance for admin."""
@@ -1252,6 +1308,8 @@ class DoctorViewSet(viewsets.ViewSet):
                 "clinical_handoff_notes": a.clinical_handoff_notes or "",
                 "reason_for_visit": v.reason_for_visit if v else "",
                 "visit_id": v.id if v else None,
+                "card_last4": a.patient.card_last4 or "",
+                "card_brand": a.patient.card_brand or "",
             }
             inv = invoice_by_aid.get(a.id)
             if (
@@ -1529,6 +1587,39 @@ class DoctorViewSet(viewsets.ViewSet):
                 "status": inv.status,
             }
         )
+
+    @action(detail=False, methods=["get"], url_path="invoice_search")
+    def invoice_search(self, request):
+        """Search invoices by patient name, invoice number, or date for bill reprinting."""
+        provider = self._get_provider(request)
+        if not provider:
+            return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
+        q = (request.query_params.get("q") or "").strip()
+        if not q:
+            return Response([])
+        qs = Invoice.objects.filter(
+            appointment__provider=provider
+        ).select_related("patient", "appointment").order_by("-appointment__appointment_date")
+        from django.db.models import Q
+        filters = Q(patient__first_name__icontains=q) | Q(patient__last_name__icontains=q) | Q(invoice_number__icontains=q)
+        try:
+            from datetime import datetime as dt
+            parsed_date = dt.strptime(q, "%Y-%m-%d").date()
+            filters = filters | Q(appointment__appointment_date=parsed_date)
+        except ValueError:
+            pass
+        qs = qs.filter(filters)[:20]
+        return Response([
+            {
+                "invoice_id": inv.id,
+                "invoice_number": inv.invoice_number,
+                "patient_name": f"{inv.patient.first_name} {inv.patient.last_name}",
+                "date_of_service": str(inv.appointment.appointment_date),
+                "total_amount": str(inv.total_amount),
+                "status": inv.status,
+            }
+            for inv in qs
+        ])
 
     @action(detail=True, methods=["post"])
     def start_visit(self, request, pk=None):
