@@ -1,7 +1,9 @@
 """
-Turn caller speech into structured booking fields using OpenAI (optional).
+Turn caller speech into structured booking fields.
 
-If OPENAI_API_KEY is not set, voice webhooks fall back to a helpful message.
+Local parsers handle name, service, provider, and common date/time patterns
+instantly (no API call). OpenAI is only used as a fallback for ambiguous
+date/time expressions like "the week after next" that regex can't handle.
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ import logging
 import re
 import urllib.error
 import urllib.request
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -22,6 +24,7 @@ from .models import Service
 
 logger = logging.getLogger(__name__)
 
+# ─── Catalog ───────────────────────────────────────────────────────────
 
 def _booking_catalog_json() -> dict[str, Any]:
     """Same shape as /api/v1/booking-options/ (minimal fields for the model)."""
@@ -46,14 +49,369 @@ def _booking_catalog_json() -> dict[str, Any]:
     return {"services": services, "providers_by_service": providers_by_service}
 
 
-def openai_extract_field(transcript: str, *, field: str, instruction: str) -> dict[str, Any] | None:
-    """Lightweight OpenAI call to extract a single field from speech. Returns parsed JSON dict or None."""
+# ─── Name extraction (no AI) ──────────────────────────────────────────
+
+_NAME_PREFIXES = [
+    "hi my name is", "hello my name is", "hey my name is",
+    "yes my name is", "yeah my name is", "my name is",
+    "hi this is", "hello this is", "hey this is",
+    "this is", "hi i'm", "hello i'm", "hey i'm",
+    "i'm", "i am", "it's", "hi it's",
+    "hi i am", "hello i am", "yes this is",
+    "hi", "hello", "hey", "yes", "yeah",
+]
+
+def extract_name_from_speech(speech: str) -> tuple[str, str]:
+    """
+    Pull first + last name from raw speech text.
+    Handles "My name is John Smith", "Hi, this is Jane Doe", or just "John Smith".
+    Returns (first_name, last_name). last_name may be empty.
+    """
+    text = speech.strip()
+    text = re.sub(r"[.,!?]+$", "", text).strip()
+
+    lower = text.lower()
+    for prefix in _NAME_PREFIXES:
+        if lower.startswith(prefix):
+            text = text[len(prefix):].strip()
+            text = text.lstrip(",").strip()
+            break
+
+    for suffix in ["please", "thank you", "thanks"]:
+        if text.lower().endswith(suffix):
+            text = text[: -len(suffix)].strip().rstrip(",").strip()
+
+    parts = text.split()
+    if len(parts) >= 2:
+        return parts[0].title(), " ".join(parts[1:]).title()
+    if parts:
+        return parts[0].title(), ""
+    return "", ""
+
+
+# ─── Service matching (no AI) ─────────────────────────────────────────
+
+def match_service_from_speech(speech: str, services: list[dict]) -> dict | None:
+    """
+    Fuzzy-match a service from the caller's speech against known service names.
+    Tries exact, contains, keyword overlap — all instantly, no API call.
+    """
+    s_lower = speech.lower().strip()
+    s_lower = re.sub(r"^(i('d| would) like( (a|an|the))?\s*|i want( (a|an|the))?\s*|"
+                     r"(can i|could i) (get|have|book)( (a|an|the))?\s*|"
+                     r"(let('s| us) (do|go with)( (a|an|the))?\s*)|"
+                     r"(the|a|an)\s+)", "", s_lower).strip()
+    s_lower = re.sub(r"\s*(please|thanks|thank you)$", "", s_lower).strip()
+
+    for svc in services:
+        if svc["name"].lower() == s_lower:
+            return svc
+
+    for svc in services:
+        if svc["name"].lower() in s_lower or s_lower in svc["name"].lower():
+            return svc
+
+    s_words = set(s_lower.split())
+    best, best_score = None, 0
+    for svc in services:
+        name_words = set(svc["name"].lower().split())
+        sig_overlap = len({w for w in (s_words & name_words) if len(w) > 2})
+        if sig_overlap > best_score:
+            best_score = sig_overlap
+            best = svc
+
+    if best and best_score >= 1:
+        return best
+
+    type_map = {"chiropractic": "chiropractic", "chiro": "chiropractic",
+                "massage": "massage", "massages": "massage"}
+    for word, stype in type_map.items():
+        if word in s_lower:
+            typed = [svc for svc in services if svc.get("service_type") == stype]
+            if len(typed) == 1:
+                return typed[0]
+            if typed:
+                return typed[0]
+
+    return None
+
+
+# ─── Provider matching (no AI) ────────────────────────────────────────
+
+def match_provider_from_speech(speech: str, providers: list[dict]) -> dict | None:
+    """Match a provider name from raw speech — tries first name, last name, full name."""
+    s_lower = speech.lower().strip()
+    s_lower = re.sub(r"^(i('d| would) like\s*|i want\s*|"
+                     r"(can i|could i) (see|get|have)\s*|"
+                     r"(let('s| us) (go with|do)\s*))", "", s_lower).strip()
+    s_lower = re.sub(r"\s*(please|thanks|thank you)$", "", s_lower).strip()
+
+    for p in providers:
+        if p["provider_name"].lower() == s_lower:
+            return p
+
+    for p in providers:
+        if p["provider_name"].lower() in s_lower or s_lower in p["provider_name"].lower():
+            return p
+
+    for p in providers:
+        name_parts = p["provider_name"].lower().split()
+        if any(part in s_lower for part in name_parts if len(part) > 2):
+            return p
+
+    return None
+
+
+# ─── Date / time parsing (local first, AI fallback) ───────────────────
+
+_WEEKDAYS = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+    "mon": 0, "tue": 1, "tues": 1, "wed": 2, "weds": 2,
+    "thu": 3, "thur": 3, "thurs": 3, "fri": 4, "sat": 5, "sun": 6,
+}
+
+_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4,
+    "jun": 6, "jul": 7, "aug": 8, "sep": 9, "sept": 9,
+    "oct": 10, "nov": 11, "dec": 12,
+}
+
+_WORD_NUMS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "twenty one": 21, "twenty two": 22, "twenty three": 23,
+    "twenty four": 24, "twenty five": 25, "twenty six": 26,
+    "twenty seven": 27, "twenty eight": 28, "twenty nine": 29,
+    "thirty": 30, "thirty one": 31,
+}
+
+_MINUTE_WORDS = {
+    "o'clock": 0, "oclock": 0, "o clock": 0,
+    "oh five": 5, "oh-five": 5,
+    "fifteen": 15, "thirty": 30, "forty five": 45, "forty-five": 45,
+    "forty": 40, "fifty": 50, "twenty": 20,
+}
+
+
+def _normalize_speech(speech: str) -> str:
+    """Lower-case and clean up speech for parsing."""
+    s = speech.lower().strip()
+    s = re.sub(r"[.,!?]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _next_weekday(today: date, weekday_num: int) -> date:
+    """Return the next occurrence of the given weekday (0=Mon)."""
+    days_ahead = weekday_num - today.weekday()
+    if days_ahead <= 0:
+        days_ahead += 7
+    return today + timedelta(days=days_ahead)
+
+
+def _replace_word_numbers(text: str) -> str:
+    """Replace written-out numbers with digits in text for easier regex."""
+    for word, num in sorted(_WORD_NUMS.items(), key=lambda x: -len(x[0])):
+        text = text.replace(word, str(num))
+    return text
+
+
+def _parse_date_from_speech(speech: str, today: date) -> date | None:
+    """Try to extract a date from natural speech. Returns None if can't parse."""
+    s = _normalize_speech(speech)
+    s = _replace_word_numbers(s)
+
+    if "tomorrow" in s:
+        return today + timedelta(days=1)
+    if re.search(r"\btoday\b", s):
+        return today
+
+    for name, num in _WEEKDAYS.items():
+        if re.search(rf"\bnext\s+{name}\b", s):
+            d = _next_weekday(today, num)
+            if d <= today:
+                d += timedelta(days=7)
+            return d
+        if re.search(rf"\bthis\s+{name}\b", s):
+            d = _next_weekday(today, num)
+            return d
+
+    for mname, mnum in sorted(_MONTHS.items(), key=lambda x: -len(x[0])):
+        m = re.search(rf"\b{mname}\s+(\d{{1,2}})\b", s)
+        if m:
+            day = int(m.group(1))
+            try:
+                d = date(today.year, mnum, day)
+                if d < today:
+                    d = date(today.year + 1, mnum, day)
+                return d
+            except ValueError:
+                continue
+
+    m = re.search(r"\bthe\s+(\d{1,2})\s*(?:st|nd|rd|th)?\b", s)
+    if m:
+        day = int(m.group(1))
+        if 1 <= day <= 31:
+            try:
+                d = date(today.year, today.month, day)
+                if d < today:
+                    next_month = today.month + 1
+                    next_year = today.year
+                    if next_month > 12:
+                        next_month = 1
+                        next_year += 1
+                    d = date(next_year, next_month, day)
+                return d
+            except ValueError:
+                pass
+
+    m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", s)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else today.year
+        if year < 100:
+            year += 2000
+        try:
+            return date(year, month, day)
+        except ValueError:
+            pass
+
+    for name, num in _WEEKDAYS.items():
+        if re.search(rf"\b{name}\b", s):
+            return _next_weekday(today, num)
+
+    return None
+
+
+def _parse_time_from_speech(speech: str):
+    """Try to extract a time from natural speech. Returns a time object or None."""
+    s = _normalize_speech(speech)
+
+    for word, mins in sorted(_MINUTE_WORDS.items(), key=lambda x: -len(x[0])):
+        s = s.replace(word, f":{mins:02d}" if mins else ":00")
+
+    s = _replace_word_numbers(s)
+
+    s = re.sub(r"\ba\s*\.?\s*m\s*\.?\b", "am", s)
+    s = re.sub(r"\bp\s*\.?\s*m\s*\.?\b", "pm", s)
+
+    m = re.search(r"(\d{1,2}):(\d{2})\s*(am|pm)", s)
+    if m:
+        h, mi, ap = int(m.group(1)), int(m.group(2)), m.group(3)
+        if ap == "pm" and h != 12:
+            h += 12
+        if ap == "am" and h == 12:
+            h = 0
+        if 0 <= h <= 23 and 0 <= mi <= 59:
+            return datetime.strptime(f"{h}:{mi:02d}", "%H:%M").time()
+
+    m = re.search(r"(\d{1,2})\s*(am|pm)", s)
+    if m:
+        h, ap = int(m.group(1)), m.group(2)
+        if ap == "pm" and h != 12:
+            h += 12
+        if ap == "am" and h == 12:
+            h = 0
+        if 0 <= h <= 23:
+            return datetime.strptime(f"{h}:00", "%H:%M").time()
+
+    m = re.search(r"\bat\s+(\d{1,2}):(\d{2})\b", s)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+        if 7 <= h <= 12 and 0 <= mi <= 59:
+            return datetime.strptime(f"{h}:{mi:02d}", "%H:%M").time()
+
+    m = re.search(r"\bat\s+(\d{1,2})\b", s)
+    if m:
+        h = int(m.group(1))
+        if 7 <= h <= 12:
+            return datetime.strptime(f"{h}:00", "%H:%M").time()
+
+    return None
+
+
+def parse_datetime_from_speech(speech: str, today: date) -> tuple[str, str]:
+    """
+    Try to parse date and time from speech using local regex.
+    Returns (date_iso, time_12h) — either or both may be empty if unparseable.
+    """
+    d = _parse_date_from_speech(speech, today)
+    t = _parse_time_from_speech(speech)
+
+    date_str = d.isoformat() if d else ""
+    time_str = t.strftime("%I:%M %p") if t else ""
+
+    logger.info("Local datetime parse: speech=%r → date=%s time=%s", speech[:120], date_str, time_str)
+    return date_str, time_str
+
+
+# ─── OpenAI fallback (only for tricky date/time) ──────────────────────
+
+def openai_parse_datetime(speech: str, today_iso: str) -> tuple[str, str]:
+    """
+    Call OpenAI to parse a date/time that the local parser couldn't handle.
+    Returns (date_iso, time_12h) — either or both may be empty.
+    """
     key = getattr(settings, "OPENAI_API_KEY", "") or ""
     if not key.strip():
-        logger.warning("OpenAI extract_field (%s): OPENAI_API_KEY not set", field)
-        return None
+        return "", ""
 
-    logger.info("OpenAI extract_field (%s): transcript=%r", field, transcript[:200])
+    logger.info("OpenAI datetime fallback: speech=%r", speech[:200])
+
+    instruction = (
+        f"Today is {today_iso}. The caller said a date and/or time for a clinic appointment. "
+        "Parse it and return JSON: "
+        '{"appointment_date": "YYYY-MM-DD", "start_time": "H:MM AM"}. '
+        "Handle phrases like 'tomorrow', 'next Tuesday', 'the 15th', 'Monday at 9', etc. "
+        "If you can only determine the date or only the time, still return what you can "
+        "and set the other to empty string."
+    )
+
+    body = json.dumps(
+        {
+            "model": getattr(settings, "OPENAI_VOICE_MODEL", "gpt-4o-mini"),
+            "messages": [
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": speech},
+            ],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.1,
+            "max_tokens": 60,
+        }
+    ).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=body,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+        content = raw["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+        logger.info("OpenAI datetime result: %r", parsed)
+        return (
+            (parsed.get("appointment_date") or "").strip(),
+            (parsed.get("start_time") or "").strip(),
+        )
+    except Exception as e:
+        logger.warning("OpenAI datetime fallback failed: %s", e)
+        return "", ""
+
+
+def openai_extract_field(transcript: str, *, field: str, instruction: str) -> dict[str, Any] | None:
+    """General-purpose OpenAI call — kept for backward compatibility but rarely used now."""
+    key = getattr(settings, "OPENAI_API_KEY", "") or ""
+    if not key.strip():
+        return None
 
     body = json.dumps(
         {
@@ -74,16 +432,37 @@ def openai_extract_field(transcript: str, *, field: str, instruction: str) -> di
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             raw = json.loads(resp.read().decode("utf-8"))
         content = raw["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
-        logger.info("OpenAI extract_field (%s): result=%r", field, parsed)
-        return parsed
+        return json.loads(content)
     except Exception as e:
         logger.warning("OpenAI extract_field (%s) failed: %s", field, e)
         return None
 
+
+# ─── Time parser used at booking confirmation ─────────────────────────
+
+def _parse_time_12h(s: str):
+    """Parse a 12-hour time string like '2:30 PM' into a time object."""
+    s = (s or "").strip()
+    for fmt in ("%I:%M %p", "%I %p", "%H:%M"):
+        try:
+            return datetime.strptime(s, fmt).time()
+        except ValueError:
+            continue
+    m = re.match(r"^(\d{1,2}):(\d{2})\s*(am|pm)$", s.lower())
+    if m:
+        h, mi, ap = int(m.group(1)), int(m.group(2)), m.group(3)
+        if ap == "pm" and h != 12:
+            h += 12
+        if ap == "am" and h == 12:
+            h = 0
+        return datetime.strptime(f"{h}:{mi:02d}", "%H:%M").time()
+    return None
+
+
+# ─── Legacy helpers (kept for backward compat) ────────────────────────
 
 def openai_parse_booking_intent(*, transcript: str, today_iso: str, catalog: dict[str, Any]) -> dict[str, Any] | None:
     """Call OpenAI; return parsed JSON dict or None on failure."""
@@ -99,9 +478,6 @@ def openai_parse_booking_intent(*, transcript: str, today_iso: str, catalog: dic
         "provider_id (integer or null), provider_name_hint (string or null), "
         "appointment_date (YYYY-MM-DD), start_time (12-hour string like \"2:30 PM\" or \"9:00 AM\"), "
         "notes (string, optional). "
-        "Use service_id from the catalog when the caller clearly matches one service; otherwise use service_name_hint. "
-        "For massage (allow_provider_choice true), set provider_id if they name a therapist, else provider_name_hint. "
-        "For chiropractic (allow_provider_choice false), provider_id may be null. "
         f"Today in the clinic calendar is {today_iso}. "
         "Interpret phrases like \"next Tuesday\" relative to that date. "
         "If something critical is missing, still return best-effort JSON with nulls."
@@ -148,19 +524,14 @@ def _match_service(services: list[dict], service_id: int | None, name_hint: str 
                 return s
     if name_hint and str(name_hint).strip():
         hint = str(name_hint).lower().strip()
-        best = None
         for s in services:
             n = s["name"].lower()
             if hint in n or n in hint:
-                best = s
-                break
-        if best is None:
-            for s in services:
-                n = s["name"].lower()
-                if any(word in n for word in hint.split() if len(word) > 3):
-                    best = s
-                    break
-        return best
+                return s
+        for s in services:
+            n = s["name"].lower()
+            if any(word in n for word in hint.split() if len(word) > 3):
+                return s
     return None
 
 
@@ -178,24 +549,6 @@ def _match_provider(
         for p in providers:
             if h in p["provider_name"].lower():
                 return int(p["id"])
-    return None
-
-
-def _parse_time_12h(s: str):
-    s = (s or "").strip()
-    for fmt in ("%I:%M %p", "%I %p", "%H:%M"):
-        try:
-            return datetime.strptime(s, fmt).time()
-        except ValueError:
-            continue
-    m = re.match(r"^(\d{1,2}):(\d{2})\s*(am|pm)$", s.lower())
-    if m:
-        h, mi, ap = int(m.group(1)), int(m.group(2)), m.group(3)
-        if ap == "pm" and h != 12:
-            h += 12
-        if ap == "am" and h == 12:
-            h = 0
-        return datetime.strptime(f"{h}:{mi:02d}", "%H:%M").time()
     return None
 
 
