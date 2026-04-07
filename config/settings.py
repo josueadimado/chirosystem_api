@@ -162,10 +162,16 @@ CELERY_BEAT_SCHEDULE = {
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "")
+TWILIO_MESSAGING_SERVICE_SID = os.getenv("TWILIO_MESSAGING_SERVICE_SID", "")
 # Voice webhooks: public https base as Twilio sees it (no trailing slash), e.g. https://api.yourclinic.com
 TWILIO_VOICE_PUBLIC_BASE_URL = os.getenv("TWILIO_VOICE_PUBLIC_BASE_URL", "").strip().rstrip("/")
 # Dev only: skip Twilio X-Twilio-Signature check (never enable in production).
 VOICE_SKIP_TWILIO_SIGNATURE = os.getenv("VOICE_SKIP_TWILIO_SIGNATURE", "").strip() in ("1", "true", "yes")
+
+# ConversationRelay WebSocket server (voice_relay.py). Public wss:// URL that Twilio can reach.
+VOICE_WS_PUBLIC_URL = os.getenv("VOICE_WS_PUBLIC_URL", "").strip().rstrip("/")
+# ElevenLabs voice ID for ConversationRelay TTS (pick from Twilio's library or use a cloned voice).
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
 
 # OpenAI — optional; enables phone speech → structured booking on Twilio voice webhooks.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()

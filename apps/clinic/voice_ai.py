@@ -153,6 +153,62 @@ def match_service_from_speech(speech: str, services: list[dict]) -> dict | None:
     return None
 
 
+def match_services_from_speech(speech: str, services: list[dict]) -> list[dict]:
+    """
+    Detect one or more services from a single utterance.
+    Handles phrases like "chiropractic and massage", "both", "I want a
+    massage and also chiropractic", etc.
+    Returns a deduplicated list of matched services (1 or more).
+    """
+    s_lower = speech.lower().strip()
+    s_lower = re.sub(r"^(i('d| would) like( (a|an|the))?\s*|i want( (a|an|the))?\s*|"
+                     r"(can i|could i) (get|have|book)( (a|an|the))?\s*|"
+                     r"(let('s| us) (do|go with)( (a|an|the))?\s*)|"
+                     r"(the|a|an)\s+)", "", s_lower).strip()
+    s_lower = re.sub(r"\s*(please|thanks|thank you)$", "", s_lower).strip()
+
+    both_keywords = {"both", "two", "all", "everything"}
+    wants_both = any(kw in s_lower.split() for kw in both_keywords)
+
+    type_map = {
+        "chiropractic": "chiropractic", "chiro": "chiropractic",
+        "massage": "massage", "massages": "massage",
+    }
+
+    detected_types: set[str] = set()
+    for word, stype in type_map.items():
+        if word in s_lower:
+            detected_types.add(stype)
+
+    if wants_both and not detected_types:
+        detected_types = {"chiropractic", "massage"}
+
+    if len(detected_types) >= 2:
+        matched: list[dict] = []
+        seen_ids: set[int] = set()
+        for stype in detected_types:
+            for svc in services:
+                if svc.get("service_type") == stype and svc["id"] not in seen_ids:
+                    matched.append(svc)
+                    seen_ids.add(svc["id"])
+                    break
+        if matched:
+            return matched
+
+    name_matches: list[dict] = []
+    seen_ids_2: set[int] = set()
+    for svc in services:
+        name_l = svc["name"].lower()
+        if name_l in s_lower and svc["id"] not in seen_ids_2:
+            name_matches.append(svc)
+            seen_ids_2.add(svc["id"])
+    if name_matches:
+        return name_matches
+
+    single = match_service_from_speech(speech, services)
+    return [single] if single else []
+
+
 # ─── Provider matching (no AI) ────────────────────────────────────────
 
 def match_provider_from_speech(speech: str, providers: list[dict]) -> dict | None:

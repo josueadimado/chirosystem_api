@@ -51,6 +51,25 @@ services:
       - db
       - redis
 
+  voice-ws:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn voice_relay:app --host 0.0.0.0 --port 8001
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    env_file:
+      - .env
+    ports:
+      - "${VOICE_WS_HOST_PORT:-8002}:8001"
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+      - redis
+
   celery:
     build:
       context: .

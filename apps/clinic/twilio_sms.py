@@ -14,30 +14,38 @@ def _twilio_creds():
         sid = (getattr(settings, "TWILIO_ACCOUNT_SID", None) or "").strip()
         token = (getattr(settings, "TWILIO_AUTH_TOKEN", None) or "").strip()
         from_num = (getattr(settings, "TWILIO_PHONE_NUMBER", None) or "").strip()
+        msg_svc = (getattr(settings, "TWILIO_MESSAGING_SERVICE_SID", None) or "").strip()
     except Exception:
-        sid = token = from_num = ""
-    return sid, token, from_num
+        sid = token = from_num = msg_svc = ""
+    return sid, token, from_num, msg_svc
 
 
 def twilio_configured() -> bool:
-    sid, token, from_num = _twilio_creds()
-    return bool(sid and token and from_num)
+    sid, token, from_num, msg_svc = _twilio_creds()
+    return bool(sid and token and (from_num or msg_svc))
 
 
 def send_sms(*, to_e164: str, body: str) -> str | None:
     """
-    Send an SMS via Twilio. Returns Message SID on success, None on skip/failure.
-    Never raises to callers — logs errors (booking flow must not break on SMS failure).
+    Send an SMS via Twilio. Uses Messaging Service SID if configured
+    (required for 10DLC compliance), otherwise falls back to raw phone number.
+    Returns Message SID on success, None on skip/failure.
     """
     if not twilio_configured():
         logger.debug("Twilio not configured; skip SMS to %s", to_e164)
         return None
-    sid, token, from_num = _twilio_creds()
+    sid, token, from_num, msg_svc = _twilio_creds()
     try:
         from twilio.rest import Client
 
         client = Client(sid, token)
-        msg = client.messages.create(to=to_e164, from_=from_num, body=body)
+        params = {"to": to_e164, "body": body}
+        if msg_svc:
+            params["messaging_service_sid"] = msg_svc
+        else:
+            params["from_"] = from_num
+        msg = client.messages.create(**params)
+        logger.info("SMS sent: sid=%s to=%s status=%s", msg.sid, to_e164, msg.status)
         return msg.sid
     except Exception:
         logger.exception("Twilio SMS failed to=%s", to_e164)
@@ -57,10 +65,9 @@ def booking_confirmation_body(
     provider_display: str,
 ) -> str:
     return (
-        f"Relief Chiropractic: Hi {first_name}, your {service_name} visit is booked for "
-        f"{appt_date_display} at {appt_time_display} with {provider_display}. "
-        f"We'll send a reminder the day before."
-        f"{sms_footer()}"
+        f"Relief Chiropractic: Hi {first_name}, your {service_name} is confirmed for "
+        f"{appt_date_display} at {appt_time_display}. "
+        f"We'll remind you the day before.{sms_footer()}"
     )
 
 
@@ -73,16 +80,14 @@ def appointment_reminder_body(
     provider_display: str,
 ) -> str:
     return (
-        f"Reminder from Relief Chiropractic: {first_name}, tomorrow ({appt_date_display}) "
-        f"you have {service_name} at {appt_time_display} with {provider_display}."
-        f"{sms_footer()}"
+        f"Relief Chiropractic: Hi {first_name}, reminder — your {service_name} is "
+        f"tomorrow ({appt_date_display}) at {appt_time_display}.{sms_footer()}"
     )
 
 
 def provider_checkin_body(*, patient_name: str, time_display: str) -> str:
     return (
-        f"Relief Chiropractic: {patient_name} checked in at the kiosk. Scheduled {time_display} today."
-        f"{sms_footer()}"
+        f"Relief Chiropractic: {patient_name} checked in (scheduled {time_display}).{sms_footer()}"
     )
 
 
@@ -94,8 +99,8 @@ def provider_new_booking_body(
     appt_time_display: str,
 ) -> str:
     return (
-        f"Relief Chiropractic: New booking — {patient_name}, {service_name} on {appt_date_display} at {appt_time_display}."
-        f"{sms_footer()}"
+        f"Relief Chiropractic: New booking — {patient_name}, {service_name} "
+        f"on {appt_date_display} at {appt_time_display}.{sms_footer()}"
     )
 
 
@@ -107,8 +112,8 @@ def provider_schedule_change_body(
     changes_text: str,
 ) -> str:
     return (
-        f"Relief Chiropractic: Schedule update — {patient_name} on {appt_date_display} at {appt_time_display}. {changes_text}"
-        f"{sms_footer()}"
+        f"Relief Chiropractic: Update — {patient_name} on {appt_date_display} "
+        f"at {appt_time_display}. {changes_text}{sms_footer()}"
     )
 
 
@@ -119,6 +124,6 @@ def provider_reassigned_away_body(
     appt_time_display: str,
 ) -> str:
     return (
-        f"Relief Chiropractic: {patient_name} was moved to another provider (was {appt_date_display} {appt_time_display})."
-        f"{sms_footer()}"
+        f"Relief Chiropractic: {patient_name} was moved to another provider "
+        f"(was {appt_date_display} {appt_time_display}).{sms_footer()}"
     )

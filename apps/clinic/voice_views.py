@@ -1,11 +1,13 @@
 """
 Twilio Programmable Voice – AI booking assistant.
 
-Flow: Name → Service → Date/Time → Confirm → Book.
-If a slot is taken, loops back to Date/Time instead of hanging up.
-All steps use instant local parsing; OpenAI is only a date/time fallback.
+Now uses ConversationRelay (streaming STT + TTS via WebSocket) for ~2-3s latency
+instead of the old Gather/Say HTTP loop (~8s).
 
-Webhook: {TWILIO_VOICE_PUBLIC_BASE_URL}/api/v1/voice/twilio/incoming/
+The incoming webhook returns <Connect><ConversationRelay> TwiML that tells Twilio
+to open a WebSocket to our FastAPI voice_relay server.
+
+The old <Gather> fallback is kept but should never be called in normal operation.
 """
 
 from __future__ import annotations
@@ -89,7 +91,64 @@ def _listen(request, prompt: str, *, hint: str = "") -> HttpResponse:
     )
 
 
-# ─── Conversation state ───────────────────────────────────────────────
+# ─── Incoming call (ConversationRelay) ─────────────────────────────────
+
+@csrf_exempt
+@require_POST
+def twilio_voice_incoming(request):
+    if not _sig_ok(request, "twilio_voice_incoming"):
+        return HttpResponse("Forbidden", status=403)
+
+    sid = (request.POST.get("CallSid") or "").strip()
+    frm = (request.POST.get("From") or "").strip()
+    upsert_voice_call_log(call_sid=sid, from_number=frm, outcome=VoiceCallLog.Outcome.PROMPTED)
+
+    ws_url = (getattr(settings, "VOICE_WS_PUBLIC_URL", "") or "").strip().rstrip("/")
+    voice_id = (getattr(settings, "ELEVENLABS_VOICE_ID", "") or "").strip()
+    clinic = ClinicSettings.get_solo()
+
+    greeting = (
+        f"Hi, thanks for calling {escape(clinic.clinic_name)}! "
+        "I can help you book an appointment. "
+        "What's your first and last name?"
+    )
+
+    if ws_url:
+        voice_attr = ""
+        if voice_id:
+            voice_attr = f' voice="{escape(voice_id)}"'
+
+        twiml = (
+            f'<Connect>'
+            f'<ConversationRelay '
+            f'url="{escape(ws_url)}/ws/voice" '
+            f'welcomeGreeting="{escape(greeting)}" '
+            f'ttsProvider="ElevenLabs"'
+            f'{voice_attr} '
+            f'interruptible="true" '
+            f'dtmfDetection="true" '
+            f'/>'
+            f'</Connect>'
+        )
+        logger.info("Voice [%s] ConversationRelay → %s/ws/voice", sid[:8], ws_url)
+        return _xml(twiml)
+
+    logger.warning(
+        "VOICE_WS_PUBLIC_URL not set — falling back to legacy Gather loop. "
+        "Set VOICE_WS_PUBLIC_URL in .env to enable ConversationRelay."
+    )
+    return _listen(
+        request,
+        f"Hi, thanks for calling {escape(clinic.clinic_name)}! "
+        "I can help you book an appointment. "
+        "What's your first and last name?",
+    )
+
+
+# ─── Legacy gather fallback (kept for backward compat) ────────────────
+
+# The gather endpoint still works if ConversationRelay is not configured.
+# In normal operation with ConversationRelay, this is never called.
 
 def _key(sid: str) -> str:
     return f"voice_conv:{sid}"
@@ -115,30 +174,6 @@ def _svc_list(catalog: dict) -> str:
         parts.append("Massage: " + ", ".join(mass))
     return ". ".join(parts) if parts else ", ".join(s["name"] for s in svcs)
 
-
-# ─── Incoming call ─────────────────────────────────────────────────────
-
-@csrf_exempt
-@require_POST
-def twilio_voice_incoming(request):
-    if not _sig_ok(request, "twilio_voice_incoming"):
-        return HttpResponse("Forbidden", status=403)
-
-    sid = (request.POST.get("CallSid") or "").strip()
-    frm = (request.POST.get("From") or "").strip()
-    upsert_voice_call_log(call_sid=sid, from_number=frm, outcome=VoiceCallLog.Outcome.PROMPTED)
-    _put(sid, {"step": "name", "retries": 0, "from_num": frm})
-
-    clinic = ClinicSettings.get_solo()
-    return _listen(
-        request,
-        f"Hi, thanks for calling {escape(clinic.clinic_name)}! "
-        "I can help you book an appointment. "
-        "What's your first and last name?",
-    )
-
-
-# ─── Main gather router ───────────────────────────────────────────────
 
 @csrf_exempt
 @require_POST
@@ -185,7 +220,7 @@ def twilio_voice_gather(request):
     return handlers.get(step, _step_name)(request, sid, frm, speech, conv)
 
 
-# ─── Step 1: Name ─────────────────────────────────────────────────────
+# ─── Legacy step handlers ─────────────────────────────────────────────
 
 def _step_name(request, sid, frm, speech, conv):
     fn, ln = extract_name_from_speech(speech)
@@ -220,8 +255,6 @@ def _step_name(request, sid, frm, speech, conv):
         hint=", ".join(s["name"] for s in catalog.get("services", [])),
     )
 
-
-# ─── Step 2: Service ──────────────────────────────────────────────────
 
 def _step_service(request, sid, frm, speech, conv):
     catalog = conv.get("_catalog") or _booking_catalog_json()
@@ -264,8 +297,6 @@ def _step_service(request, sid, frm, speech, conv):
     )
 
 
-# ─── Step 3: Date & time ──────────────────────────────────────────────
-
 def _step_datetime(request, sid, frm, speech, conv):
     tz_name = getattr(settings, "CLINIC_TIMEZONE", "America/Detroit")
     today = timezone.now().astimezone(ZoneInfo(tz_name)).date()
@@ -289,9 +320,9 @@ def _step_datetime(request, sid, frm, speech, conv):
         if not appt_date and not start_time:
             msg = "I didn't catch the date or time. Could you say something like next Monday at 9 AM?"
         elif not appt_date:
-            msg = f"I got the time but missed the date. What day would you like?"
+            msg = "I got the time but missed the date. What day would you like?"
         else:
-            msg = f"I got the date but missed the time. What time works for you?"
+            msg = "I got the date but missed the time. What time works for you?"
         return _listen(request, msg)
 
     conv.update(appointment_date=appt_date, start_time=start_time, step="confirm", retries=0)
@@ -314,8 +345,6 @@ def _step_datetime(request, sid, frm, speech, conv):
     )
 
 
-# ─── Step 4: Confirm ──────────────────────────────────────────────────
-
 _YES_WORDS = {
     "yes", "yeah", "yep", "yup", "correct", "right", "sure", "ok", "okay",
     "confirm", "please", "go ahead", "book it", "sounds good", "perfect",
@@ -329,7 +358,6 @@ def _step_confirm(request, sid, frm, speech, conv):
     is_yes = any(w in lower for w in _YES_WORDS)
     is_no = any(w in lower for w in _NO_WORDS)
 
-    # ── Patient wants to change something ──
     if is_no and not is_yes:
         conv.update(step="datetime", retries=0)
         conv.pop("appointment_date", None)
@@ -340,7 +368,6 @@ def _step_confirm(request, sid, frm, speech, conv):
             "No problem! What other date and time would you like instead?",
         )
 
-    # ── Unclear response ──
     if not is_yes:
         conv["retries"] = conv.get("retries", 0) + 1
         if conv["retries"] >= MAX_RETRIES:
@@ -351,11 +378,8 @@ def _step_confirm(request, sid, frm, speech, conv):
         _put(sid, conv)
         return _listen(request, "Just say yes to confirm, or no to pick a different time.", hint="yes, no")
 
-    # ── Confirmed — try to book ──
     return _do_book(request, sid, frm, conv)
 
-
-# ─── Booking logic (with retry on slot conflict) ──────────────────────
 
 def _do_book(request, sid, frm, conv):
     phone = conv.get("from_num", frm)
@@ -428,7 +452,6 @@ def _do_book(request, sid, frm, conv):
             "What other date or time would work for you?",
         )
 
-    # ── Success! ──
     _end(sid)
     upsert_voice_call_log(call_sid=sid, from_number=frm, transcript=transcript,
                           outcome=VoiceCallLog.Outcome.BOOKED, appointment=appt)

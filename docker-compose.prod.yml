@@ -69,6 +69,40 @@ services:
       - default
       - web
 
+  voice-ws:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: chiroflow-voice-ws
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-config.settings}
+      DEBUG: "false"
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chiroflow_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-chiroflow}
+      CELERY_BROKER_URL: redis://redis:6379/0
+    command: uvicorn voice_relay:app --host 0.0.0.0 --port 8001 --workers 2
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${VOICE_WS_HOST_PORT:-8001}:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1',8001)); s.close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    stop_grace_period: 10s
+    networks:
+      - default
+      - web
+
   celery:
     build:
       context: .
