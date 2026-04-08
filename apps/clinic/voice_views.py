@@ -163,18 +163,22 @@ def twilio_voice_incoming(request):
         else:
             tts_provider = "ElevenLabs"
             tts_voice = tts_voice_setting or voice_id or "UgBBYS2sOqTuMpoF3BR0"
-        voice_attr = f' voice="{escape(tts_voice)}"'
-
+        # Nested <Language> matches Twilio's documented shape; some accounts fail if only parent attributes are set.
+        lang_block = (
+            f'<Language code="en-US" '
+            f'ttsProvider="{escape(tts_provider)}" voice="{escape(tts_voice)}" '
+            f'transcriptionProvider="Deepgram" speechModel="nova-2-general"/>'
+        )
         twiml = (
             f'<Connect>'
             f'<ConversationRelay '
             f'url="{escape(ws_url)}/ws/voice" '
             f'welcomeGreeting="{escape(greeting)}" '
-            f'ttsProvider="{escape(tts_provider)}"'
-            f'{voice_attr} '
+            f'language="en-US" '
             f'interruptible="true" '
-            f'dtmfDetection="true" '
-            f'/>'
+            f'dtmfDetection="true">'
+            f'{lang_block}'
+            f'</ConversationRelay>'
             f'</Connect>'
         )
         logger.info("Voice [%s] ConversationRelay → %s/ws/voice", sid[:8], ws_url)
