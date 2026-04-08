@@ -92,6 +92,44 @@ def _listen(request, prompt: str, *, hint: str = "") -> HttpResponse:
     )
 
 
+def _normalize_conversation_relay_ws_base(raw: str) -> str:
+    """
+    Twilio requires <ConversationRelay url="..."> to start with wss:// (not https://).
+    Accepts common mistakes: https/http origin, missing scheme, or path /ws/voice duplicated in env.
+    Returns origin only (no path), or "" if invalid.
+    """
+    u = (raw or "").strip().rstrip("/")
+    if not u:
+        return ""
+    low = u.lower()
+    if low.endswith("/ws/voice"):
+        u = u[: -len("/ws/voice")].rstrip("/")
+        low = u.lower()
+    if "://" not in u:
+        u = f"wss://{u.lstrip('/')}"
+        low = u.lower()
+    elif low.startswith("https://"):
+        u = "wss://" + u[8:]
+        logger.info(
+            "VOICE_WS_PUBLIC_URL used https://; Twilio ConversationRelay requires wss://. Normalized automatically."
+        )
+    elif low.startswith("http://"):
+        u = "wss://" + u[7:]
+        logger.warning(
+            "VOICE_WS_PUBLIC_URL used http://; normalized to wss://. "
+            "Twilio must reach TLS on port 443 for this host."
+        )
+    low = u.lower()
+    if not low.startswith("wss://"):
+        logger.error(
+            "VOICE_WS_PUBLIC_URL must start with wss:// for ConversationRelay (got %r). "
+            "Fix .env or proxy; falling back to Gather if this value is used.",
+            (raw or "")[:120],
+        )
+        return ""
+    return u.rstrip("/")
+
+
 # ─── Incoming call (ConversationRelay) ─────────────────────────────────
 
 @csrf_exempt
@@ -104,7 +142,8 @@ def twilio_voice_incoming(request):
     frm = (request.POST.get("From") or "").strip()
     upsert_voice_call_log(call_sid=sid, from_number=frm, outcome=VoiceCallLog.Outcome.PROMPTED)
 
-    ws_url = (getattr(settings, "VOICE_WS_PUBLIC_URL", "") or "").strip().rstrip("/")
+    ws_raw = (getattr(settings, "VOICE_WS_PUBLIC_URL", "") or "").strip()
+    ws_base = _normalize_conversation_relay_ws_base(ws_raw)
     voice_id = (getattr(settings, "ELEVENLABS_VOICE_ID", "") or "").strip()
     clinic = ClinicSettings.get_solo()
 
@@ -150,7 +189,8 @@ def twilio_voice_incoming(request):
         ]
         greeting = random.choice(new_greetings)
 
-    if ws_url:
+    if ws_base:
+        relay_ws_url = f"{ws_base}/ws/voice"
         # Twilio disconnects immediately if ttsProvider/voice combo is invalid or ElevenLabs isn't enabled on the account.
         tts_provider = (getattr(settings, "CONVERSATION_RELAY_TTS_PROVIDER", "") or "ElevenLabs").strip()
         tts_voice_setting = (getattr(settings, "CONVERSATION_RELAY_TTS_VOICE", "") or "").strip()
@@ -172,7 +212,7 @@ def twilio_voice_incoming(request):
         twiml = (
             f'<Connect>'
             f'<ConversationRelay '
-            f'url="{escape(ws_url)}/ws/voice" '
+            f'url="{escape(relay_ws_url)}" '
             f'welcomeGreeting="{escape(greeting)}" '
             f'language="en-US" '
             f'interruptible="true" '
@@ -181,12 +221,12 @@ def twilio_voice_incoming(request):
             f'</ConversationRelay>'
             f'</Connect>'
         )
-        logger.info("Voice [%s] ConversationRelay → %s/ws/voice", sid[:8], ws_url)
+        logger.info("Voice [%s] ConversationRelay url=%s", sid[:8], relay_ws_url)
         return _xml(twiml)
 
     logger.warning(
-        "VOICE_WS_PUBLIC_URL not set — falling back to legacy Gather loop. "
-        "Set VOICE_WS_PUBLIC_URL in .env to enable ConversationRelay."
+        "VOICE_WS_PUBLIC_URL missing or invalid — falling back to legacy Gather loop. "
+        "Set wss:// origin (e.g. wss://api.example.com) matching your public WebSocket proxy."
     )
     return _listen(
         request,
