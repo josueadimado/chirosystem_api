@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from asgiref.sync import sync_to_async
+
 from .models import VoiceCallLog
 
 
@@ -34,3 +36,27 @@ def upsert_voice_call_log(
     if appointment is not None:
         obj.appointment = appointment
     obj.save()
+
+
+# One wrapper for the whole process (do not call sync_to_async() inside each await).
+_upsert_voice_call_log_async = sync_to_async(upsert_voice_call_log, thread_sensitive=True)
+
+
+async def async_upsert_voice_call_log(
+    *,
+    call_sid: str,
+    from_number: str = "",
+    transcript: str | None = None,
+    outcome: str | None = None,
+    detail: str = "",
+    appointment=None,
+) -> None:
+    """Same as upsert_voice_call_log but safe to await from async (e.g. FastAPI WebSockets)."""
+    await _upsert_voice_call_log_async(
+        call_sid=call_sid,
+        from_number=from_number,
+        transcript=transcript,
+        outcome=outcome,
+        detail=detail,
+        appointment=appointment,
+    )

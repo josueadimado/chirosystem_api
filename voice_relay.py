@@ -29,6 +29,7 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
 django.setup()
 
 import httpx
+from asgiref.sync import sync_to_async
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from apps.clinic.models import Appointment, ClinicSettings, Patient, VoiceCallLog
@@ -43,11 +44,15 @@ from apps.clinic.voice_ai import (
     openai_parse_datetime,
     parse_datetime_from_speech,
 )
-from apps.clinic.voice_logging import upsert_voice_call_log
+from apps.clinic.voice_logging import async_upsert_voice_call_log, upsert_voice_call_log
 
 from django.conf import settings
 from django.utils import timezone
 from zoneinfo import ZoneInfo
+
+# ORM helpers for async WebSocket handlers (Django forbids sync DB in async context).
+_booking_catalog_async = sync_to_async(_booking_catalog_json, thread_sensitive=True)
+_clinic_get_solo_async = sync_to_async(ClinicSettings.get_solo, thread_sensitive=True)
 
 logger = logging.getLogger("voice_relay")
 
@@ -245,6 +250,37 @@ def _lookup_patient(from_number: str) -> Patient | None:
         return Patient.objects.filter(phone=normalized).first()
 
 
+def _returning_patient_voice_setup(from_number: str) -> dict | None:
+    """Load returning-patient context from DB (sync only). Returns None if unknown caller."""
+    patient = _lookup_patient(from_number)
+    if not patient:
+        return None
+    catalog = _booking_catalog_json()
+    last_sid = None
+    last_appt = (
+        Appointment.objects.filter(patient=patient)
+        .exclude(
+            status__in=[
+                Appointment.Status.CANCELLED,
+                Appointment.Status.NO_SHOW,
+            ],
+        )
+        .order_by("-appointment_date")
+        .first()
+    )
+    if last_appt and last_appt.booked_service_id:
+        last_sid = last_appt.booked_service_id
+    return {
+        "first_name": patient.first_name,
+        "last_name": patient.last_name,
+        "catalog": catalog,
+        "last_service_id": last_sid,
+    }
+
+
+_returning_setup_async = sync_to_async(_returning_patient_voice_setup, thread_sensitive=True)
+
+
 # ─── Off-script intent detection ──────────────────────────────────────
 
 _HOURS_PATTERNS = [
@@ -296,7 +332,7 @@ async def _handle_off_script(ws: WebSocket, state: ConversationState, speech: st
 
     # Business hours
     if any(p in lower for p in _HOURS_PATTERNS):
-        clinic = ClinicSettings.get_solo()
+        clinic = await _clinic_get_solo_async()
         hours_info = ""
         if clinic.business_hours:
             try:
@@ -320,7 +356,7 @@ async def _handle_off_script(ws: WebSocket, state: ConversationState, speech: st
 
     # Pricing
     if any(p in lower for p in _PRICE_PATTERNS):
-        catalog = state.catalog or _booking_catalog_json()
+        catalog = state.catalog or (await _booking_catalog_async())
         svcs = catalog.get("services") or []
         price_list = ", ".join(f"{s['name']}: ${s['price']} ({s['duration_minutes']} min)" for s in svcs)
         msg = await _llm_respond(
@@ -403,6 +439,9 @@ def _find_nearby_slots(
     return [label for _, label in slots[:max_suggestions]]
 
 
+_find_nearby_slots_async = sync_to_async(_find_nearby_slots, thread_sensitive=True)
+
+
 # ─── Step handlers ────────────────────────────────────────────────────
 
 async def handle_name(ws: WebSocket, state: ConversationState, speech: str):
@@ -418,7 +457,7 @@ async def handle_name(ws: WebSocket, state: ConversationState, speech: str):
     if not fn:
         state.retries += 1
         if state.retries >= MAX_RETRIES:
-            upsert_voice_call_log(
+            await async_upsert_voice_call_log(
                 call_sid=state.call_sid, from_number=state.from_number,
                 outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES, detail="name",
             )
@@ -443,7 +482,7 @@ async def handle_name(ws: WebSocket, state: ConversationState, speech: str):
     state.last_name = ln
     state.step = "service"
     state.retries = 0
-    state.catalog = _booking_catalog_json()
+    state.catalog = await _booking_catalog_async()
 
     services = _svc_list(state.catalog)
     greeting = await _llm_respond(
@@ -463,7 +502,7 @@ _SAME_AGAIN_PHRASES = [
 
 
 async def handle_service(ws: WebSocket, state: ConversationState, speech: str):
-    catalog = state.catalog or _booking_catalog_json()
+    catalog = state.catalog or (await _booking_catalog_async())
     all_services = catalog.get("services") or []
     pbs = catalog.get("providers_by_service") or {}
 
@@ -493,7 +532,7 @@ async def handle_service(ws: WebSocket, state: ConversationState, speech: str):
     if not matched:
         state.retries += 1
         if state.retries >= MAX_RETRIES:
-            upsert_voice_call_log(
+            await async_upsert_voice_call_log(
                 call_sid=state.call_sid, from_number=state.from_number,
                 outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES,
                 detail=f"service: {speech}",
@@ -596,7 +635,7 @@ async def _finish_service_selection(ws: WebSocket, state: ConversationState):
 
 
 async def handle_pick_service(ws: WebSocket, state: ConversationState, speech: str):
-    catalog = state.catalog or _booking_catalog_json()
+    catalog = state.catalog or (await _booking_catalog_async())
     all_services = catalog.get("services") or []
     pbs = catalog.get("providers_by_service") or {}
 
@@ -614,7 +653,7 @@ async def handle_pick_service(ws: WebSocket, state: ConversationState, speech: s
     if not picked:
         state.retries += 1
         if state.retries >= MAX_RETRIES:
-            upsert_voice_call_log(
+            await async_upsert_voice_call_log(
                 call_sid=state.call_sid, from_number=state.from_number,
                 outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES,
                 detail=f"pick_service ({current_cat}): {speech}",
@@ -717,7 +756,7 @@ async def handle_confirm_services(ws: WebSocket, state: ConversationState, speec
     if not is_yes:
         state.retries += 1
         if state.retries >= MAX_RETRIES:
-            upsert_voice_call_log(
+            await async_upsert_voice_call_log(
                 call_sid=state.call_sid, from_number=state.from_number,
                 outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES, detail="confirm_services",
             )
@@ -764,7 +803,7 @@ async def handle_datetime(ws: WebSocket, state: ConversationState, speech: str):
     if not appt_date or not start_time:
         state.retries += 1
         if state.retries >= MAX_RETRIES:
-            upsert_voice_call_log(
+            await async_upsert_voice_call_log(
                 call_sid=state.call_sid, from_number=state.from_number,
                 outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES,
                 detail=f"datetime: {speech}",
@@ -862,7 +901,7 @@ async def handle_confirm(ws: WebSocket, state: ConversationState, speech: str):
     if not is_yes:
         state.retries += 1
         if state.retries >= MAX_RETRIES:
-            upsert_voice_call_log(
+            await async_upsert_voice_call_log(
                 call_sid=state.call_sid, from_number=state.from_number,
                 outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES, detail="confirm",
             )
@@ -929,6 +968,49 @@ async def do_book_all(ws: WebSocket, state: ConversationState):
     await _build_final_message(ws, state, booked)
 
 
+def _book_single_try_sync(
+    payload: dict,
+    *,
+    call_sid: str,
+    from_number: str,
+    transcript: str,
+) -> tuple[str, object | None]:
+    """Run serializer + booking in one sync DB transaction context. Returns ('ok', appt) or error tag."""
+    ser = PublicBookingSerializer(data=payload)
+    if not ser.is_valid():
+        logger.info("Voice serializer errors: %s", ser.errors)
+        upsert_voice_call_log(
+            call_sid=call_sid,
+            from_number=from_number,
+            transcript=transcript,
+            outcome=VoiceCallLog.Outcome.SERIALIZER_REJECTED,
+            detail=str(ser.errors)[:2000],
+        )
+        return "serializer", None
+    appt, err = create_appointment_from_public_booking(ser.validated_data)
+    if err:
+        logger.info("Voice booking error: %s", err)
+        upsert_voice_call_log(
+            call_sid=call_sid,
+            from_number=from_number,
+            transcript=transcript,
+            outcome=VoiceCallLog.Outcome.SLOT_OR_RULE_ERROR,
+            detail=err[:2000],
+        )
+        return "slot", None
+    upsert_voice_call_log(
+        call_sid=call_sid,
+        from_number=from_number,
+        transcript=transcript,
+        outcome=VoiceCallLog.Outcome.BOOKED,
+        appointment=appt,
+    )
+    return "ok", appt
+
+
+_book_single_try_async = sync_to_async(_book_single_try_sync, thread_sensitive=True)
+
+
 async def _book_single(
     ws: WebSocket, state: ConversationState, svc: ServiceEntry, phone: str
 ) -> tuple | None:
@@ -977,36 +1059,19 @@ async def _book_single(
         f"Date: {svc.appointment_date}, Time: {svc.start_time}"
     )
 
-    ser = PublicBookingSerializer(data=payload)
-    if not ser.is_valid():
-        logger.info("Voice serializer errors: %s", ser.errors)
-        upsert_voice_call_log(
-            call_sid=state.call_sid, from_number=state.from_number,
-            transcript=transcript,
-            outcome=VoiceCallLog.Outcome.SERIALIZER_REJECTED,
-            detail=str(ser.errors)[:2000],
-        )
-        await _offer_alternative_slots(ws, state, svc, t)
-        return None
-
-    appt, err = create_appointment_from_public_booking(ser.validated_data)
-
-    if err:
-        logger.info("Voice booking error: %s", err)
-        upsert_voice_call_log(
-            call_sid=state.call_sid, from_number=state.from_number,
-            transcript=transcript,
-            outcome=VoiceCallLog.Outcome.SLOT_OR_RULE_ERROR,
-            detail=err[:2000],
-        )
-        await _offer_alternative_slots(ws, state, svc, t)
-        return None
-
-    upsert_voice_call_log(
-        call_sid=state.call_sid, from_number=state.from_number,
+    status, appt = await _book_single_try_async(
+        payload,
+        call_sid=state.call_sid,
+        from_number=state.from_number,
         transcript=transcript,
-        outcome=VoiceCallLog.Outcome.BOOKED, appointment=appt,
     )
+    if status == "serializer":
+        await _offer_alternative_slots(ws, state, svc, t)
+        return None
+    if status == "slot":
+        await _offer_alternative_slots(ws, state, svc, t)
+        return None
+
     td = appt.start_time.strftime("%I:%M %p")
     dd = appt.appointment_date.strftime("%A, %B %d")
     return appt, td, dd
@@ -1022,7 +1087,9 @@ async def _offer_alternative_slots(ws, state, svc, rejected_time):
 
     try:
         appt_date = date_type.fromisoformat(svc.appointment_date_backup)
-        nearby = _find_nearby_slots(svc.provider_id, svc.service_id, appt_date, rejected_time)
+        nearby = await _find_nearby_slots_async(
+            svc.provider_id, svc.service_id, appt_date, rejected_time
+        )
     except Exception:
         nearby = []
 
@@ -1121,7 +1188,7 @@ async def voice_websocket(ws: WebSocket):
                 from_number = msg.get("from", "")
                 state = ConversationState(call_sid, from_number)
 
-                upsert_voice_call_log(
+                await async_upsert_voice_call_log(
                     call_sid=call_sid,
                     from_number=from_number,
                     outcome=VoiceCallLog.Outcome.PROMPTED,
@@ -1130,28 +1197,18 @@ async def voice_websocket(ws: WebSocket):
 
                 # Returning patient: TwiML greeting already welcomed them
                 # and asked about services — just set up state silently
-                patient = _lookup_patient(from_number)
-                if patient:
-                    state.first_name = patient.first_name
-                    state.last_name = patient.last_name
+                returning = await _returning_setup_async(from_number)
+                if returning:
+                    state.first_name = returning["first_name"]
+                    state.last_name = returning["last_name"]
                     state.step = "service"
                     state.is_returning = True
-                    state.catalog = _booking_catalog_json()
-                    # Store last booked service for "same thing" recognition
-                    last_appt = (
-                        Appointment.objects.filter(patient=patient)
-                        .exclude(status__in=[
-                            Appointment.Status.CANCELLED,
-                            Appointment.Status.NO_SHOW,
-                        ])
-                        .order_by("-appointment_date")
-                        .first()
-                    )
-                    if last_appt and last_appt.booked_service_id:
-                        state.last_service_id = last_appt.booked_service_id
+                    state.catalog = returning["catalog"]
+                    if returning["last_service_id"]:
+                        state.last_service_id = returning["last_service_id"]
                     logger.info(
                         "Voice WS [%s] returning patient: %s %s",
-                        call_sid[:8], patient.first_name, patient.last_name,
+                        call_sid[:8], returning["first_name"], returning["last_name"],
                     )
 
             elif msg_type == "prompt":
@@ -1166,7 +1223,7 @@ async def voice_websocket(ws: WebSocket):
                     state.call_sid[:8], state.step, speech[:120] if speech else "",
                 )
 
-                upsert_voice_call_log(
+                await async_upsert_voice_call_log(
                     call_sid=state.call_sid,
                     from_number=state.from_number,
                     transcript=speech,
@@ -1175,7 +1232,7 @@ async def voice_websocket(ws: WebSocket):
                 if not speech:
                     state.retries += 1
                     if state.retries >= MAX_RETRIES:
-                        upsert_voice_call_log(
+                        await async_upsert_voice_call_log(
                             call_sid=state.call_sid,
                             from_number=state.from_number,
                             outcome=VoiceCallLog.Outcome.EMPTY_SPEECH,
@@ -1246,7 +1303,7 @@ async def voice_websocket(ws: WebSocket):
         _last_responses.pop(id(ws), None)
         logger.exception("Voice WS unexpected error")
         if state:
-            upsert_voice_call_log(
+            await async_upsert_voice_call_log(
                 call_sid=state.call_sid,
                 from_number=state.from_number,
                 outcome=VoiceCallLog.Outcome.OPENAI_FAILED,
