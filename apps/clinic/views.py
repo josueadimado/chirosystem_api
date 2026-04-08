@@ -225,7 +225,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             .order_by("_book_order", "name")
         )
         services = list(
-            bookable.values("id", "name", "duration_minutes", "price", "service_type")
+            bookable.values("id", "name", "description", "duration_minutes", "price", "service_type")
         )
         providers_by_service = {}
         for svc in bookable.prefetch_related("providers"):
@@ -262,10 +262,38 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         if not provider.services.filter(pk=service.id).exists():
             return Response({"detail": "Provider does not offer this service."}, status=status.HTTP_400_BAD_REQUEST)
 
+        import re as _re
         from datetime import time as time_cls
 
+        # Read business hours from ClinicSettings for the requested day
         DAY_START_HOUR, DAY_START_MIN = 9, 0
         DAY_END_HOUR, DAY_END_MIN = 18, 0
+
+        day_name = appt_date.strftime("%A")
+        clinic = ClinicSettings.get_solo()
+        bh_list = clinic.business_hours or []
+        for entry in bh_list:
+            if entry.get("day", "").lower() == day_name.lower():
+                hours_str = entry.get("hours", "")
+                if hours_str.lower() in ("closed", ""):
+                    return Response({"available_slots": []})
+                parts = _re.split(r"\s*[–—-]\s*", hours_str)
+                if len(parts) == 2:
+                    for i, part in enumerate(parts):
+                        t_match = _re.match(r"(\d{1,2}):(\d{2})\s*(AM|PM)", part.strip(), _re.I)
+                        if t_match:
+                            h = int(t_match.group(1))
+                            m = int(t_match.group(2))
+                            ap = t_match.group(3).upper()
+                            if ap == "PM" and h != 12:
+                                h += 12
+                            if ap == "AM" and h == 12:
+                                h = 0
+                            if i == 0:
+                                DAY_START_HOUR, DAY_START_MIN = h, m
+                            else:
+                                DAY_END_HOUR, DAY_END_MIN = h, m
+                break
 
         duration = service.duration_minutes
         SLOT_INTERVAL = 15 if service.service_type == "chiropractic" else max(duration, 15)

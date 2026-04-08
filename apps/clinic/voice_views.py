@@ -27,7 +27,8 @@ from django.views.decorators.http import require_POST
 from twilio.request_validator import RequestValidator
 from zoneinfo import ZoneInfo
 
-from .models import ClinicSettings, VoiceCallLog
+from .models import Appointment, ClinicSettings, Patient, VoiceCallLog
+from .utils import normalize_phone
 from .public_booking_service import create_appointment_from_public_booking
 from .serializers import PublicBookingSerializer
 from .voice_ai import (
@@ -107,11 +108,47 @@ def twilio_voice_incoming(request):
     voice_id = (getattr(settings, "ELEVENLABS_VOICE_ID", "") or "").strip()
     clinic = ClinicSettings.get_solo()
 
-    greeting = (
-        f"Hi, thanks for calling {escape(clinic.clinic_name)}! "
-        "I can help you book an appointment. "
-        "What's your first and last name?"
-    )
+    import random
+    clinic_name = escape(clinic.clinic_name)
+
+    # Detect returning patients by phone before the WebSocket connects
+    patient = None
+    norm_phone = normalize_phone(frm)
+    if norm_phone:
+        patient = Patient.objects.filter(phone=norm_phone).first()
+
+    if patient:
+        pname = escape(f"{patient.first_name} {patient.last_name}".strip())
+        # Check recent appointment history for smart suggestions
+        last_appt = (
+            Appointment.objects.filter(patient=patient)
+            .exclude(status__in=[Appointment.Status.CANCELLED, Appointment.Status.NO_SHOW])
+            .order_by("-appointment_date")
+            .first()
+        )
+        if last_appt and last_appt.booked_service:
+            last_svc = escape(last_appt.booked_service.name)
+            returning_greetings = [
+                f"Hey {pname}! Welcome back to {clinic_name}. Last time you had a {last_svc} — would you like to book that again, or try something different?",
+                f"Hi {pname}, great to hear from you again! I see your last visit was for a {last_svc}. Want to go with that again, or something new?",
+                f"{pname}! So glad you called back. Your last appointment was a {last_svc} — should I set up the same thing, or would you like to see what else we offer?",
+            ]
+        else:
+            returning_greetings = [
+                f"Hey {pname}! Welcome back to {clinic_name}. What can I help you book today?",
+                f"Hi {pname}, good to hear from you again! What service would you like to schedule?",
+                f"{pname}! Great to have you back at {clinic_name}. What are you looking to book today?",
+            ]
+        greeting = random.choice(returning_greetings)
+    else:
+        new_greetings = [
+            f"Hey there! Thanks for calling {clinic_name}. I'm Sarah and I'd love to help you get an appointment set up. Could I get your first and last name?",
+            f"Hi! You've reached {clinic_name}, this is Sarah. I can help you book an appointment real quick. What's your name?",
+            f"Thanks for calling {clinic_name}! I'm Sarah. Let's get you scheduled — can I start with your first and last name?",
+            f"Hey, welcome to {clinic_name}! I'm Sarah and I'll help you book an appointment. What's your name?",
+            f"Hi there! Thanks for calling {clinic_name}. I'm Sarah — I can get you booked in just a minute. What's your first and last name?",
+        ]
+        greeting = random.choice(new_greetings)
 
     if ws_url:
         voice_attr = ""
