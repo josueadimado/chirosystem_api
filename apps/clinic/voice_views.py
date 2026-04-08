@@ -151,16 +151,26 @@ def twilio_voice_incoming(request):
         greeting = random.choice(new_greetings)
 
     if ws_url:
-        voice_attr = ""
-        if voice_id:
-            voice_attr = f' voice="{escape(voice_id)}"'
+        # Twilio disconnects immediately if ttsProvider/voice combo is invalid or ElevenLabs isn't enabled on the account.
+        tts_provider = (getattr(settings, "CONVERSATION_RELAY_TTS_PROVIDER", "") or "ElevenLabs").strip()
+        tts_voice_setting = (getattr(settings, "CONVERSATION_RELAY_TTS_VOICE", "") or "").strip()
+        if tts_provider.lower() == "google":
+            tts_provider = "Google"
+            tts_voice = tts_voice_setting or "en-US-Journey-O"
+        elif tts_provider.lower() == "amazon":
+            tts_provider = "Amazon"
+            tts_voice = tts_voice_setting or "Joanna-Neural"
+        else:
+            tts_provider = "ElevenLabs"
+            tts_voice = tts_voice_setting or voice_id or "UgBBYS2sOqTuMpoF3BR0"
+        voice_attr = f' voice="{escape(tts_voice)}"'
 
         twiml = (
             f'<Connect>'
             f'<ConversationRelay '
             f'url="{escape(ws_url)}/ws/voice" '
             f'welcomeGreeting="{escape(greeting)}" '
-            f'ttsProvider="ElevenLabs"'
+            f'ttsProvider="{escape(tts_provider)}"'
             f'{voice_attr} '
             f'interruptible="true" '
             f'dtmfDetection="true" '

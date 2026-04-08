@@ -172,6 +172,10 @@ VOICE_SKIP_TWILIO_SIGNATURE = os.getenv("VOICE_SKIP_TWILIO_SIGNATURE", "").strip
 VOICE_WS_PUBLIC_URL = os.getenv("VOICE_WS_PUBLIC_URL", "").strip().rstrip("/")
 # ElevenLabs voice ID for ConversationRelay TTS (pick from Twilio's library or use a cloned voice).
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
+# ConversationRelay TTS: ElevenLabs | Google | Amazon. Use Google if calls drop immediately (Twilio/ElevenLabs setup).
+CONVERSATION_RELAY_TTS_PROVIDER = os.getenv("CONVERSATION_RELAY_TTS_PROVIDER", "ElevenLabs").strip() or "ElevenLabs"
+# Voice name for that provider (Twilio docs). Google example: en-US-Journey-O. Leave blank for provider defaults.
+CONVERSATION_RELAY_TTS_VOICE = os.getenv("CONVERSATION_RELAY_TTS_VOICE", "").strip()
 
 # OpenAI — optional; enables phone speech → structured booking on Twilio voice webhooks.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
