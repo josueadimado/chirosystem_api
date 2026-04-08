@@ -53,6 +53,7 @@ from zoneinfo import ZoneInfo
 # ORM helpers for async WebSocket handlers (Django forbids sync DB in async context).
 _booking_catalog_async = sync_to_async(_booking_catalog_json, thread_sensitive=True)
 _clinic_get_solo_async = sync_to_async(ClinicSettings.get_solo, thread_sensitive=True)
+_openai_parse_datetime_async = sync_to_async(openai_parse_datetime, thread_sensitive=True)
 
 logger = logging.getLogger("voice_relay")
 
@@ -68,7 +69,8 @@ _http_client: httpx.AsyncClient | None = None
 async def _get_http_client() -> httpx.AsyncClient:
     global _http_client
     if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(timeout=8.0)
+        # Slightly longer default for voice (LLM + streaming reads).
+        _http_client = httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=10.0))
     return _http_client
 
 
@@ -109,7 +111,7 @@ async def _llm_respond(instruction: str, fallback: str) -> str:
     if not api_key.strip():
         return fallback
 
-    model = getattr(settings, "OPENAI_VOICE_MODEL", "gpt-4o-mini") or "gpt-4o-mini"
+    model = getattr(settings, "OPENAI_VOICE_MODEL", None) or "gpt-5.4-nano"
 
     try:
         client = await _get_http_client()
@@ -121,8 +123,8 @@ async def _llm_respond(instruction: str, fallback: str) -> str:
             },
             json={
                 "model": model,
-                "temperature": 0.9,
-                "max_tokens": 150,
+                "temperature": 0.75,
+                "max_tokens": 120,
                 "messages": [
                     {"role": "system", "content": RECEPTIONIST_PERSONA},
                     {"role": "user", "content": instruction},
@@ -137,6 +139,92 @@ async def _llm_respond(instruction: str, fallback: str) -> str:
     except Exception:
         logger.exception("LLM response generation failed, using fallback")
         return fallback
+
+
+async def _stream_openai_tokens_to_ws(ws: WebSocket, instruction: str, fallback: str) -> str:
+    """
+    Stream chat completion deltas to Twilio as they arrive (last=false), then one final last=true.
+    Twilio recommends this over a single blob for lower latency to first audio.
+    """
+    api_key = (getattr(settings, "OPENAI_API_KEY", "") or "").strip()
+    if not api_key:
+        await _send_text(ws, fallback)
+        return fallback
+
+    model = getattr(settings, "OPENAI_VOICE_MODEL", None) or "gpt-5.4-nano"
+    queued: str | None = None
+    full_parts: list[str] = []
+
+    try:
+        client = await _get_http_client()
+        async with client.stream(
+            "POST",
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "temperature": 0.75,
+                "max_tokens": 120,
+                "stream": True,
+                "messages": [
+                    {"role": "system", "content": RECEPTIONIST_PERSONA},
+                    {"role": "user", "content": instruction},
+                ],
+            },
+            timeout=httpx.Timeout(45.0, connect=10.0),
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                delta = (choices[0].get("delta") or {})
+                content = delta.get("content") or ""
+                if not content:
+                    continue
+                full_parts.append(content)
+                if queued is not None:
+                    await ws.send_json({"type": "text", "token": queued, "last": False})
+                queued = content
+
+        if queued is not None:
+            await ws.send_json({"type": "text", "token": queued, "last": True})
+        full = "".join(full_parts).strip().strip('"').strip("'")
+        if not full:
+            await _send_text(ws, fallback)
+            return fallback
+        _last_responses[id(ws)] = full
+        return full
+    except Exception:
+        logger.exception("OpenAI streaming failed, using fallback")
+        await _send_text(ws, fallback)
+        return fallback
+
+
+async def _speak_llm(ws: WebSocket, instruction: str, fallback: str) -> str:
+    """Generate Sarah's line: stream to Twilio when VOICE_LLM_STREAM is on, else one round-trip."""
+    if getattr(settings, "VOICE_LLM_STREAM", True) and (getattr(settings, "OPENAI_API_KEY", "") or "").strip():
+        return await _stream_openai_tokens_to_ws(ws, instruction, fallback)
+    text = await _llm_respond(instruction, fallback)
+    await _send_text(ws, text)
+    return text
+
+
+async def _end_session_speaking_llm(ws: WebSocket, instruction: str, fallback: str):
+    await _speak_llm(ws, instruction, fallback)
+    await ws.send_json({"type": "end"})
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────
@@ -322,12 +410,12 @@ async def _handle_off_script(ws: WebSocket, state: ConversationState, speech: st
 
     # Transfer to human
     if any(p in lower for p in _TRANSFER_PATTERNS):
-        msg = await _llm_respond(
+        await _end_session_speaking_llm(
+            ws,
             "The caller wants to speak to a real person. Say something warm like "
             "'Absolutely, let me connect you to the front desk.' Then end the session.",
             "Of course! Let me transfer you to our front desk right now. One moment!",
         )
-        await _end_session(ws, msg)
         return True
 
     # Business hours
@@ -346,12 +434,12 @@ async def _handle_off_script(ws: WebSocket, state: ConversationState, speech: st
                 hours_info = "Monday to Friday, 9 AM to 6 PM"
         else:
             hours_info = "Monday to Friday, 9 AM to 6 PM"
-        msg = await _llm_respond(
+        await _speak_llm(
+            ws,
             f"The caller asked about business hours. Answer them, then bring them back to booking. "
             f"REQUIRED FACTS — hours: {hours_info}. Current step: {state.step}.",
             f"Our hours are {hours_info}. Now, would you like to go ahead and book an appointment?",
         )
-        await _send_text(ws, msg)
         return True
 
     # Pricing
@@ -359,23 +447,23 @@ async def _handle_off_script(ws: WebSocket, state: ConversationState, speech: st
         catalog = state.catalog or (await _booking_catalog_async())
         svcs = catalog.get("services") or []
         price_list = ", ".join(f"{s['name']}: ${s['price']} ({s['duration_minutes']} min)" for s in svcs)
-        msg = await _llm_respond(
+        await _speak_llm(
+            ws,
             f"The caller asked about pricing. Tell them the prices, then guide back to booking. "
             f"REQUIRED FACTS — {price_list}.",
             f"Here are our prices: {price_list}. Would you like to book one of these?",
         )
-        await _send_text(ws, msg)
         return True
 
     # Cancel / reschedule
     if any(p in lower for p in _CANCEL_PATTERNS):
-        msg = await _llm_respond(
+        await _speak_llm(
+            ws,
             "The caller wants to cancel or reschedule. Let them know they can call the front desk "
             "or visit the website for that. Offer to book a new appointment if they want.",
             "For cancellations or rescheduling, you can call our front desk directly or visit our website. "
             "Would you like to book a new appointment instead?",
         )
-        await _send_text(ws, msg)
         return True
 
     return False
@@ -461,21 +549,21 @@ async def handle_name(ws: WebSocket, state: ConversationState, speech: str):
                 call_sid=state.call_sid, from_number=state.from_number,
                 outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES, detail="name",
             )
-            farewell = await _llm_respond(
+            await _end_session_speaking_llm(
+                ws,
                 "The caller has been silent or unintelligible multiple times. "
                 "Politely say goodbye and suggest they book online or call back later. "
                 "Be empathetic, not frustrated.",
                 "I'm having trouble hearing you. Please call back or book online at our website. Goodbye!",
             )
-            await _end_session(ws, farewell)
             return
-        retry_msg = await _llm_respond(
+        await _speak_llm(
+            ws,
             "You couldn't hear the caller's name clearly. "
             "Ask them to repeat it naturally — don't sound robotic. "
             "Maybe say something like 'I didn't quite catch that' or 'sorry, could you say that again?'",
             "Sorry, I didn't quite catch your name. Could you say it one more time for me?",
         )
-        await _send_text(ws, retry_msg)
         return
 
     state.first_name = fn
@@ -485,13 +573,13 @@ async def handle_name(ws: WebSocket, state: ConversationState, speech: str):
     state.catalog = await _booking_catalog_async()
 
     services = _svc_list(state.catalog)
-    greeting = await _llm_respond(
+    await _speak_llm(
+        ws,
         f"The caller's name is {fn} {ln}. Greet them warmly by name. "
         f"Then ask what service they'd like. Mention they can book more than one. "
         f"REQUIRED FACTS — available services: {services}",
         f"Great to meet you, {fn}! We offer: {services}. Which one would you like? You can also book more than one.",
     )
-    await _send_text(ws, greeting)
 
 
 _SAME_AGAIN_PHRASES = [
@@ -537,21 +625,21 @@ async def handle_service(ws: WebSocket, state: ConversationState, speech: str):
                 outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES,
                 detail=f"service: {speech}",
             )
-            farewell = await _llm_respond(
+            await _end_session_speaking_llm(
+                ws,
                 "The caller keeps requesting something you can't identify as a service. "
                 "Apologize naturally, suggest they book online, and say goodbye warmly.",
                 "I'm sorry, I'm not able to find that service. You can always book on our website. Thanks for calling!",
             )
-            await _end_session(ws, farewell)
             return
         svc_list = _svc_list(catalog)
-        retry = await _llm_respond(
+        await _speak_llm(
+            ws,
             f"The caller said something you couldn't match to a service. "
             f"They said: \"{speech}\". Apologize naturally and list the available services. "
             f"REQUIRED FACTS — available services: {svc_list}",
             f"Hmm, I didn't quite catch which service. We have: {svc_list}. Which sounds good?",
         )
-        await _send_text(ws, retry)
         return
 
     state.retries = 0
@@ -583,13 +671,13 @@ async def handle_service(ws: WebSocket, state: ConversationState, speech: str):
         cat_services = [s for s in all_services if s.get("service_type") == cat]
         names = ", ".join(s["name"] for s in cat_services)
         label = "chiropractic" if cat == "chiropractic" else "massage"
-        pick_msg = await _llm_respond(
+        await _speak_llm(
+            ws,
             f"The caller wants {label} but there are multiple {label} options: {names}. "
             f"Ask which specific one they'd like. Be conversational about it. "
             f"REQUIRED FACTS — options: {names}",
             f"For {label}, we actually have a few options: {names}. Which one sounds right for you?",
         )
-        await _send_text(ws, pick_msg)
         return
 
     state.current_svc_idx = 0
@@ -615,23 +703,23 @@ async def _finish_service_selection(ws: WebSocket, state: ConversationState):
     if state.is_multi:
         state.step = "confirm_services"
         names = _svc_names([{"name": s.service_name} for s in state.services])
-        confirm_msg = await _llm_respond(
+        await _speak_llm(
+            ws,
             f"The caller selected multiple services: {names}. "
             f"Confirm with them naturally — like 'so you want both X and Y, right?' "
             f"REQUIRED FACTS — selected services: {names}",
             f"So you'd like both {names} — is that right?",
         )
-        await _send_text(ws, confirm_msg)
     else:
         svc = state.services[0]
         state.step = "datetime"
-        datetime_msg = await _llm_respond(
+        await _speak_llm(
+            ws,
             f"The caller chose {svc.service_name} ({svc.service_duration} min, ${svc.service_price}). "
             f"Acknowledge their choice positively and ask what date and time works for them. "
             f"REQUIRED FACTS — service: {svc.service_name}",
             f"Great choice! {svc.service_name} it is. What date and time work best for you?",
         )
-        await _send_text(ws, datetime_msg)
 
 
 async def handle_pick_service(ws: WebSocket, state: ConversationState, speech: str):
@@ -661,13 +749,13 @@ async def handle_pick_service(ws: WebSocket, state: ConversationState, speech: s
             await _end_session(ws, "No worries at all — you can always book on our website. Thanks for calling!")
             return
         names = ", ".join(s["name"] for s in cat_services)
-        retry = await _llm_respond(
+        await _speak_llm(
+            ws,
             f"The caller tried to pick a specific {current_cat} service but you couldn't match it. "
             f"They said: \"{speech}\". Ask again naturally. "
             f"REQUIRED FACTS — options: {names}",
             f"I didn't quite get which one. We have: {names}. Which would you prefer?",
         )
-        await _send_text(ws, retry)
         return
 
     state.retries = 0
@@ -683,12 +771,12 @@ async def handle_pick_service(ws: WebSocket, state: ConversationState, speech: s
         next_svcs = [s for s in all_services if s.get("service_type") == next_cat]
         names = ", ".join(s["name"] for s in next_svcs)
         label = "chiropractic" if next_cat == "chiropractic" else "massage"
-        next_msg = await _llm_respond(
+        await _speak_llm(
+            ws,
             f"Great, they picked {picked['name']}. Now ask about their {label} preference. "
             f"REQUIRED FACTS — options: {names}",
             f"Got it! And for {label}, we have: {names}. Which one?",
         )
-        await _send_text(ws, next_msg)
         return
 
     state.current_svc_idx = 0
@@ -745,12 +833,12 @@ async def handle_confirm_services(ws: WebSocket, state: ConversationState, speec
         state.step = "service"
         state.retries = 0
         state.services = []
-        restart = await _llm_respond(
+        await _speak_llm(
+            ws,
             "The caller changed their mind about the services. "
             "Be understanding and ask what they'd like instead. Keep it casual.",
             "No problem at all! What service would you like instead?",
         )
-        await _send_text(ws, restart)
         return
 
     if not is_yes:
@@ -763,30 +851,31 @@ async def handle_confirm_services(ws: WebSocket, state: ConversationState, speec
             await _end_session(ws, "No worries, you can book on our website anytime. Thanks for calling!")
             return
         names = _svc_names([{"name": s.service_name} for s in state.services])
-        nudge = await _llm_respond(
+        await _speak_llm(
+            ws,
             f"The caller's response was unclear. You need a yes or no about booking {names}. "
             f"Ask again in a friendly way. REQUIRED FACTS — services: {names}",
             f"Just checking — did you want both {names}? Just say yes or no.",
         )
-        await _send_text(ws, nudge)
         return
 
     state.step = "datetime"
     state.retries = 0
     svc = state.current_service
     if state.is_multi:
-        datetime_msg = await _llm_respond(
+        await _speak_llm(
+            ws,
             f"The caller confirmed they want both services. Now ask about date and time. "
             f"Mention you'll start scheduling with {svc.service_name}. "
             f"REQUIRED FACTS — first service: {svc.service_name}",
             f"Awesome! Let's get those scheduled. Starting with {svc.service_name} — what date and time work for you?",
         )
     else:
-        datetime_msg = await _llm_respond(
+        await _speak_llm(
+            ws,
             "The caller confirmed the service. Ask what date and time works for them. Be upbeat.",
             "Perfect! What date and time work best for you?",
         )
-    await _send_text(ws, datetime_msg)
 
 
 async def handle_datetime(ws: WebSocket, state: ConversationState, speech: str):
@@ -796,7 +885,7 @@ async def handle_datetime(ws: WebSocket, state: ConversationState, speech: str):
     appt_date, start_time = parse_datetime_from_speech(speech, today)
 
     if not appt_date or not start_time:
-        ai_date, ai_time = openai_parse_datetime(speech, today.isoformat())
+        ai_date, ai_time = await _openai_parse_datetime_async(speech, today.isoformat())
         appt_date = appt_date or ai_date
         start_time = start_time or ai_time
 
@@ -808,13 +897,13 @@ async def handle_datetime(ws: WebSocket, state: ConversationState, speech: str):
                 outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES,
                 detail=f"datetime: {speech}",
             )
-            farewell = await _llm_respond(
+            await _end_session_speaking_llm(
+                ws,
                 "You've tried multiple times to understand the date/time but can't. "
                 "Apologize, suggest booking online, and say goodbye warmly.",
                 "I'm really sorry about this — I'm having trouble with the date. "
                 "You can always book on our website anytime. Thanks for calling!",
             )
-            await _end_session(ws, farewell)
             return
 
         if not appt_date and not start_time:
@@ -823,13 +912,13 @@ async def handle_datetime(ws: WebSocket, state: ConversationState, speech: str):
             hint = "the time but not the date"
         else:
             hint = "the date but not the time"
-        retry = await _llm_respond(
+        await _speak_llm(
+            ws,
             f"The caller said \"{speech}\" for date/time but you only caught {hint}. "
             f"Ask them to clarify naturally. Give an example like 'next Tuesday at 2 PM'. "
             f"Don't be robotic about it.",
             "I didn't quite get that. Could you say something like 'next Tuesday at 2 PM'?",
         )
-        await _send_text(ws, retry)
         return
 
     svc = state.current_service
@@ -852,7 +941,8 @@ async def handle_datetime(ws: WebSocket, state: ConversationState, speech: str):
         end_t = _add_minutes(t, svc.service_duration) if t else None
         next_start = _add_minutes(end_t, BETWEEN_SERVICE_BUFFER_MINUTES) if end_t else None
         next_td = next_start.strftime("%I:%M %p") if next_start else "after a short break"
-        confirm_msg = await _llm_respond(
+        await _speak_llm(
+            ws,
             f"Confirm multi-service booking with {name}. "
             f"REQUIRED FACTS you MUST include: "
             f"1) {svc.service_name} on {dd} at {td}. "
@@ -864,14 +954,14 @@ async def handle_datetime(ws: WebSocket, state: ConversationState, speech: str):
             f"Does that work for you?",
         )
     else:
-        confirm_msg = await _llm_respond(
+        await _speak_llm(
+            ws,
             f"Confirm a single appointment with {name}. "
             f"REQUIRED FACTS you MUST include: "
             f"{svc.service_name} on {dd} at {td}. "
             f"Ask if that's good. Keep it natural and brief.",
             f"Perfect, {name}! So that's {svc.service_name} on {dd} at {td}. Shall I lock that in?",
         )
-    await _send_text(ws, confirm_msg)
 
 
 def _add_minutes(t, minutes: int):
@@ -890,12 +980,12 @@ async def handle_confirm(ws: WebSocket, state: ConversationState, speech: str):
         svc.start_time = ""
         state.step = "datetime"
         state.retries = 0
-        change_msg = await _llm_respond(
+        await _speak_llm(
+            ws,
             "The caller wants to change the date/time. "
             "Be understanding and ask for a new date and time. Keep it light.",
             "No problem! What other date and time would work better for you?",
         )
-        await _send_text(ws, change_msg)
         return
 
     if not is_yes:
@@ -907,12 +997,12 @@ async def handle_confirm(ws: WebSocket, state: ConversationState, speech: str):
             )
             await _end_session(ws, "No worries, you can book on our website anytime. Thanks for calling!")
             return
-        nudge = await _llm_respond(
+        await _speak_llm(
+            ws,
             "The caller's response was unclear — you need a yes or no to book the appointment. "
             "Ask again naturally, not robotically.",
             "Just want to make sure — should I go ahead and book that for you?",
         )
-        await _send_text(ws, nudge)
         return
 
     await do_book_all(ws, state)
@@ -943,7 +1033,8 @@ async def do_book_all(ws: WebSocket, state: ConversationState):
             # Partial failure: some services already booked
             if booked:
                 already = " and ".join(f"{n} on {d} at {t}" for n, d, t in booked)
-                partial_msg = await _llm_respond(
+                await _speak_llm(
+                    ws,
                     f"The first appointment was booked successfully ({already}), but "
                     f"the next one ({svc.service_name}) couldn't be booked at that time. "
                     f"Let the caller know the first is confirmed, and ask for a new "
@@ -953,7 +1044,6 @@ async def do_book_all(ws: WebSocket, state: ConversationState):
                     f"But the slot for {svc.service_name} isn't available. "
                     f"What other time would work for that one?",
                 )
-                await _send_text(ws, partial_msg)
             return
 
         appt, td, dd = result
@@ -1019,24 +1109,24 @@ async def _book_single(
     except (ValueError, KeyError):
         state.step = "datetime"
         state.retries = 0
-        msg = await _llm_respond(
+        await _speak_llm(
+            ws,
             "Something went wrong with the date internally. "
             "Ask the caller to say the date and time again. Sound apologetic but casual.",
             "Sorry about that — could you give me the date and time one more time?",
         )
-        await _send_text(ws, msg)
         return None
 
     t = _parse_time_12h(svc.start_time)
     if not t:
         state.step = "datetime"
         state.retries = 0
-        msg = await _llm_respond(
+        await _speak_llm(
+            ws,
             "Something went wrong with the time internally. "
             "Ask the caller to repeat the date and time. Sound apologetic.",
             "Sorry, I had a hiccup with the time. Could you say it again for me?",
         )
-        await _send_text(ws, msg)
         return None
 
     payload = {
@@ -1095,7 +1185,8 @@ async def _offer_alternative_slots(ws, state, svc, rejected_time):
 
     if nearby:
         slot_list = ", ".join(nearby[:3])
-        msg = await _llm_respond(
+        await _speak_llm(
+            ws,
             f"The requested time for {svc.service_name} is not available. "
             f"But you found these nearby open slots on the same day: {slot_list}. "
             f"Offer them naturally. The caller can also pick a totally different date. "
@@ -1104,20 +1195,21 @@ async def _offer_alternative_slots(ws, state, svc, rejected_time):
             f"Would any of those work, or would you prefer a different day?",
         )
     else:
-        msg = await _llm_respond(
+        await _speak_llm(
+            ws,
             f"The time for {svc.service_name} is taken and no other slots are available on that day. "
             f"Ask the caller to try a different date. Be empathetic.",
             f"Unfortunately that slot is taken and the rest of the day looks full. "
             f"Would you like to try a different date?",
         )
-    await _send_text(ws, msg)
 
 
 async def _build_final_message(ws: WebSocket, state: ConversationState, booked: list[tuple[str, str, str]]):
     name = state.caller_name
     if len(booked) == 1:
         svc_name, dd, td = booked[0]
-        farewell = await _llm_respond(
+        await _end_session_speaking_llm(
+            ws,
             f"The appointment is confirmed! Tell {name} their booking details and say goodbye. "
             f"Be genuinely warm and excited for them. Mention they'll get a text and email. "
             f"REQUIRED FACTS: {svc_name} on {dd} at {td}. "
@@ -1127,7 +1219,8 @@ async def _build_final_message(ws: WebSocket, state: ConversationState, booked: 
         )
     else:
         details = "; ".join(f"{n} on {d} at {t}" for n, d, t in booked)
-        farewell = await _llm_respond(
+        await _end_session_speaking_llm(
+            ws,
             f"Both appointments are confirmed for {name}! Tell them the details and say goodbye warmly. "
             f"Mention they'll get a text and email for each appointment. "
             f"REQUIRED FACTS: {details}.",
@@ -1136,7 +1229,6 @@ async def _build_final_message(ws: WebSocket, state: ConversationState, booked: 
             + f" on {booked[0][1]}. "
             "You'll get confirmations for each by text and email. Have a wonderful day!",
         )
-    await _end_session(ws, farewell)
 
 
 # ─── Step dispatcher ──────────────────────────────────────────────────
@@ -1238,20 +1330,22 @@ async def voice_websocket(ws: WebSocket):
                             outcome=VoiceCallLog.Outcome.EMPTY_SPEECH,
                             detail="silence",
                         )
-                        silence_bye = await _llm_respond(
+                        await _end_session_speaking_llm(
+                            ws,
                             "The caller has been completely silent for a while. "
                             "Say goodbye gently — maybe they got disconnected. "
                             "Invite them to call back anytime.",
                             "Looks like we may have lost the connection. "
                             "Feel free to call back anytime. Take care!",
                         )
-                        await _end_session(ws, silence_bye)
                         break
 
                     context = _NUDGE_CONTEXTS.get(state.step, "The caller is silent. Gently ask if they're still there.")
                     fallback = _NUDGE_FALLBACKS.get(state.step, "I'm here! Go ahead whenever you're ready.")
-                    nudge = await _llm_respond(context, fallback)
-                    await _send_text(ws, nudge)
+                    if getattr(settings, "VOICE_LLM_FOR_SILENCE_NUDGES", False):
+                        await _speak_llm(ws, context, fallback)
+                    else:
+                        await _send_text(ws, fallback)
                     continue
 
                 # Check for off-script intents before step handlers

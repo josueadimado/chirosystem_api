@@ -130,6 +130,25 @@ def _normalize_conversation_relay_ws_base(raw: str) -> str:
     return u.rstrip("/")
 
 
+def _elevenlabs_twilio_voice(tts_voice_full: str, voice_id: str) -> str:
+    """
+    Build the Twilio `voice` attribute for ElevenLabs TTS.
+
+    Twilio format (see voice-configuration): voice_id, optionally -model, optionally -speed_stability_similarity.
+    Example: NYC9WEgkq1u4jiqBseQ9-turbo_v2_5-0.8_0.8_0.6
+    """
+    if (tts_voice_full or "").strip():
+        return tts_voice_full.strip()
+    base = (voice_id or "").strip() or "UgBBYS2sOqTuMpoF3BR0"
+    model = (getattr(settings, "ELEVENLABS_TTS_MODEL", "") or "").strip()
+    tuning = (getattr(settings, "ELEVENLABS_TTS_VOICE_TUNING", "") or "").strip()
+    if model:
+        base = f"{base}-{model}"
+    if tuning:
+        base = f"{base}-{tuning}"
+    return base
+
+
 # ─── Incoming call (ConversationRelay) ─────────────────────────────────
 
 @csrf_exempt
@@ -202,13 +221,17 @@ def twilio_voice_incoming(request):
             tts_voice = tts_voice_setting or "Joanna-Neural"
         else:
             tts_provider = "ElevenLabs"
-            tts_voice = tts_voice_setting or voice_id or "UgBBYS2sOqTuMpoF3BR0"
+            tts_voice = _elevenlabs_twilio_voice(tts_voice_setting, voice_id)
         # Nested <Language> matches Twilio's documented shape; some accounts fail if only parent attributes are set.
         lang_block = (
             f'<Language code="en-US" '
             f'ttsProvider="{escape(tts_provider)}" voice="{escape(tts_voice)}" '
             f'transcriptionProvider="Deepgram" speechModel="nova-2-general"/>'
         )
+        el_norm = (getattr(settings, "CONVERSATION_RELAY_ELEVENLABS_TEXT_NORMALIZATION", "") or "").strip().lower()
+        relay_el_attr = ""
+        if tts_provider == "ElevenLabs" and el_norm in ("on", "off", "auto"):
+            relay_el_attr = f' elevenlabsTextNormalization="{escape(el_norm)}"'
         twiml = (
             f'<Connect>'
             f'<ConversationRelay '
@@ -216,7 +239,8 @@ def twilio_voice_incoming(request):
             f'welcomeGreeting="{escape(greeting)}" '
             f'language="en-US" '
             f'interruptible="true" '
-            f'dtmfDetection="true">'
+            f'dtmfDetection="true"'
+            f'{relay_el_attr}>'
             f'{lang_block}'
             f'</ConversationRelay>'
             f'</Connect>'

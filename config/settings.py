@@ -175,11 +175,31 @@ ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
 # ConversationRelay TTS: ElevenLabs | Google | Amazon. Use Google if calls drop immediately (Twilio/ElevenLabs setup).
 CONVERSATION_RELAY_TTS_PROVIDER = os.getenv("CONVERSATION_RELAY_TTS_PROVIDER", "ElevenLabs").strip() or "ElevenLabs"
 # Voice name for that provider (Twilio docs). Google example: en-US-Journey-O. Leave blank for provider defaults.
+# If set for ElevenLabs, this is the FULL `voice` string (voice id + optional -model + optional -tuning); other ElevenLabs envs below are ignored.
 CONVERSATION_RELAY_TTS_VOICE = os.getenv("CONVERSATION_RELAY_TTS_VOICE", "").strip()
+# ElevenLabs (ConversationRelay only): append TTS model to voice id — flash_v2_5 (Twilio default), turbo_v2_5, turbo_v2, flash_v2.
+# https://www.twilio.com/docs/voice/conversationrelay/voice-configuration
+ELEVENLABS_TTS_MODEL = os.getenv("ELEVENLABS_TTS_MODEL", "").strip()
+# After model: speed_stability_similarity (e.g. 1.0_0.6_0.8). Speed 0.7–1.2; stability & similarity 0.0–1.0.
+ELEVENLABS_TTS_VOICE_TUNING = os.getenv("ELEVENLABS_TTS_VOICE_TUNING", "").strip()
+# Twilio <ConversationRelay> when ttsProvider is ElevenLabs: on | off | auto (auto behaves like off for voice calls).
+CONVERSATION_RELAY_ELEVENLABS_TEXT_NORMALIZATION = os.getenv(
+    "CONVERSATION_RELAY_ELEVENLABS_TEXT_NORMALIZATION", ""
+).strip().lower()
 
 # OpenAI — optional; enables phone speech → structured booking on Twilio voice webhooks.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_VOICE_MODEL = os.getenv("OPENAI_VOICE_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+# Phone voice (Sarah): gpt-5.4-nano is OpenAI’s fastest/cheapest frontier tier for low latency. If your key
+# returns “model not found”, set OPENAI_VOICE_MODEL=gpt-4o-mini (or gpt-5.4-mini) in .env.
+OPENAI_VOICE_MODEL = os.getenv("OPENAI_VOICE_MODEL", "gpt-5.4-nano").strip() or "gpt-5.4-nano"
+# Voice relay: stream LLM tokens to Twilio (lower perceived delay). Set VOICE_LLM_STREAM=false to disable.
+VOICE_LLM_STREAM = os.getenv("VOICE_LLM_STREAM", "true").strip().lower() in ("1", "true", "yes")
+# If false, silence nudges use fixed phrases only (skips an OpenAI round trip).
+VOICE_LLM_FOR_SILENCE_NUDGES = os.getenv("VOICE_LLM_FOR_SILENCE_NUDGES", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Google Calendar — personal account per doctor (OAuth). Callback URL must match Google Cloud Console.
 GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")

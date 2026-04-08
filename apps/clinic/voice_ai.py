@@ -448,7 +448,7 @@ def openai_parse_datetime(speech: str, today_iso: str) -> tuple[str, str]:
 
     body = json.dumps(
         {
-            "model": getattr(settings, "OPENAI_VOICE_MODEL", "gpt-4o-mini"),
+            "model": getattr(settings, "OPENAI_VOICE_MODEL", None) or "gpt-5.4-nano",
             "messages": [
                 {"role": "system", "content": instruction},
                 {"role": "user", "content": speech},
@@ -488,7 +488,7 @@ def openai_extract_field(transcript: str, *, field: str, instruction: str) -> di
 
     body = json.dumps(
         {
-            "model": getattr(settings, "OPENAI_VOICE_MODEL", "gpt-4o-mini"),
+            "model": getattr(settings, "OPENAI_VOICE_MODEL", None) or "gpt-5.4-nano",
             "messages": [
                 {"role": "system", "content": instruction},
                 {"role": "user", "content": transcript},
@@ -559,7 +559,7 @@ def openai_parse_booking_intent(*, transcript: str, today_iso: str, catalog: dic
 
     body = json.dumps(
         {
-            "model": getattr(settings, "OPENAI_VOICE_MODEL", "gpt-4o-mini"),
+            "model": getattr(settings, "OPENAI_VOICE_MODEL", None) or "gpt-5.4-nano",
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
