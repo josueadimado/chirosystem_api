@@ -63,10 +63,12 @@ def booking_confirmation_body(
     appt_date_display: str,
     appt_time_display: str,
     provider_display: str,
+    estimated_payment: str = "",
 ) -> str:
+    pay = f" Est. {estimated_payment} due at visit." if estimated_payment else ""
     return (
         f"Relief Chiropractic: Hi {first_name}, your {service_name} is confirmed for "
-        f"{appt_date_display} at {appt_time_display}. "
+        f"{appt_date_display} at {appt_time_display}.{pay} "
         f"We'll remind you the day before.{sms_footer()}"
     )
 
@@ -78,10 +80,12 @@ def appointment_reminder_body(
     appt_date_display: str,
     appt_time_display: str,
     provider_display: str,
+    estimated_payment: str = "",
 ) -> str:
+    pay = f" Est. {estimated_payment} due at visit." if estimated_payment else ""
     return (
         f"Relief Chiropractic: Hi {first_name}, reminder — your {service_name} is "
-        f"tomorrow ({appt_date_display}) at {appt_time_display}.{sms_footer()}"
+        f"tomorrow ({appt_date_display}) at {appt_time_display}.{pay}{sms_footer()}"
     )
 
 

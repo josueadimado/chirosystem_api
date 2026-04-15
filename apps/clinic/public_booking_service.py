@@ -12,6 +12,7 @@ from django.utils import timezone
 from django.utils.text import slugify
 
 from .booking_availability import provider_interval_blocked_online
+from .chiropractic_booking_policy import chiropractic_booking_must_use_intake
 from .models import Appointment, Patient, Provider, Service
 from .utils import normalize_phone
 
@@ -29,7 +30,7 @@ def create_appointment_from_public_booking(validated: dict) -> tuple[Appointment
         defaults={
             "first_name": validated["first_name"],
             "last_name": validated["last_name"],
-            "email": validated.get("email", ""),
+            "email": (validated.get("email") or "").strip(),
         },
     )
 
@@ -86,6 +87,10 @@ def create_appointment_from_public_booking(validated: dict) -> tuple[Appointment
 
     if provider_interval_blocked_online(provider.pk, validated["appointment_date"], start_time, end_time):
         return None, "That time is not open for online booking with this provider. Please pick another slot."
+
+    lapse_msg = chiropractic_booking_must_use_intake(patient, service)
+    if lapse_msg:
+        return None, lapse_msg
 
     overlapping = (
         Appointment.objects.filter(

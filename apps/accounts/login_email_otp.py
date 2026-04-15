@@ -1,4 +1,7 @@
-"""Email verification code after successful password check (staff / doctor login)."""
+"""Email verification code after successful password check (staff login when enabled).
+
+Doctors and owner admins sign in with password only — see ``should_send_login_otp``.
+"""
 
 from __future__ import annotations
 
@@ -30,10 +33,11 @@ def login_email_verification_enabled() -> bool:
 def should_send_login_otp(user: "User") -> bool:
     if not login_email_verification_enabled():
         return False
-    # Clinic owner/admin signs in with password only (no email code).
+    # Owner/admin and doctors sign in with password only (no email code). Staff still get OTP when enabled.
     from .models import User as UserModel
 
-    if getattr(user, "role", None) == UserModel.Roles.OWNER_ADMIN:
+    role = getattr(user, "role", None)
+    if role in (UserModel.Roles.OWNER_ADMIN, UserModel.Roles.DOCTOR):
         return False
     email = (user.email or "").strip()
     if not email:

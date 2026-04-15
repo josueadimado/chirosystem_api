@@ -10,7 +10,7 @@ from celery import shared_task
 from django.conf import settings
 from django.utils import timezone
 
-from apps.clinic.utils import format_time_12h
+from apps.clinic.utils import format_time_12h, format_usd_plain
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +39,14 @@ def send_booking_confirmation_sms_task(appointment_id: int) -> str:
     service_name = appt.booked_service.name if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%a %b %d, %Y")
     time_disp = format_time_12h(appt.start_time)
+    est_pay = format_usd_plain(appt.booked_service.price) if appt.booked_service else ""
     body = booking_confirmation_body(
         first_name=appt.patient.first_name.strip() or "there",
         service_name=service_name,
         appt_date_display=date_disp,
         appt_time_display=time_disp,
         provider_display=str(appt.provider),
+        estimated_payment=est_pay,
     )
     sid = send_sms(to_e164=to, body=body)
     logger.info("Booking SMS result: appt=%s to=%s sid=%s", appointment_id, to, sid)
@@ -78,6 +80,13 @@ def send_booking_confirmation_email_task(appointment_id: int) -> str:
     service_name = appt.booked_service.name if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%A, %B %d, %Y")
     time_disp = format_time_12h(appt.start_time)
+    est_pay = format_usd_plain(appt.booked_service.price) if appt.booked_service else ""
+    est_block = ""
+    if est_pay:
+        est_block = (
+            f"  Expected amount at time of visit: {est_pay}\n"
+            f"    (Estimate for this booked service; taxes, insurance, or add-on services may change your final balance.)\n\n"
+        )
 
     subject = f"Booking Confirmed — {service_name} on {date_disp}"
     body = (
@@ -85,7 +94,8 @@ def send_booking_confirmation_email_task(appointment_id: int) -> str:
         f"Your appointment at Relief Chiropractic has been confirmed!\n\n"
         f"  Service: {service_name}\n"
         f"  Date: {date_disp}\n"
-        f"  Time: {time_disp}\n\n"
+        f"  Time: {time_disp}\n"
+        f"{est_block}"
         f"We'll send you a reminder the day before your visit.\n\n"
         f"If you need to reschedule or cancel, please call us or visit our website.\n\n"
         f"Thank you for choosing Relief Chiropractic!\n"
@@ -111,7 +121,7 @@ def send_booking_confirmation_email_task(appointment_id: int) -> str:
 def send_daily_appointment_reminders() -> dict:
     """
     Run once per day (Celery Beat). Sends SMS for appointments happening *tomorrow*
-    in CLINIC_TIMEZONE, for booked/confirmed visits that have not been reminded yet.
+    in CLINIC_TIMEZONE, for booked visits that have not been reminded yet.
     """
     from apps.clinic.models import Appointment
     from apps.clinic.twilio_sms import appointment_reminder_body, send_sms, twilio_configured
@@ -129,7 +139,7 @@ def send_daily_appointment_reminders() -> dict:
         Appointment.objects.filter(
             appointment_date=tomorrow,
             sms_reminder_sent_at__isnull=True,
-            status__in=[Appointment.Status.BOOKED, Appointment.Status.CONFIRMED],
+            status=Appointment.Status.BOOKED,
         )
         .select_related("patient", "provider", "booked_service")
         .order_by("start_time")
@@ -143,12 +153,14 @@ def send_daily_appointment_reminders() -> dict:
         service_name = appt.booked_service.name if appt.booked_service else "appointment"
         date_disp = appt.appointment_date.strftime("%a %b %d, %Y")
         time_disp = format_time_12h(appt.start_time)
+        est_pay = format_usd_plain(appt.booked_service.price) if appt.booked_service else ""
         body = appointment_reminder_body(
             first_name=appt.patient.first_name.strip() or "there",
             service_name=service_name,
             appt_date_display=date_disp,
             appt_time_display=time_disp,
             provider_display=str(appt.provider),
+            estimated_payment=est_pay,
         )
         sid = send_sms(to_e164=to, body=body)
         if sid:

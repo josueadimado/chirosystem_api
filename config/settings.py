@@ -151,6 +151,8 @@ else:
 # Used for “tomorrow” appointment SMS reminders and Celery Beat crontab
 CLINIC_TIMEZONE = os.getenv("CLINIC_TIMEZONE", "America/Detroit")
 CELERY_TIMEZONE = CLINIC_TIMEZONE
+# Kiosk: earliest self check-in is this many minutes before the scheduled start (staff can check in earlier in admin).
+KIOSK_EARLY_CHECKIN_MINUTES_BEFORE = int(os.getenv("KIOSK_EARLY_CHECKIN_MINUTES_BEFORE", "15"))
 CELERY_BEAT_SCHEDULE = {
     "send-daily-appointment-sms-reminders": {
         "task": "apps.notifications.tasks.send_daily_appointment_reminders",

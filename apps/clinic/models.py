@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django.conf import settings
 from django.db import models
 
@@ -105,6 +107,11 @@ class Service(TimeStampedModel):
         default=ServiceType.CHIROPRACTIC,
         help_text="Chiropractic: one doctor assigned by admin, no choice. Massage: patient chooses from assigned providers.",
     )
+    is_new_client_intake = models.BooleanField(
+        default=False,
+        help_text="If True, online chiropractic booking allows patients returning after a long gap (e.g. 2+ years since last completed chiro visit). "
+        "Mark one bookable visit type as new patient / reactivation intake.",
+    )
 
     def visible_for_primary_service_type(self, primary_service_type: str) -> bool:
         """Whether this service may appear on the in-room bill for a provider with the given booking category."""
@@ -121,7 +128,6 @@ class Service(TimeStampedModel):
 class Appointment(TimeStampedModel):
     class Status(models.TextChoices):
         BOOKED = "booked", "Booked"
-        CONFIRMED = "confirmed", "Confirmed"
         CHECKED_IN = "checked_in", "Checked In"
         IN_CONSULTATION = "in_consultation", "In Consultation"
         AWAITING_PAYMENT = "awaiting_payment", "Awaiting Payment"
@@ -207,9 +213,19 @@ class Invoice(TimeStampedModel):
         VOID = "void", "Void"
         OVERDUE = "overdue", "Overdue"
 
+    class Kind(models.TextChoices):
+        VISIT = "visit", "Visit"
+        NO_SHOW_FEE = "no_show_fee", "No-show fee"
+
     patient = models.ForeignKey(Patient, on_delete=models.CASCADE)
     appointment = models.OneToOneField(Appointment, on_delete=models.CASCADE)
     visit = models.OneToOneField(Visit, on_delete=models.CASCADE)
+    kind = models.CharField(
+        max_length=20,
+        choices=Kind.choices,
+        default=Kind.VISIT,
+        help_text="Visit = normal clinical invoice; no_show_fee = missed-appointment fee.",
+    )
     invoice_number = models.CharField(max_length=40, unique=True)
     subtotal = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     tax = models.DecimalField(max_digits=10, decimal_places=2, default=0)
@@ -338,6 +354,13 @@ class ClinicSettings(TimeStampedModel):
         help_text="Default place-of-service code on printed bill lines.",
     )
     business_hours = models.JSONField(default=list)
+    no_show_fee = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=Decimal("25.00"),
+        help_text="Amount charged when staff marks no-show (USD). Set to 0 to skip fee and invoice. "
+        "If a card is on file, it is charged automatically; otherwise the visit stays in Awaiting payment.",
+    )
 
     class Meta:
         verbose_name_plural = "Clinic settings"
@@ -357,6 +380,7 @@ class ClinicSettings(TimeStampedModel):
                 "phone": "269-408-0303",
                 "email": "",
                 "pos_default": "11",
+                "no_show_fee": Decimal("25.00"),
                 "business_hours": list(_DEFAULT_CLINIC_BUSINESS_HOURS),
             },
         )

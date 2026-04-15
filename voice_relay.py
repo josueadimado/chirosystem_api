@@ -20,7 +20,7 @@ import json
 import logging
 import os
 import random
-from datetime import date as date_type, datetime, timedelta
+from datetime import date as date_type, datetime, time as dt_time, timedelta
 from decimal import Decimal
 
 import django
@@ -61,6 +61,57 @@ app = FastAPI(title="ChiroFlow Voice Relay")
 
 MAX_RETRIES = 5
 BETWEEN_SERVICE_BUFFER_MINUTES = 15
+
+
+def _today_clinic_date() -> date_type:
+    tz_name = getattr(settings, "CLINIC_TIMEZONE", "America/Detroit")
+    return timezone.now().astimezone(ZoneInfo(tz_name)).date()
+
+
+def _ordinal_day(n: int) -> str:
+    if 10 <= (n % 100) <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _date_plain_english(d: date_type, *, today: date_type) -> str:
+    """Readable date for phone audio, e.g. Tuesday, April 8th (add year if not this calendar year)."""
+    weekday = d.strftime("%A")
+    month = d.strftime("%B")
+    day_ord = _ordinal_day(d.day)
+    if d.year != today.year:
+        return f"{weekday}, {month} {day_ord}, {d.year}"
+    return f"{weekday}, {month} {day_ord}"
+
+
+def _time_plain_english(t: dt_time) -> str:
+    """Spoken-friendly time: no leading zero on the hour, explicit A.M. / P.M."""
+    h12 = t.hour % 12 or 12
+    ap = "A.M." if t.hour < 12 else "P.M."
+    if t.minute == 0:
+        return f"{h12} {ap}"
+    return f"{h12}:{t.minute:02d} {ap}"
+
+
+def _booking_datetime_plain_english(
+    d: date_type,
+    t: dt_time,
+    *,
+    today: date_type | None = None,
+) -> str:
+    """Single clear phrase for confirmations and wrap-up, e.g. 'Tuesday, April 8th at 2:30 P.M.'"""
+    ref = today if today is not None else _today_clinic_date()
+    return f"{_date_plain_english(d, today=ref)} at {_time_plain_english(t)}"
+
+
+def _catalog_has_both_chiropractic_and_massage(catalog: dict | None) -> bool:
+    if not catalog:
+        return False
+    types = {s.get("service_type") for s in (catalog.get("services") or []) if s.get("service_type")}
+    return "chiropractic" in types and "massage" in types
+
 
 # Shared async HTTP client for OpenAI calls (connection pooling)
 _http_client: httpx.AsyncClient | None = None
@@ -107,6 +158,11 @@ NEVER:
 
 ALWAYS:
 - Include every REQUIRED FACT from the instructions — names, dates, times, services, prices.
+- When you repeat a date and time, use the plain-English form given in the instructions (weekday, month with \
+ordinal day like "April 8th", and times like "2:30 P.M.") — not ISO dates or 24-hour time.
+- If the caller is a returning patient (you are told this in the instructions), do NOT say "new patient," \
+"brand-new appointment," or anything that sounds like their first visit ever. Say "your visit," \
+"get you scheduled," "book that for you," or "another appointment" instead.
 """
 
 
@@ -283,6 +339,7 @@ class ServiceEntry:
         self.service_name: str = svc["name"]
         self.service_duration: int = svc["duration_minutes"]
         self.service_price: str = svc["price"]
+        self.service_type: str = (svc.get("service_type") or "").strip()
         self.provider_id: int | None = provider_id
         self.provider_name: str = provider_name
         self.appointment_date: str = ""
@@ -307,6 +364,8 @@ class ConversationState:
         self.current_svc_idx: int = 0
         self.pending_categories: list[str] = []
         self.last_service_id: int | None = None  # from appointment history
+        # After a single-service book, optional cross-sell before hang-up (see do_book_all).
+        self.pending_final_booked: list[tuple[str, str]] | None = None
 
     @property
     def current_service(self) -> ServiceEntry | None:
@@ -462,13 +521,23 @@ async def _handle_off_script(ws: WebSocket, state: ConversationState, speech: st
 
     # Cancel / reschedule
     if any(p in lower for p in _CANCEL_PATTERNS):
-        await _speak_llm(
-            ws,
-            "The caller wants to cancel or reschedule. Let them know they can call the front desk "
-            "or visit the website for that. Offer to book a new appointment if they want.",
-            "For cancellations or rescheduling, you can call our front desk directly or visit our website. "
-            "Would you like to book a new appointment instead?",
-        )
+        if state.is_returning:
+            await _speak_llm(
+                ws,
+                "The caller wants to cancel or reschedule. They are a returning patient. "
+                "Tell them the front desk or website handles changes to existing visits. "
+                "Offer to schedule another visit if they want.",
+                "For cancellations or rescheduling an existing visit, our front desk or website can help with that. "
+                "Would you like to schedule another visit while you're on the line?",
+            )
+        else:
+            await _speak_llm(
+                ws,
+                "The caller wants to cancel or reschedule. Let them know they can call the front desk "
+                "or visit the website for that. Offer to set up a visit if they still need an appointment.",
+                "For cancellations or rescheduling, you can call our front desk directly or visit our website. "
+                "Would you like to book an appointment for another time?",
+            )
         return True
 
     return False
@@ -784,6 +853,20 @@ async def handle_pick_service(ws: WebSocket, state: ConversationState, speech: s
         )
         return
 
+    if any(getattr(s, "booked_appt", None) for s in state.services):
+        state.current_svc_idx = len(state.services) - 1
+        state.step = "datetime"
+        state.retries = 0
+        svc = state.current_service
+        if svc:
+            await _speak_llm(
+                ws,
+                f"They chose {svc.service_name} to add after a visit was already booked. "
+                f"Ask what date and time work for this second visit.",
+                f"Perfect! For your {svc.service_name}, what date and time work for you?",
+            )
+        return
+
     state.current_svc_idx = 0
     await _finish_service_selection(ws, state)
 
@@ -932,40 +1015,47 @@ async def handle_datetime(ws: WebSocket, state: ConversationState, speech: str):
     state.step = "confirm"
     state.retries = 0
 
+    today = _today_clinic_date()
     try:
         d = date_type.fromisoformat(appt_date)
-        dd = d.strftime("%A, %B %d")
+        date_spoken = _date_plain_english(d, today=today)
     except ValueError:
-        dd = appt_date
+        date_spoken = appt_date
     t = _parse_time_12h(start_time)
-    td = t.strftime("%I:%M %p") if t else start_time
+    time_spoken = _time_plain_english(t) if t else start_time
+    when_plain = f"{date_spoken} at {time_spoken}"
     name = state.caller_name
+    returning_note = (
+        " The caller is a returning patient — do not imply this is their first visit."
+        if state.is_returning
+        else ""
+    )
 
     if state.is_multi and state.has_more_services:
         next_svc = state.services[state.current_svc_idx + 1]
         end_t = _add_minutes(t, svc.service_duration) if t else None
         next_start = _add_minutes(end_t, BETWEEN_SERVICE_BUFFER_MINUTES) if end_t else None
-        next_td = next_start.strftime("%I:%M %p") if next_start else "after a short break"
+        next_time_spoken = _time_plain_english(next_start) if next_start else "after a short break"
         await _speak_llm(
             ws,
-            f"Confirm multi-service booking with {name}. "
-            f"REQUIRED FACTS you MUST include: "
-            f"1) {svc.service_name} on {dd} at {td}. "
-            f"2) Then a 15-minute break. "
-            f"3) Then {next_svc.service_name} at {next_td}. "
+            f"Confirm multi-service booking with {name}.{returning_note} "
+            f"REQUIRED FACTS you MUST say out loud in plain English: "
+            f"1) First, {svc.service_name} on {when_plain}. "
+            f"2) Then a fifteen-minute break. "
+            f"3) Then {next_svc.service_name} at {next_time_spoken} that same day. "
             f"Ask if that sounds good. Be natural.",
-            f"Alright {name}, so here's the plan: {svc.service_name} on {dd} at {td}, "
-            f"then a little 15-minute break, and {next_svc.service_name} at {next_td}. "
+            f"Alright {name}, here's the plan: first {svc.service_name} on {when_plain}, "
+            f"then a fifteen-minute break, then {next_svc.service_name} at {next_time_spoken}. "
             f"Does that work for you?",
         )
     else:
         await _speak_llm(
             ws,
-            f"Confirm a single appointment with {name}. "
-            f"REQUIRED FACTS you MUST include: "
-            f"{svc.service_name} on {dd} at {td}. "
+            f"Confirm a single appointment with {name}.{returning_note} "
+            f"REQUIRED FACTS you MUST say out loud in plain English: "
+            f"{svc.service_name} on {when_plain}. "
             f"Ask if that's good. Keep it natural and brief.",
-            f"Perfect, {name}! So that's {svc.service_name} on {dd} at {td}. Shall I lock that in?",
+            f"Perfect, {name}! So that's {svc.service_name} on {when_plain}. Shall I lock that in?",
         )
 
 
@@ -1013,20 +1103,216 @@ async def handle_confirm(ws: WebSocket, state: ConversationState, speech: str):
     await do_book_all(ws, state)
 
 
+async def _begin_addon_second_service(ws: WebSocket, state: ConversationState, svc_dict: dict):
+    """Append one add-on service (other category) and collect date/time."""
+    catalog = state.catalog or (await _booking_catalog_async())
+    pbs = catalog.get("providers_by_service") or {}
+    providers = pbs.get(svc_dict["id"]) or []
+    pid = providers[0]["id"] if providers else None
+    pname = providers[0]["provider_name"] if providers else ""
+    state.services.append(ServiceEntry(svc_dict, pid, pname))
+    state.current_svc_idx = len(state.services) - 1
+    state.step = "datetime"
+    state.retries = 0
+    svc = state.current_service
+    if not svc:
+        return
+    await _speak_llm(
+        ws,
+        f"They want to add {svc.service_name} after their first visit is already booked. "
+        f"Ask what date and time work (same calendar day as the first visit is typical).",
+        f"Love it! For your {svc.service_name}, what date and time would you like?",
+    )
+
+
+async def handle_addon_offer(ws: WebSocket, state: ConversationState, speech: str):
+    """After a single visit is booked: offer the other category (chiro vs massage) if the clinic has both."""
+    pending = state.pending_final_booked
+    if not pending:
+        state.step = "service"
+        await _send_text(ws, "What else can I help you with today?")
+        return
+
+    catalog = state.catalog or (await _booking_catalog_async())
+    first = state.services[0] if state.services else None
+    if not first or first.service_type not in ("chiropractic", "massage"):
+        state.pending_final_booked = None
+        await _build_final_message(ws, state, pending)
+        return
+
+    other_svcs = [
+        s
+        for s in (catalog.get("services") or [])
+        if s.get("service_type") and s.get("service_type") != first.service_type
+    ]
+    matched = match_services_from_speech(speech, other_svcs)
+
+    resolved: list[dict] = []
+    pending_cats: list[str] = []
+    for svc in matched:
+        stype = svc.get("service_type", "")
+        same_type = [s for s in other_svcs if s.get("service_type") == stype]
+        if len(same_type) > 1 and _was_category_match(speech, svc, same_type):
+            if stype not in pending_cats:
+                pending_cats.append(stype)
+        else:
+            resolved.append(svc)
+
+    if resolved:
+        await _begin_addon_second_service(ws, state, resolved[0])
+        return
+
+    if pending_cats:
+        state.pending_categories = pending_cats
+        state.step = "pick_service"
+        state.retries = 0
+        cat = pending_cats[0]
+        cat_services = [s for s in other_svcs if s.get("service_type") == cat]
+        names = ", ".join(s["name"] for s in cat_services)
+        label = "chiropractic" if cat == "chiropractic" else "massage"
+        await _speak_llm(
+            ws,
+            f"They want to add {label} but need a specific visit type. Options: {names}.",
+            f"Great! For {label}, we have: {names}. Which one would you like?",
+        )
+        return
+
+    is_yes, is_no = _detect_yes_no(speech)
+    if is_no and not is_yes:
+        booked_final = pending
+        state.pending_final_booked = None
+        await _build_final_message(ws, state, booked_final)
+        return
+
+    if is_yes and not is_no:
+        state.step = "service_addon"
+        state.retries = 0
+        other_label = "massage" if first.service_type == "chiropractic" else "chiropractic"
+        opt_summary = ", ".join(s["name"] for s in other_svcs[:6])
+        if len(other_svcs) > 6:
+            opt_summary += ", and more"
+        await _speak_llm(
+            ws,
+            f"They said yes to adding the other type of care. Help them pick a specific visit. "
+            f"Options include: {opt_summary}.",
+            f"Sure! For {other_label}, we have options like {opt_summary}. Which one sounds best?",
+        )
+        return
+
+    state.retries += 1
+    if state.retries >= MAX_RETRIES:
+        booked_final = pending
+        state.pending_final_booked = None
+        await _build_final_message(ws, state, booked_final)
+        return
+    await _speak_llm(
+        ws,
+        "Their answer about adding another visit wasn't clear. Ask a simple yes or no, "
+        "or have them name the visit type they want.",
+        "Sorry — would you like to add the other kind of visit too, or are you happy with what we booked?",
+    )
+
+
+async def handle_service_addon(ws: WebSocket, state: ConversationState, speech: str):
+    """Pick a specific add-on service after the caller said yes to adding the other category."""
+    catalog = state.catalog or (await _booking_catalog_async())
+    all_raw = catalog.get("services") or []
+    if not state.services:
+        state.step = "service"
+        await _send_text(ws, "Which service would you like?")
+        return
+    first_type = state.services[0].service_type
+    eligible = [s for s in all_raw if s.get("service_type") and s.get("service_type") != first_type]
+    pbs = catalog.get("providers_by_service") or {}
+    matched = match_services_from_speech(speech, eligible)
+
+    if not matched:
+        state.retries += 1
+        if state.retries >= MAX_RETRIES:
+            pending = state.pending_final_booked
+            state.pending_final_booked = None
+            if pending:
+                await _build_final_message(ws, state, pending)
+            else:
+                await _end_session(ws, "Thanks again for calling. Have a great day!")
+            return
+        names = ", ".join(s["name"] for s in eligible[:8])
+        await _speak_llm(
+            ws,
+            f"Could not match add-on service from: \"{speech}\". Options include: {names}.",
+            f"I didn't quite catch that. We have: {names}. Which would you like?",
+        )
+        return
+
+    state.retries = 0
+    resolved: list[dict] = []
+    pending: list[str] = []
+    for svc in matched:
+        stype = svc.get("service_type", "")
+        same_type = [s for s in eligible if s.get("service_type") == stype]
+        if len(same_type) > 1 and _was_category_match(speech, svc, same_type):
+            if stype not in pending:
+                pending.append(stype)
+        else:
+            resolved.append(svc)
+
+    if pending:
+        state.pending_categories = pending
+        state.step = "pick_service"
+        state.retries = 0
+        cat = pending[0]
+        cat_services = [s for s in eligible if s.get("service_type") == cat]
+        names = ", ".join(s["name"] for s in cat_services)
+        label = "chiropractic" if cat == "chiropractic" else "massage"
+        await _speak_llm(
+            ws,
+            f"They need a specific {label} option: {names}.",
+            f"For {label}, we have: {names}. Which one works for you?",
+        )
+        return
+
+    if not resolved:
+        state.retries += 1
+        await _speak_llm(
+            ws,
+            "Ask which add-on visit type they want.",
+            "Which visit type would you like to add?",
+        )
+        return
+
+    await _begin_addon_second_service(ws, state, resolved[0])
+
+
 # ─── Booking logic ────────────────────────────────────────────────────
 
 async def do_book_all(ws: WebSocket, state: ConversationState):
+    # Fresh booking run — drop any add-on offer payload from a prior pass.
+    state.pending_final_booked = None
+
     phone = state.from_number
     if phone.startswith("tel:"):
         phone = phone[4:]
 
-    booked: list[tuple[str, str, str]] = []
+    # (service_name, plain-English date+time phrase)
+    booked: list[tuple[str, str]] = []
     last_end_time = None
     last_date = None
+    today = _today_clinic_date()
 
     for idx in range(state.current_svc_idx, len(state.services)):
         svc = state.services[idx]
         state.current_svc_idx = idx
+
+        if svc.booked_appt is not None:
+            appt = svc.booked_appt
+            when_plain = _booking_datetime_plain_english(
+                appt.appointment_date, appt.start_time, today=today
+            )
+            if not any(b[0] == svc.service_name for b in booked):
+                booked.append((svc.service_name, when_plain))
+            last_date = appt.appointment_date.isoformat()
+            last_end_time = _add_minutes(appt.start_time, svc.service_duration)
+            continue
 
         if idx > 0 and not svc.appointment_date and last_date and last_end_time:
             svc.appointment_date = last_date
@@ -1037,28 +1323,55 @@ async def do_book_all(ws: WebSocket, state: ConversationState):
         if result is None:
             # Partial failure: some services already booked
             if booked:
-                already = " and ".join(f"{n} on {d} at {t}" for n, d, t in booked)
+                summary = booked[0][1]
                 await _speak_llm(
                     ws,
-                    f"The first appointment was booked successfully ({already}), but "
+                    f"The first appointment was booked successfully ({booked[0][0]} on {summary}), but "
                     f"the next one ({svc.service_name}) couldn't be booked at that time. "
                     f"Let the caller know the first is confirmed, and ask for a new "
                     f"date/time for the remaining service. Be reassuring. "
-                    f"REQUIRED FACTS: {already} is confirmed.",
-                    f"Good news — your {booked[0][0]} is confirmed for {booked[0][1]} at {booked[0][2]}! "
+                    f"REQUIRED FACTS: first visit is confirmed for {summary}.",
+                    f"Good news — your {booked[0][0]} is confirmed for {summary}! "
                     f"But the slot for {svc.service_name} isn't available. "
                     f"What other time would work for that one?",
                 )
             return
 
-        appt, td, dd = result
+        appt, when_plain = result
         svc.booked_appt = appt
-        booked.append((svc.service_name, dd, td))
+        booked.append((svc.service_name, when_plain))
 
         last_date = svc.appointment_date
         t = _parse_time_12h(svc.start_time)
         if t:
             last_end_time = _add_minutes(t, svc.service_duration)
+
+    if (
+        len(booked) == 1
+        and len(state.services) == 1
+        and _catalog_has_both_chiropractic_and_massage(state.catalog)
+    ):
+        first = state.services[0]
+        if first.service_type in ("chiropractic", "massage"):
+            other_phrase = (
+                "a massage visit"
+                if first.service_type == "chiropractic"
+                else "a chiropractic visit"
+            )
+            state.pending_final_booked = booked
+            state.step = "addon_offer"
+            state.retries = 0
+            when0 = booked[0][1]
+            await _speak_llm(
+                ws,
+                f"One visit was just booked successfully. The clinic offers both chiropractic and massage. "
+                f"Casually ask if they'd like to add {other_phrase} too — no pressure if they decline. "
+                f"Do not sound salesy. REQUIRED FACTS: {first.service_name} is booked for {when0}.",
+                f"Wonderful — I've got you down for {when0}! "
+                f"While I have you, would you like to add {other_phrase} as well, "
+                f"or are you all set with just this one?",
+            )
+            return
 
     await _build_final_message(ws, state, booked)
 
@@ -1167,9 +1480,10 @@ async def _book_single(
         await _offer_alternative_slots(ws, state, svc, t)
         return None
 
-    td = appt.start_time.strftime("%I:%M %p")
-    dd = appt.appointment_date.strftime("%A, %B %d")
-    return appt, td, dd
+    when_plain = _booking_datetime_plain_english(
+        appt.appointment_date, appt.start_time, today=_today_clinic_date()
+    )
+    return appt, when_plain
 
 
 async def _offer_alternative_slots(ws, state, svc, rejected_time):
@@ -1209,29 +1523,36 @@ async def _offer_alternative_slots(ws, state, svc, rejected_time):
         )
 
 
-async def _build_final_message(ws: WebSocket, state: ConversationState, booked: list[tuple[str, str, str]]):
+async def _build_final_message(ws: WebSocket, state: ConversationState, booked: list[tuple[str, str]]):
     name = state.caller_name
+    returning_note = (
+        " The caller is a returning patient — do not call this a 'new patient' or first-time visit."
+        if state.is_returning
+        else ""
+    )
     if len(booked) == 1:
-        svc_name, dd, td = booked[0]
+        svc_name, when_plain = booked[0]
         await _end_session_speaking_llm(
             ws,
             f"The appointment is confirmed! Tell {name} their booking details and say goodbye. "
             f"Be genuinely warm and excited for them. Mention they'll get a text and email. "
-            f"REQUIRED FACTS: {svc_name} on {dd} at {td}. "
+            f"{returning_note}"
+            f"REQUIRED FACTS (say in plain English): {svc_name} on {when_plain}. "
             f"Confirmation sent via text and email.",
-            f"You're all set, {name}! Your {svc_name} is booked for {dd} at {td}. "
+            f"You're all set, {name}! Your {svc_name} is booked for {when_plain}. "
             "You'll get a text and email confirmation. Have an awesome day!",
         )
     else:
-        details = "; ".join(f"{n} on {d} at {t}" for n, d, t in booked)
+        details = " — ".join(f"{n} ({w})" for n, w in booked)
         await _end_session_speaking_llm(
             ws,
             f"Both appointments are confirmed for {name}! Tell them the details and say goodbye warmly. "
             f"Mention they'll get a text and email for each appointment. "
-            f"REQUIRED FACTS: {details}.",
-            f"You're all set, {name}! Both appointments are confirmed — "
-            + " and ".join(f"{n} at {t}" for n, d, t in booked)
-            + f" on {booked[0][1]}. "
+            f"{returning_note}"
+            f"REQUIRED FACTS (plain English): {details}.",
+            f"You're all set, {name}! Both appointments are confirmed: "
+            + "; ".join(f"{n} — {w}" for n, w in booked)
+            + ". "
             "You'll get confirmations for each by text and email. Have a wonderful day!",
         )
 
@@ -1245,6 +1566,8 @@ STEP_HANDLERS = {
     "confirm_services": handle_confirm_services,
     "datetime": handle_datetime,
     "confirm": handle_confirm,
+    "addon_offer": handle_addon_offer,
+    "service_addon": handle_service_addon,
 }
 
 # Nudge messages — these are also varied via LLM when possible
@@ -1255,6 +1578,8 @@ _NUDGE_CONTEXTS = {
     "confirm_services": "The caller went silent during service confirmation. Gently ask yes or no.",
     "datetime": "The caller went silent. Gently ask what date and time works for them.",
     "confirm": "The caller went silent during final confirmation. Gently ask if they'd like to book.",
+    "addon_offer": "The caller went silent after one visit was booked. Gently ask if they want to add the other kind of visit too, or if they're all set.",
+    "service_addon": "The caller went silent while choosing an add-on visit. Gently list options or ask which visit type.",
 }
 
 _NUDGE_FALLBACKS = {
@@ -1264,6 +1589,8 @@ _NUDGE_FALLBACKS = {
     "confirm_services": "Just say yes to confirm or no if you'd like to change anything.",
     "datetime": "What date and time work for you?",
     "confirm": "Should I go ahead and book that for you?",
+    "addon_offer": "Would you like to add the other kind of visit too, or are you happy with what we booked?",
+    "service_addon": "Which visit type would you like to add?",
 }
 
 

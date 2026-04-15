@@ -450,6 +450,12 @@ class ClinicProfileUpdateSerializer(serializers.Serializer):
     phone = serializers.CharField(max_length=40, required=False, allow_blank=True)
     email = serializers.EmailField(required=False, allow_blank=True)
     pos_default = serializers.CharField(max_length=10, required=False, allow_blank=True)
+    no_show_fee = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        min_value=Decimal("0"),
+        required=False,
+    )
     business_hours = serializers.ListField(
         child=serializers.DictField(child=serializers.CharField(allow_blank=True)),
         required=False,

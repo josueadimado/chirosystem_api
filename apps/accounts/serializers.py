@@ -184,3 +184,17 @@ class RoleTokenSerializer(TokenObtainPairSerializer):
         token["role"] = user.role
         token["full_name"] = user.full_name
         return token
+
+    def validate(self, attrs):
+        """
+        Accept either Django username or email (case-insensitive email match).
+        Username is tried first; if no active user matches, we resolve by email.
+        """
+        raw = (attrs.get("username") or "").strip()
+        if raw:
+            user = User.objects.filter(username__iexact=raw, is_active=True).first()
+            if user is None:
+                user = User.objects.filter(email__iexact=raw, is_active=True).first()
+            if user is not None:
+                attrs = {**attrs, "username": user.username}
+        return super().validate(attrs)

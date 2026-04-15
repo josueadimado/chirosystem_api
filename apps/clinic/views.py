@@ -1,10 +1,13 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from django.conf import settings
 from django.core.signing import TimestampSigner
+from typing import Optional
+
 from django.db import transaction
-from django.db.models import Case, IntegerField, Prefetch, Value, When
+from django.db.models import Case, IntegerField, Prefetch, Q, Value, When
 from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -225,7 +228,15 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             .order_by("_book_order", "name")
         )
         services = list(
-            bookable.values("id", "name", "description", "duration_minutes", "price", "service_type")
+            bookable.values(
+                "id",
+                "name",
+                "description",
+                "duration_minutes",
+                "price",
+                "service_type",
+                "is_new_client_intake",
+            )
         )
         providers_by_service = {}
         for svc in bookable.prefetch_related("providers"):
@@ -353,15 +364,20 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                     break
         if not patient:
             return Response({"found": False})
-        return Response({
-            "found": True,
-            "first_name": patient.first_name,
-            "last_name": patient.last_name,
-            "email": patient.email or "",
-            "has_saved_card": bool(patient.card_last4),
-            "card_brand": patient.card_brand or "",
-            "card_last4": patient.card_last4 or "",
-        })
+        from .chiropractic_booking_policy import chiropractic_intake_context_for_patient
+
+        return Response(
+            {
+                "found": True,
+                "first_name": patient.first_name,
+                "last_name": patient.last_name,
+                "email": patient.email or "",
+                "has_saved_card": bool(patient.square_card_id and patient.card_last4),
+                "card_brand": patient.card_brand or "",
+                "card_last4": patient.card_last4 or "",
+                **chiropractic_intake_context_for_patient(patient),
+            }
+        )
 
     @action(detail=False, methods=["get"], url_path="square-config")
     def square_config(self, request):
@@ -561,9 +577,33 @@ class ServiceViewSet(viewsets.ModelViewSet):
             if not provider:
                 return qs.none()
             if provider.primary_service_type == Service.ServiceType.CHIROPRACTIC:
-                return qs.filter(visible_to_chiropractic_staff=True)
-            if provider.primary_service_type == Service.ServiceType.MASSAGE:
-                return qs.filter(visible_to_massage_staff=True)
+                visibility = Q(visible_to_chiropractic_staff=True)
+            elif provider.primary_service_type == Service.ServiceType.MASSAGE:
+                visibility = Q(visible_to_massage_staff=True)
+            else:
+                visibility = Q(pk__in=[])
+            date_str = (self.request.query_params.get("for_date") or "").strip()
+            try:
+                appt_date = timezone.datetime.strptime(date_str, "%Y-%m-%d").date() if date_str else timezone.localdate()
+            except ValueError:
+                appt_date = timezone.localdate()
+            booked_ids = (
+                Appointment.objects.filter(
+                    provider=provider,
+                    appointment_date=appt_date,
+                    booked_service_id__isnull=False,
+                )
+                .exclude(
+                    status__in=[
+                        Appointment.Status.CANCELLED,
+                        Appointment.Status.NO_SHOW,
+                        Appointment.Status.COMPLETED,
+                    ]
+                )
+                .values_list("booked_service_id", flat=True)
+                .distinct()
+            )
+            return qs.filter(visibility | Q(pk__in=list(booked_ids))).order_by("name").distinct()
         return qs
 
 
@@ -660,7 +700,6 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                 if new_s in (Appointment.Status.NO_SHOW, Appointment.Status.CANCELLED):
                     if old_s not in (
                         Appointment.Status.BOOKED,
-                        Appointment.Status.CONFIRMED,
                         Appointment.Status.CHECKED_IN,
                     ):
                         raise PermissionDenied(
@@ -717,12 +756,30 @@ class AppointmentViewSet(viewsets.ModelViewSet):
             if overlapping:
                 raise ValidationError({"detail": "That time slot is already booked for this provider."})
 
+        if data.get("status") == Appointment.Status.NO_SHOW:
+            fee_amt = ClinicSettings.get_solo().no_show_fee or Decimal("0")
+            if fee_amt > 0 and inst.status in (
+                Appointment.Status.BOOKED,
+                Appointment.Status.CHECKED_IN,
+            ):
+                from .no_show_billing import apply_no_show_fee_for_appointment
+
+                with transaction.atomic():
+                    locked = Appointment.objects.select_for_update().get(pk=inst.pk)
+                    ctx = apply_no_show_fee_for_appointment(locked, fee_amt)
+                if ctx.get("use_awaiting_payment_instead"):
+                    data["status"] = Appointment.Status.AWAITING_PAYMENT
+                if ctx.get("clear_checkin"):
+                    data["checked_in_at"] = None
+                    data["consultation_started_at"] = None
+                if ctx.get("already_charged"):
+                    inst.refresh_from_db()
+
         if data.get("status") == Appointment.Status.COMPLETED and inst.completed_at is None:
             data["completed_at"] = timezone.now()
         if data.get("status") in (Appointment.Status.NO_SHOW, Appointment.Status.CANCELLED):
             if inst.status in (
                 Appointment.Status.BOOKED,
-                Appointment.Status.CONFIRMED,
                 Appointment.Status.CHECKED_IN,
             ):
                 data["checked_in_at"] = None
@@ -1030,6 +1087,7 @@ class AdminViewSet(viewsets.ViewSet):
             h = _clinic_settings_bill_header()
             return Response({
                 **h,
+                "no_show_fee": str(solo.no_show_fee),
                 "business_hours": list(solo.business_hours or []),
             })
         if getattr(request.user, "role", None) not in ("owner_admin", "staff"):
@@ -1051,12 +1109,15 @@ class AdminViewSet(viewsets.ViewSet):
             if field in data:
                 val = data[field]
                 setattr(solo, field, (val or "") if field == "email" else val)
+        if "no_show_fee" in data:
+            solo.no_show_fee = data["no_show_fee"]
         if "business_hours" in data:
             solo.business_hours = data["business_hours"]
         solo.save()
         h = _clinic_settings_bill_header()
         return Response({
             **h,
+            "no_show_fee": str(solo.no_show_fee),
             "business_hours": list(solo.business_hours or []),
         })
 
@@ -1659,6 +1720,19 @@ class DoctorViewSet(viewsets.ViewSet):
         appointment = Appointment.objects.filter(pk=pk, provider=provider).first()
         if not appointment:
             return Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
+        if appointment.status == Appointment.Status.IN_CONSULTATION:
+            visit, _ = Visit.objects.get_or_create(
+                appointment=appointment,
+                defaults={"patient": appointment.patient, "provider": provider, "status": Visit.Status.IN_PROGRESS},
+            )
+            return Response({"visit_id": visit.id})
+        if appointment.status != Appointment.Status.CHECKED_IN:
+            return Response(
+                {
+                    "detail": "Check the patient in (kiosk or front desk) before starting the visit.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         appointment.status = Appointment.Status.IN_CONSULTATION
         appointment.consultation_started_at = timezone.now()
         appointment.save(update_fields=["status", "consultation_started_at", "updated_at"])
@@ -1997,31 +2071,159 @@ class KioskViewSet(viewsets.ViewSet):
 
     permission_classes = [permissions.AllowAny]
 
+    @staticmethod
+    def _patient_for_kiosk_phone(norm: str) -> Optional[Patient]:
+        for p in Patient.objects.iterator(chunk_size=200):
+            if normalize_phone(p.phone) == norm:
+                return p
+        return None
+
+    @staticmethod
+    def _kiosk_appointments_qs(patient: Patient):
+        return (
+            Appointment.objects.filter(patient=patient)
+            .exclude(
+                status__in=[Appointment.Status.CANCELLED, Appointment.Status.NO_SHOW],
+            )
+            .select_related("patient", "provider")
+            .order_by("appointment_date", "start_time")
+        )
+
+    @classmethod
+    def _kiosk_minutes_before(cls) -> int:
+        v = getattr(settings, "KIOSK_EARLY_CHECKIN_MINUTES_BEFORE", 15)
+        try:
+            return max(0, int(v))
+        except (TypeError, ValueError):
+            return 15
+
+    @classmethod
+    def _can_kiosk_checkin_now(cls, appt: Appointment):
+        """Return (allowed, start_local, earliest_local)."""
+        tz = timezone.get_current_timezone()
+        start_local = timezone.make_aware(
+            datetime.combine(appt.appointment_date, appt.start_time),
+            tz,
+        )
+        minutes = cls._kiosk_minutes_before()
+        earliest_local = start_local - timedelta(minutes=minutes)
+        now_local = timezone.localtime()
+        return now_local >= earliest_local, start_local, earliest_local
+
     @action(detail=False, methods=["post"])
     def lookup(self, request):
         phone = request.data.get("phone")
         today = timezone.localdate()
         valid, msg = validate_phone(phone or "")
         if not valid:
-            return Response({"detail": msg}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"result": "invalid_phone", "message": msg},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         norm = normalize_phone(phone)
-        # Match by normalized phone (handles +1, 5551234567, etc.)
-        appts = list(
-            Appointment.objects.select_related("patient", "provider")
-            .filter(appointment_date=today)
-            .exclude(status__in=[Appointment.Status.CANCELLED, Appointment.Status.NO_SHOW])
-            .order_by("start_time")
-        )
-        appt = next((a for a in appts if normalize_phone(a.patient.phone) == norm), None)
-        if not appt:
-            return Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
+        patient = self._patient_for_kiosk_phone(norm)
+        if not patient:
+            return Response(
+                {
+                    "result": "not_found",
+                    "message": (
+                        "We could not find an appointment for this phone number. "
+                        "If you have not booked yet, you can book online or ask the front desk for help."
+                    ),
+                }
+            )
+
+        qs = list(self._kiosk_appointments_qs(patient))
+        today_appts = [a for a in qs if a.appointment_date == today]
+
+        open_today = [a for a in today_appts if a.status == Appointment.Status.BOOKED]
+        if open_today:
+            appt = min(open_today, key=lambda a: (a.start_time, a.pk))
+            allowed, start_local, earliest_local = self._can_kiosk_checkin_now(appt)
+            if not allowed:
+                return Response(
+                    {
+                        "result": "too_early",
+                        "message": (
+                            "You are here before your check-in window. Please wait until closer to your "
+                            "appointment time, or ask the front desk if you need help."
+                        ),
+                        "appointment_id": appt.id,
+                        "patient": f"{appt.patient.first_name} {appt.patient.last_name}",
+                        "provider": str(appt.provider),
+                        "start_time_display": format_time_12h(appt.start_time),
+                        "earliest_checkin_display": format_time_12h(earliest_local.time()),
+                    }
+                )
+            return Response(
+                {
+                    "result": "ready",
+                    "appointment_id": appt.id,
+                    "patient": f"{appt.patient.first_name} {appt.patient.last_name}",
+                    "provider": str(appt.provider),
+                    "time": str(appt.start_time),
+                    "start_time_display": format_time_12h(appt.start_time),
+                    "status": appt.status,
+                }
+            )
+
+        in_progress_today = [
+            a
+            for a in today_appts
+            if a.status
+            in (
+                Appointment.Status.CHECKED_IN,
+                Appointment.Status.IN_CONSULTATION,
+                Appointment.Status.AWAITING_PAYMENT,
+            )
+        ]
+        if in_progress_today:
+            appt = min(in_progress_today, key=lambda a: (a.start_time, a.pk))
+            return Response(
+                {
+                    "result": "already_checked_in",
+                    "message": (
+                        "Our records show you are already checked in for today. "
+                        "Please have a seat in the waiting area — we will call you when it is time."
+                    ),
+                    "start_time_display": format_time_12h(appt.start_time),
+                }
+            )
+
+        if today_appts and all(a.status == Appointment.Status.COMPLETED for a in today_appts):
+            return Response(
+                {
+                    "result": "visit_completed_today",
+                    "message": (
+                        "It looks like your visit for today is already completed. "
+                        "If you need another appointment, please book online or speak with the front desk."
+                    ),
+                }
+            )
+
+        future = [a for a in qs if a.appointment_date > today]
+        if future:
+            nxt = min(future, key=lambda a: (a.appointment_date, a.start_time))
+            date_disp = nxt.appointment_date.strftime("%A, %B %d, %Y")
+            return Response(
+                {
+                    "result": "wrong_day",
+                    "message": (
+                        f"We do not see an appointment for you today. Your next visit with us is scheduled for "
+                        f"{date_disp} at {format_time_12h(nxt.start_time)}."
+                    ),
+                    "appointment_date_display": date_disp,
+                    "start_time_display": format_time_12h(nxt.start_time),
+                }
+            )
+
         return Response(
             {
-                "appointment_id": appt.id,
-                "patient": f"{appt.patient.first_name} {appt.patient.last_name}",
-                "provider": str(appt.provider),
-                "time": str(appt.start_time),
-                "status": appt.status,
+                "result": "not_found",
+                "message": (
+                    "We could not find an upcoming appointment for this phone number. "
+                    "You can book online or ask the front desk for help."
+                ),
             }
         )
 
@@ -2031,6 +2233,38 @@ class KioskViewSet(viewsets.ViewSet):
         if appointment_id is None:
             return Response({"detail": "appointment_id is required."}, status=status.HTTP_400_BAD_REQUEST)
         appt = get_object_or_404(Appointment, pk=appointment_id)
+        today = timezone.localdate()
+        if appt.appointment_date != today:
+            return Response(
+                {"detail": "Check-in is only available on the day of your appointment."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if appt.status in (
+            Appointment.Status.CANCELLED,
+            Appointment.Status.NO_SHOW,
+            Appointment.Status.COMPLETED,
+        ):
+            return Response(
+                {"detail": "This appointment cannot be checked in."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if appt.status != Appointment.Status.BOOKED:
+            return Response(
+                {"detail": "You are already checked in or this visit is in progress."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        allowed, _, _ = self._can_kiosk_checkin_now(appt)
+        if not allowed:
+            return Response(
+                {
+                    "detail": (
+                        "It is too early to check in from this kiosk. Please wait until your scheduled time "
+                        "(or within the check-in window), or ask the front desk."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         appt.status = Appointment.Status.CHECKED_IN
         appt.checked_in_at = timezone.now()
         appt.save(update_fields=["status", "checked_in_at", "updated_at"])

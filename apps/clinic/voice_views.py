@@ -188,7 +188,7 @@ def twilio_voice_incoming(request):
             last_svc = escape(last_appt.booked_service.name)
             returning_greetings = [
                 f"Hey {pname}! Welcome back to {clinic_name}. Last time you had a {last_svc} — would you like to book that again, or try something different?",
-                f"Hi {pname}, great to hear from you again! I see your last visit was for a {last_svc}. Want to go with that again, or something new?",
+                f"Hi {pname}, great to hear from you again! I see your last visit was for a {last_svc}. Want to go with that again, or a different service?",
                 f"{pname}! So glad you called back. Your last appointment was a {last_svc} — should I set up the same thing, or would you like to see what else we offer?",
             ]
         else:

@@ -1,6 +1,7 @@
 """Clinic utilities."""
 
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Tuple
 
 import phonenumbers
@@ -80,3 +81,25 @@ def normalize_phone(value: str) -> str:
     except phonenumbers.NumberParseException:
         pass
     return "+" + digits
+
+
+def format_usd_plain(amount) -> str:
+    """Format a price for SMS/email (e.g. ``$85.00``). Returns empty string if value is missing or invalid."""
+    if amount is None:
+        return ""
+    try:
+        d = Decimal(str(amount))
+    except (InvalidOperation, TypeError, ValueError):
+        return ""
+    return f"${d:,.2f}"
+
+
+def format_usd_plain(amount) -> str:
+    """Format a price for SMS/email (e.g. ``$85.00``). Returns empty string if value is missing or invalid."""
+    if amount is None:
+        return ""
+    try:
+        d = Decimal(str(amount))
+    except (InvalidOperation, TypeError, ValueError):
+        return ""
+    return f"${d:,.2f}"
