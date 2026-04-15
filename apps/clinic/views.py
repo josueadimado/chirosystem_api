@@ -363,7 +363,10 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                     patient = p
                     break
         if not patient:
-            return Response({"found": False})
+            from .chiropractic_booking_policy import chiropractic_intake_context_for_new_phone_lookup
+
+            return Response({"found": False, **chiropractic_intake_context_for_new_phone_lookup()})
+
         from .chiropractic_booking_policy import chiropractic_intake_context_for_patient
 
         return Response(
