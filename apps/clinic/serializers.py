@@ -316,6 +316,21 @@ class PublicBookingSerializer(serializers.Serializer):
         return attrs
 
 
+class PublicRescheduleSerializer(serializers.Serializer):
+    """Patient self-service reschedule (verified by phone on file)."""
+
+    phone = serializers.CharField(max_length=20)
+    appointment_id = serializers.IntegerField(min_value=1)
+    appointment_date = serializers.DateField()
+    start_time = serializers.TimeField(input_formats=["%I:%M %p", "%H:%M"])
+
+    def validate(self, attrs):
+        valid, msg = validate_phone(attrs.get("phone", ""))
+        if not valid:
+            raise serializers.ValidationError({"phone": msg})
+        return attrs
+
+
 class VisitRenderedServiceSerializer(serializers.ModelSerializer):
     class Meta:
         model = VisitRenderedService

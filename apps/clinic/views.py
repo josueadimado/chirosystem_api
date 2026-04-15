@@ -30,7 +30,7 @@ from .models import (
     VisitRenderedService,
     VoiceCallLog,
 )
-from .public_booking_service import create_appointment_from_public_booking
+from .public_booking_service import create_appointment_from_public_booking, reschedule_appointment_public
 from .utils import format_time_12h, normalize_phone, validate_phone
 from .serializers import (
     AppointmentHandoffNotesSerializer,
@@ -47,6 +47,7 @@ from .serializers import (
     PaymentCompleteSerializer,
     PaymentSerializer,
     PublicBookingSerializer,
+    PublicRescheduleSerializer,
     ProviderSerializer,
     ProviderUnavailabilitySerializer,
     ServiceSerializer,
@@ -338,15 +339,67 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         day_start = DAY_START_HOUR * 60 + DAY_START_MIN
         day_end = DAY_END_HOUR * 60 + DAY_END_MIN
 
-        taken = set()
-        for a in (
-            Appointment.objects.filter(
-                provider=provider,
-                appointment_date=appt_date,
+        busy_qs = Appointment.objects.filter(
+            provider=provider,
+            appointment_date=appt_date,
+        ).exclude(
+            status__in=[Appointment.Status.CANCELLED, Appointment.Status.NO_SHOW, Appointment.Status.COMPLETED]
+        )
+        exclude_raw = (request.query_params.get("exclude_appointment_id") or "").strip()
+        phone_for_exclude = (request.query_params.get("phone") or "").strip()
+        if exclude_raw:
+            if not phone_for_exclude:
+                return Response(
+                    {"detail": "phone is required when exclude_appointment_id is set."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            valid_ex, msg_ex = validate_phone(phone_for_exclude)
+            if not valid_ex:
+                return Response({"detail": msg_ex or "Invalid phone."}, status=status.HTTP_400_BAD_REQUEST)
+            norm_ex = normalize_phone(phone_for_exclude)
+            try:
+                exclude_pk = int(exclude_raw)
+            except ValueError:
+                return Response(
+                    {"detail": "exclude_appointment_id must be a number."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            ex_appt = (
+                Appointment.objects.select_related("patient")
+                .filter(pk=exclude_pk, status=Appointment.Status.BOOKED)
+                .first()
             )
-            .exclude(status__in=[Appointment.Status.CANCELLED, Appointment.Status.NO_SHOW, Appointment.Status.COMPLETED])
-            .values_list("start_time", "end_time")
-        ):
+            if not ex_appt:
+                return Response(
+                    {"detail": "Could not verify that appointment for rescheduling."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            patient_ex = ex_appt.patient
+            phone_ok = normalize_phone(patient_ex.phone) == norm_ex
+            if not phone_ok:
+                for p in Patient.objects.all():
+                    if p.pk == patient_ex.pk and normalize_phone(p.phone) == norm_ex:
+                        phone_ok = True
+                        break
+            if not phone_ok:
+                return Response(
+                    {"detail": "Could not verify that appointment for rescheduling."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if ex_appt.provider_id != provider.pk:
+                return Response(
+                    {"detail": "That visit is with a different provider."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if ex_appt.booked_service_id != service.id:
+                return Response(
+                    {"detail": "That visit does not match this service."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            busy_qs = busy_qs.exclude(pk=exclude_pk)
+
+        taken = set()
+        for a in busy_qs.values_list("start_time", "end_time"):
             start_min = a[0].hour * 60 + a[0].minute
             end_min = a[1].hour * 60 + a[1].minute
             for m in range(start_min, end_min):
@@ -460,6 +513,108 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                 "card_brand": patient.card_brand,
                 "card_last4": patient.card_last4,
             }
+        )
+
+    @action(detail=False, methods=["get"], url_path="my-appointments")
+    def my_appointments(self, request):
+        """List upcoming BOOKED visits for this phone that can be managed online. Public."""
+        phone_raw = request.query_params.get("phone")
+        if not phone_raw:
+            return Response({"detail": "phone is required."}, status=status.HTTP_400_BAD_REQUEST)
+        valid, msg = validate_phone(phone_raw)
+        if not valid:
+            return Response({"detail": msg or "Invalid phone."}, status=status.HTTP_400_BAD_REQUEST)
+        norm = normalize_phone(phone_raw)
+        patient = Patient.objects.filter(phone=norm).first()
+        if not patient:
+            for p in Patient.objects.all():
+                if normalize_phone(p.phone) == norm:
+                    patient = p
+                    break
+        if not patient:
+            return Response(
+                {
+                    "first_name": "",
+                    "last_name": "",
+                    "email": "",
+                    "appointments": [],
+                }
+            )
+
+        today = timezone.localdate()
+        rows = (
+            Appointment.objects.filter(
+                patient=patient,
+                appointment_date__gte=today,
+                status=Appointment.Status.BOOKED,
+            )
+            .select_related("provider", "booked_service")
+            .order_by("appointment_date", "start_time")
+        )
+        out = []
+        for a in rows:
+            svc = a.booked_service
+            if not svc or not svc.is_active or not svc.show_in_public_booking:
+                continue
+            out.append(
+                {
+                    "id": a.id,
+                    "appointment_date": str(a.appointment_date),
+                    "start_time": format_time_12h(a.start_time),
+                    "service_id": svc.id,
+                    "service_name": svc.name,
+                    "provider_id": a.provider_id,
+                    "provider_name": str(a.provider),
+                    "duration_minutes": svc.duration_minutes,
+                    "price": str(svc.price),
+                }
+            )
+        return Response(
+            {
+                "first_name": patient.first_name,
+                "last_name": patient.last_name,
+                "email": patient.email or "",
+                "appointments": out,
+            }
+        )
+
+    @action(detail=False, methods=["post"], url_path="reschedule")
+    def reschedule(self, request):
+        """Patient self-service: move a BOOKED visit to a new open slot (phone must match). Public."""
+        ser = PublicRescheduleSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        norm = normalize_phone(data["phone"])
+        appt, err = reschedule_appointment_public(
+            phone_normalized=norm,
+            appointment_id=data["appointment_id"],
+            new_date=data["appointment_date"],
+            new_start=data["start_time"],
+        )
+        if err:
+            code = (
+                status.HTTP_409_CONFLICT
+                if "no longer available" in err.lower() or "not open" in err.lower()
+                else status.HTTP_400_BAD_REQUEST
+            )
+            return Response({"detail": err}, status=code)
+
+        patient = appt.patient
+        service = appt.booked_service
+        provider = appt.provider
+        return Response(
+            {
+                "appointment_id": appt.id,
+                "status": appt.status,
+                "patient": f"{patient.first_name} {patient.last_name}",
+                "provider": str(provider),
+                "service": service.name if service else "",
+                "service_type": service.service_type if service else "",
+                "appointment_date": str(appt.appointment_date),
+                "start_time": format_time_12h(appt.start_time),
+                "total_amount": str(service.price) if service else "0",
+            },
+            status=status.HTTP_200_OK,
         )
 
 

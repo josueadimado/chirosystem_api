@@ -85,7 +85,7 @@ def send_booking_confirmation_email_task(appointment_id: int) -> str:
     if est_pay:
         est_block = (
             f"  Expected amount at time of visit: {est_pay}\n"
-            f"    (Estimate for this booked service; taxes, insurance, or add-on services may change your final balance.)\n\n"
+            f"    (Estimate for this booked service; add-on services may change your final balance.)\n\n"
         )
 
     subject = f"Booking Confirmed — {service_name} on {date_disp}"
