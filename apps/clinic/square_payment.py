@@ -68,14 +68,17 @@ def mark_invoice_paid_from_square(invoice: Invoice, square_payment_id: str) -> b
             inv.save(update_fields=["status", "paid_at", "updated_at"])
 
         appt = inv.appointment
-        target_status = (
-            Appointment.Status.NO_SHOW
-            if inv.kind == Invoice.Kind.NO_SHOW_FEE
-            else Appointment.Status.COMPLETED
-        )
+        if inv.kind == Invoice.Kind.NO_SHOW_FEE:
+            target_status = Appointment.Status.NO_SHOW
+        elif inv.kind == Invoice.Kind.LATE_CANCEL_FEE:
+            target_status = Appointment.Status.CANCELLED
+        else:
+            target_status = Appointment.Status.COMPLETED
         if appt.status != target_status:
             appt.status = target_status
-            if not appt.completed_at:
+            if target_status == Appointment.Status.CANCELLED:
+                appt.completed_at = None
+            elif not appt.completed_at:
                 appt.completed_at = timezone.now()
             appt.save(update_fields=["status", "completed_at", "updated_at"])
 

@@ -239,10 +239,17 @@ class VoiceCallLogSerializer(serializers.ModelSerializer):
         return obj.get_outcome_display()
 
 
+_APPOINTMENT_FIELD_NAMES = tuple(f.name for f in Appointment._meta.fields)
+
+
 class AppointmentSerializer(serializers.ModelSerializer):
+    """Staff/doctor PATCH: optional waive_late_cancel_fee when cancelling a massage inside the 24h window."""
+
+    waive_late_cancel_fee = serializers.BooleanField(required=False, write_only=True, default=False)
+
     class Meta:
         model = Appointment
-        fields = "__all__"
+        fields = _APPOINTMENT_FIELD_NAMES + ("waive_late_cancel_fee",)
         read_only_fields = ("sms_reminder_sent_at", "google_calendar_event_id")
 
 
@@ -252,6 +259,7 @@ class AppointmentListSerializer(serializers.ModelSerializer):
     patient_name = serializers.SerializerMethodField()
     provider_name = serializers.SerializerMethodField()
     service_name = serializers.SerializerMethodField()
+    service_type = serializers.SerializerMethodField()
     start_time_display = serializers.SerializerMethodField()
     end_time_display = serializers.SerializerMethodField()
 
@@ -265,6 +273,7 @@ class AppointmentListSerializer(serializers.ModelSerializer):
             "provider_name",
             "booked_service",
             "service_name",
+            "service_type",
             "appointment_date",
             "start_time",
             "end_time",
@@ -281,6 +290,9 @@ class AppointmentListSerializer(serializers.ModelSerializer):
 
     def get_service_name(self, obj):
         return obj.booked_service.name if obj.booked_service else ""
+
+    def get_service_type(self, obj):
+        return obj.booked_service.service_type if obj.booked_service else ""
 
     def get_start_time_display(self, obj):
         return obj.start_time.strftime("%I:%M %p")
@@ -323,6 +335,19 @@ class PublicRescheduleSerializer(serializers.Serializer):
     appointment_id = serializers.IntegerField(min_value=1)
     appointment_date = serializers.DateField()
     start_time = serializers.TimeField(input_formats=["%I:%M %p", "%H:%M"])
+
+    def validate(self, attrs):
+        valid, msg = validate_phone(attrs.get("phone", ""))
+        if not valid:
+            raise serializers.ValidationError({"phone": msg})
+        return attrs
+
+
+class PublicCancelSerializer(serializers.Serializer):
+    """Patient self-service cancel before visit start (policy fees apply for late massage cancel)."""
+
+    phone = serializers.CharField(max_length=20)
+    appointment_id = serializers.IntegerField(min_value=1)
 
     def validate(self, attrs):
         valid, msg = validate_phone(attrs.get("phone", ""))

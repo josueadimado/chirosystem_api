@@ -7,11 +7,13 @@ Used by the REST `book` action and by the Twilio voice assistant webhook.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.utils import timezone
 from django.utils.text import slugify
+from rest_framework.exceptions import ValidationError as RestValidationError
 
 from .booking_availability import provider_interval_blocked_online
 from .chiropractic_booking_policy import chiropractic_booking_must_use_intake
@@ -305,3 +307,98 @@ def reschedule_appointment_public(
     transaction.on_commit(queue_in_app)
 
     return appt, None
+
+
+def cancel_appointment_public(*, phone_normalized: str, appointment_id: int) -> tuple[Appointment | None, str | None]:
+    """
+    Patient cancels before visit start (online). Chiropractic: no fee. Massage: full fee if under 24h notice.
+    """
+    appt = (
+        Appointment.objects.select_related("patient", "provider", "booked_service")
+        .filter(pk=appointment_id)
+        .first()
+    )
+    if not appt:
+        return None, "We could not find that appointment."
+
+    patient = appt.patient
+    phone_ok = normalize_phone(patient.phone) == phone_normalized
+    if not phone_ok:
+        for p in Patient.objects.all():
+            if p.pk == patient.pk and normalize_phone(p.phone) == phone_normalized:
+                phone_ok = True
+                break
+    if not phone_ok:
+        return None, "That phone number does not match this appointment. Please call the clinic for help."
+
+    if appt.status != Appointment.Status.BOOKED:
+        return None, "This visit can no longer be cancelled online. Please call the clinic."
+
+    svc = appt.booked_service
+    if not svc or not svc.is_active or not svc.show_in_public_booking:
+        return None, "This visit cannot be cancelled online. Please call the clinic."
+
+    if svc.service_type not in (
+        Service.ServiceType.CHIROPRACTIC,
+        Service.ServiceType.MASSAGE,
+    ):
+        return None, "This visit type cannot be cancelled online. Please call the clinic."
+
+    now = timezone.now()
+    start_dt = timezone.make_aware(datetime.combine(appt.appointment_date, appt.start_time))
+    if now >= start_dt:
+        return None, "You can only cancel online before your appointment start time. Please call the clinic."
+
+    notice = start_dt - now
+    apply_late_massage_fee = (
+        svc.service_type == Service.ServiceType.MASSAGE and notice < timedelta(hours=24)
+    )
+
+    try:
+        with transaction.atomic():
+            locked = (
+                Appointment.objects.select_for_update()
+                .select_related("patient", "booked_service", "provider")
+                .get(pk=appt.id)
+            )
+            if locked.status != Appointment.Status.BOOKED:
+                return None, "This visit can no longer be cancelled online. Please call the clinic."
+            svc_locked = locked.booked_service
+            if apply_late_massage_fee and svc_locked:
+                fee = svc_locked.price or Decimal("0")
+                if fee > 0:
+                    from .no_show_billing import apply_late_cancel_fee_for_appointment
+
+                    apply_late_cancel_fee_for_appointment(locked, fee)
+            locked.status = Appointment.Status.CANCELLED
+            locked.checked_in_at = None
+            locked.consultation_started_at = None
+            locked.completed_at = None
+            locked.save(
+                update_fields=[
+                    "status",
+                    "checked_in_at",
+                    "consultation_started_at",
+                    "completed_at",
+                    "updated_at",
+                ]
+            )
+    except RestValidationError as exc:
+        detail = exc.detail
+        if isinstance(detail, dict) and "detail" in detail:
+            inner = detail["detail"]
+            if isinstance(inner, list) and inner:
+                return None, str(inner[0])
+            return None, inner if isinstance(inner, str) else str(inner)
+        return None, str(detail)
+
+    aid = locked.id
+
+    def queue_calendar():
+        from apps.notifications.tasks import sync_appointment_google_calendar_task
+
+        sync_appointment_google_calendar_task.delay(aid)
+
+    transaction.on_commit(queue_calendar)
+
+    return locked, None

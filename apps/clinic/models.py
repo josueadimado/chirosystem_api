@@ -216,6 +216,7 @@ class Invoice(TimeStampedModel):
     class Kind(models.TextChoices):
         VISIT = "visit", "Visit"
         NO_SHOW_FEE = "no_show_fee", "No-show fee"
+        LATE_CANCEL_FEE = "late_cancel_fee", "Late cancellation fee"
 
     patient = models.ForeignKey(Patient, on_delete=models.CASCADE)
     appointment = models.OneToOneField(Appointment, on_delete=models.CASCADE)
@@ -224,7 +225,7 @@ class Invoice(TimeStampedModel):
         max_length=20,
         choices=Kind.choices,
         default=Kind.VISIT,
-        help_text="Visit = normal clinical invoice; no_show_fee = missed-appointment fee.",
+        help_text="Visit = normal clinical invoice; penalty kinds = missed visit or late cancellation per clinic policy.",
     )
     invoice_number = models.CharField(max_length=40, unique=True)
     subtotal = models.DecimalField(max_digits=10, decimal_places=2, default=0)
@@ -358,8 +359,9 @@ class ClinicSettings(TimeStampedModel):
         max_digits=10,
         decimal_places=2,
         default=Decimal("25.00"),
-        help_text="Amount charged when staff marks no-show (USD). Set to 0 to skip fee and invoice. "
-        "If a card is on file, it is charged automatically; otherwise the visit stays in Awaiting payment.",
+        help_text="Fallback no-show amount (USD) when the booked visit type has no price. "
+        "Normally chiropractic and massage no-shows use the booked service price. "
+        "Set to 0 to skip only that fallback. Card on file is charged when possible; otherwise the visit may stay in Awaiting payment.",
     )
 
     class Meta:

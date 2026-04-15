@@ -30,7 +30,11 @@ from .models import (
     VisitRenderedService,
     VoiceCallLog,
 )
-from .public_booking_service import create_appointment_from_public_booking, reschedule_appointment_public
+from .public_booking_service import (
+    cancel_appointment_public,
+    create_appointment_from_public_booking,
+    reschedule_appointment_public,
+)
 from .utils import format_time_12h, normalize_phone, validate_phone
 from .serializers import (
     AppointmentHandoffNotesSerializer,
@@ -47,6 +51,7 @@ from .serializers import (
     PaymentCompleteSerializer,
     PaymentSerializer,
     PublicBookingSerializer,
+    PublicCancelSerializer,
     PublicRescheduleSerializer,
     ProviderSerializer,
     ProviderUnavailabilitySerializer,
@@ -617,6 +622,29 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @action(detail=False, methods=["post"], url_path="cancel-appointment")
+    def cancel_appointment(self, request):
+        """Patient self-service: cancel before visit start. Massage <24h: full service fee. Public."""
+        ser = PublicCancelSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        norm = normalize_phone(data["phone"])
+        appt, err = cancel_appointment_public(
+            phone_normalized=norm,
+            appointment_id=data["appointment_id"],
+        )
+        if err:
+            return Response({"detail": err}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {
+                "appointment_id": appt.id,
+                "status": appt.status,
+                "detail": "Appointment cancelled.",
+            },
+            status=status.HTTP_200_OK,
+        )
+
 
 class IsOwnerOrDoctor(permissions.BasePermission):
     def has_permission(self, request, view):
@@ -870,6 +898,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         user = self.request.user
         role = getattr(user, "role", None)
         data = serializer.validated_data
+        waive_late_cancel = bool(data.pop("waive_late_cancel_fee", False))
 
         if role == "doctor":
             prov = Provider.objects.filter(user=user).first()
@@ -941,8 +970,47 @@ class AppointmentViewSet(viewsets.ModelViewSet):
             if overlapping:
                 raise ValidationError({"detail": "That time slot is already booked for this provider."})
 
+        if data.get("status") == Appointment.Status.CANCELLED:
+            svc_cancel = inst.booked_service
+            now_cancel = timezone.now()
+            start_dt_cancel = timezone.make_aware(
+                datetime.combine(inst.appointment_date, inst.start_time)
+            )
+            if (
+                svc_cancel
+                and svc_cancel.service_type == Service.ServiceType.MASSAGE
+                and inst.status
+                in (
+                    Appointment.Status.BOOKED,
+                    Appointment.Status.CHECKED_IN,
+                )
+                and not waive_late_cancel
+            ):
+                notice_cancel = start_dt_cancel - now_cancel
+                if notice_cancel < timedelta(hours=24):
+                    fee_amt = svc_cancel.price or Decimal("0")
+                    if fee_amt > 0:
+                        from .no_show_billing import apply_late_cancel_fee_for_appointment
+
+                        with transaction.atomic():
+                            locked = Appointment.objects.select_for_update().get(pk=inst.pk)
+                            ctx = apply_late_cancel_fee_for_appointment(locked, fee_amt)
+                        if ctx.get("clear_checkin"):
+                            data["checked_in_at"] = None
+                            data["consultation_started_at"] = None
+                        if ctx.get("already_charged"):
+                            inst.refresh_from_db()
+
         if data.get("status") == Appointment.Status.NO_SHOW:
-            fee_amt = ClinicSettings.get_solo().no_show_fee or Decimal("0")
+            svc_ns = inst.booked_service
+            fee_amt = Decimal("0")
+            if svc_ns and svc_ns.service_type in (
+                Service.ServiceType.CHIROPRACTIC,
+                Service.ServiceType.MASSAGE,
+            ):
+                fee_amt = svc_ns.price or Decimal("0")
+            if fee_amt <= 0:
+                fee_amt = ClinicSettings.get_solo().no_show_fee or Decimal("0")
             if fee_amt > 0 and inst.status in (
                 Appointment.Status.BOOKED,
                 Appointment.Status.CHECKED_IN,
@@ -962,6 +1030,8 @@ class AppointmentViewSet(viewsets.ModelViewSet):
 
         if data.get("status") == Appointment.Status.COMPLETED and inst.completed_at is None:
             data["completed_at"] = timezone.now()
+        if data.get("status") == Appointment.Status.CANCELLED:
+            data["completed_at"] = None
         if data.get("status") in (Appointment.Status.NO_SHOW, Appointment.Status.CANCELLED):
             if inst.status in (
                 Appointment.Status.BOOKED,
@@ -1575,6 +1645,7 @@ class DoctorViewSet(viewsets.ViewSet):
                 "patient_id": a.patient_id,
                 "service": a.booked_service.name if a.booked_service else "",
                 "booked_service_id": a.booked_service_id,
+                "service_type": a.booked_service.service_type if a.booked_service else "",
                 "appointment_date": str(a.appointment_date),
                 "start_time": a.start_time.strftime("%I:%M %p"),
                 "start_time_iso": a.start_time.isoformat(timespec="seconds"),
