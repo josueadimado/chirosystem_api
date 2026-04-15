@@ -251,12 +251,20 @@ class BookingOptionsViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["get"], url_path="availability")
     def availability(self, request):
-        """Return available time slots for a date/provider/service. Public."""
+        """Return available time slots for a date/provider/service. Public.
+
+        Optional ``block_minutes``: when booking multiple services back-to-back with the *same*
+        provider, pass the total minutes from the start of the first visit through the end of the
+        last (including each service duration and any breaks between them). Only slots where the
+        entire block fits in working hours and is free on the calendar are returned. If omitted,
+        only ``service.duration_minutes`` is used (single-visit behavior).
+        """
         from datetime import datetime
 
         date_str = request.query_params.get("date")
         provider_id = request.query_params.get("provider_id")
         service_id = request.query_params.get("service_id")
+        block_minutes_raw = (request.query_params.get("block_minutes") or "").strip()
         if not all([date_str, provider_id, service_id]):
             return Response(
                 {"detail": "date, provider_id, and service_id are required."},
@@ -307,6 +315,25 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                 break
 
         duration = service.duration_minutes
+        if block_minutes_raw:
+            try:
+                block_val = int(block_minutes_raw)
+            except ValueError:
+                return Response({"detail": "block_minutes must be a positive integer."}, status=status.HTTP_400_BAD_REQUEST)
+            if block_val < duration:
+                return Response(
+                    {
+                        "detail": "block_minutes cannot be less than the first service duration "
+                        f"({duration} minutes)."
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if block_val > 24 * 60:
+                return Response({"detail": "block_minutes is too large."}, status=status.HTTP_400_BAD_REQUEST)
+            required_span = block_val
+        else:
+            required_span = duration
+
         SLOT_INTERVAL = 15 if service.service_type == "chiropractic" else max(duration, 15)
         day_start = DAY_START_HOUR * 60 + DAY_START_MIN
         day_end = DAY_END_HOUR * 60 + DAY_END_MIN
@@ -327,11 +354,11 @@ class BookingOptionsViewSet(viewsets.ViewSet):
 
         available = []
         cursor = day_start
-        while cursor + duration <= day_end:
-            if not any(cursor <= t < cursor + duration for t in taken):
+        while cursor + required_span <= day_end:
+            if not any(cursor <= t < cursor + required_span for t in taken):
                 h, m = divmod(cursor, 60)
                 slot_start_time = time_cls(hour=h, minute=m)
-                end_total = cursor + duration
+                end_total = cursor + required_span
                 end_h, end_m = divmod(end_total, 60)
                 if end_h >= 24:
                     end_h, end_m = 23, 59
