@@ -40,6 +40,7 @@ def _booking_catalog_json() -> dict[str, Any]:
                 "price": str(svc.price),
                 "service_type": svc.service_type,
                 "allow_provider_choice": svc.service_type == "massage",
+                "is_new_client_intake": bool(svc.is_new_client_intake),
             }
         )
         providers_by_service[svc.id] = [

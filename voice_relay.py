@@ -32,7 +32,8 @@ import httpx
 from asgiref.sync import sync_to_async
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
-from apps.clinic.models import Appointment, ClinicSettings, Patient, VoiceCallLog
+from apps.clinic.chiropractic_booking_policy import chiropractic_booking_must_use_intake
+from apps.clinic.models import Appointment, ClinicSettings, Patient, Service, VoiceCallLog
 from apps.clinic.public_booking_service import create_appointment_from_public_booking
 from apps.clinic.serializers import PublicBookingSerializer
 from apps.clinic.utils import normalize_phone
@@ -289,6 +290,13 @@ async def _end_session_speaking_llm(ws: WebSocket, instruction: str, fallback: s
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────
+
+def _intake_chiro_names(catalog: dict | None) -> str:
+    """Comma-separated intake visit names for voice prompts (matches web booking policy)."""
+    svcs = (catalog or {}).get("services") or []
+    names = [s["name"] for s in svcs if s.get("service_type") == "chiropractic" and s.get("is_new_client_intake")]
+    return ", ".join(names) if names else "a new patient, new office, or reactivation visit"
+
 
 def _svc_list(catalog: dict) -> str:
     svcs = catalog.get("services") or []
@@ -675,6 +683,29 @@ async def handle_service(ws: WebSocket, state: ConversationState, speech: str):
         if is_yes or any(p in lower for p in _SAME_AGAIN_PHRASES):
             last_svc = next((s for s in all_services if s["id"] == state.last_service_id), None)
             if last_svc:
+                patient = _lookup_patient(state.from_number)
+                if patient and last_svc.get("service_type") == "chiropractic":
+                    try:
+                        s_obj = Service.objects.get(pk=last_svc["id"])
+                        block = chiropractic_booking_must_use_intake(patient, s_obj)
+                        if block:
+                            names_plain = _intake_chiro_names(catalog)
+                            state.retries = 0
+                            await _speak_llm(
+                                ws,
+                                "The caller is returning and asked to book the same visit type as last time, "
+                                f"but clinic rules require a first-time-style chiropractic visit first. "
+                                f"Policy detail: {block} "
+                                f"They should choose one of these intake visit types: {names_plain}. "
+                                "Explain briefly and warmly. Do NOT call them a brand-new patient if they're returning — "
+                                "say they need this type of visit first due to timing or records. "
+                                f"REQUIRED FACTS — allowed intake names: {names_plain}",
+                                f"I can book that for you soon — first we need to schedule {names_plain} "
+                                "per clinic policy when someone's in this situation. Which of those would you like?",
+                            )
+                            return
+                    except Service.DoesNotExist:
+                        pass
                 matched = [last_svc]
                 # Skip normal matching and go straight to resolved
                 state.retries = 0
@@ -786,6 +817,16 @@ async def _finish_service_selection(ws: WebSocket, state: ConversationState):
         )
     else:
         svc = state.services[0]
+        patient = _lookup_patient(state.from_number) if state.from_number else None
+        if patient and svc.service_type == "chiropractic":
+            try:
+                s_obj = Service.objects.get(pk=svc.service_id)
+                block = chiropractic_booking_must_use_intake(patient, s_obj)
+                if block:
+                    await _handle_chiropractic_intake_block(ws, state, svc, block)
+                    return
+            except Service.DoesNotExist:
+                pass
         state.step = "datetime"
         await _speak_llm(
             ws,
@@ -884,7 +925,78 @@ _YES_PHRASES = [
     "go ahead", "book it", "sounds good", "yes please", "that works",
     "that's right", "thats right", "that's correct", "thats correct",
     "let's do it", "do it", "for sure",
+    "i'd like to try", "id like to try", "want to try", "i'll try", "ill try",
+    "add one", "add that", "book that too", "schedule that too", "the other one",
+    "sign me up", "why not", "sure let's", "let's add",
 ]
+
+
+def _addon_offer_caller_done(speech: str) -> bool:
+    """
+    After 'was that all?', detect 'I'm done' without relying on global yes/no
+    (avoids phrases like 'that's all' fighting other steps).
+    """
+    lower = speech.lower().strip()
+    done_markers = (
+        "that's all",
+        "that was all",
+        "thats all",
+        "that is all",
+        "that's everything",
+        "thats everything",
+        "that was everything",
+        "that's it",
+        "thats it",
+        "i'm done",
+        "im done",
+        "we're done",
+        "were done",
+        "just that",
+        "only that",
+        "only this",
+        "just this one",
+        "just the one",
+        "nothing else",
+        "nothing more",
+        "that's enough",
+        "thats enough",
+        "i'm all set",
+        "im all set",
+        "we're good",
+        "were good",
+        "i'm good",
+        "im good",
+        "nope i'm good",
+        "no i'm good",
+        "just the massage",
+        "only massage",
+        "just massage",
+        "just the chiropractic",
+        "only chiropractic",
+    )
+    if not any(m in lower for m in done_markers):
+        return False
+    # Still interested in adding the other service — keep in flow
+    interest = (
+        " add ",
+        "add a ",
+        "add an ",
+        "also want",
+        "also like",
+        "book ",
+        "schedule ",
+        "try the",
+        "try a",
+        "the other",
+        " second ",
+        " another ",
+        " as well",
+        "want the other",
+        "interested in",
+    )
+    if any(i in lower for i in interest):
+        return False
+    return True
 
 _YES_WORD_SET = {
     "yes", "yeah", "yep", "yup", "correct", "right", "sure", "ok", "okay",
@@ -1177,6 +1289,12 @@ async def handle_addon_offer(ws: WebSocket, state: ConversationState, speech: st
         )
         return
 
+    if _addon_offer_caller_done(speech):
+        booked_final = pending
+        state.pending_final_booked = None
+        await _build_final_message(ws, state, booked_final)
+        return
+
     is_yes, is_no = _detect_yes_no(speech)
     if is_no and not is_yes:
         booked_final = pending
@@ -1193,9 +1311,10 @@ async def handle_addon_offer(ws: WebSocket, state: ConversationState, speech: st
             opt_summary += ", and more"
         await _speak_llm(
             ws,
-            f"They said yes to adding the other type of care. Help them pick a specific visit. "
+            f"They want to try the other type of care ({other_label}) in addition to what is already booked. "
+            f"Sound enthusiastic but relaxed. Help them pick a specific visit. "
             f"Options include: {opt_summary}.",
-            f"Sure! For {other_label}, we have options like {opt_summary}. Which one sounds best?",
+            f"Love it! For {other_label}, we have options like {opt_summary}. Which one sounds best to you?",
         )
         return
 
@@ -1205,11 +1324,13 @@ async def handle_addon_offer(ws: WebSocket, state: ConversationState, speech: st
         state.pending_final_booked = None
         await _build_final_message(ws, state, booked_final)
         return
+    other_label = "massage" if first.service_type == "chiropractic" else "chiropractic"
     await _speak_llm(
         ws,
-        "Their answer about adding another visit wasn't clear. Ask a simple yes or no, "
-        "or have them name the visit type they want.",
-        "Sorry — would you like to add the other kind of visit too, or are you happy with what we booked?",
+        "You had asked if that was everything and mentioned they could try the other service. "
+        "Their answer wasn't clear. Ask simply: are they all set, or would they like to add "
+        f"{other_label}? They can also name a specific visit type.",
+        f"Sorry — just to check: was that all you needed, or would you like to add {other_label} too?",
     )
 
 
@@ -1358,18 +1479,27 @@ async def do_book_all(ws: WebSocket, state: ConversationState):
                 if first.service_type == "chiropractic"
                 else "a chiropractic visit"
             )
+            other_plain = (
+                "massage therapy"
+                if first.service_type == "chiropractic"
+                else "chiropractic care"
+            )
             state.pending_final_booked = booked
             state.step = "addon_offer"
             state.retries = 0
             when0 = booked[0][1]
             await _speak_llm(
                 ws,
-                f"One visit was just booked successfully. The clinic offers both chiropractic and massage. "
-                f"Casually ask if they'd like to add {other_phrase} too — no pressure if they decline. "
-                f"Do not sound salesy. REQUIRED FACTS: {first.service_name} is booked for {when0}.",
-                f"Wonderful — I've got you down for {when0}! "
-                f"While I have you, would you like to add {other_phrase} as well, "
-                f"or are you all set with just this one?",
+                f"One visit was just booked successfully: {first.service_name} on {when0}. "
+                f"The clinic also offers {other_plain} besides what they chose today. "
+                f"FIRST ask in a warm, natural way if that was everything they needed (e.g. was that all for today). "
+                f"THEN mention that {other_phrase} is available here too if they'd ever like to try it — "
+                f"totally optional, no pressure, not salesy. If they want it, help them book; if they're done, wrap up kindly. "
+                f"REQUIRED FACTS: confirmed booking is {first.service_name} on {when0}. Other service category: {other_plain}.",
+                f"Wonderful — you're all set for {first.service_name} on {when0}. "
+                f"Was that everything you needed today? "
+                f"We also offer {other_plain} if you'd like to add {other_phrase} while we're on the line — "
+                f"happy to, or I'm glad to let you go. What works for you?",
             )
             return
 
@@ -1382,8 +1512,13 @@ def _book_single_try_sync(
     call_sid: str,
     from_number: str,
     transcript: str,
-) -> tuple[str, object | None]:
-    """Run serializer + booking in one sync DB transaction context. Returns ('ok', appt) or error tag."""
+) -> tuple[str, object | None, str | None]:
+    """
+    Run serializer + booking in one sync DB transaction context.
+
+    Returns (status, appointment_or_none, error_detail_or_none).
+    status is 'ok' | 'serializer' | 'intake' | 'slot'.
+    """
     ser = PublicBookingSerializer(data=payload)
     if not ser.is_valid():
         logger.info("Voice serializer errors: %s", ser.errors)
@@ -1394,8 +1529,9 @@ def _book_single_try_sync(
             outcome=VoiceCallLog.Outcome.SERIALIZER_REJECTED,
             detail=str(ser.errors)[:2000],
         )
-        return "serializer", None
-    appt, err = create_appointment_from_public_booking(ser.validated_data)
+        return "serializer", None, None
+    vd = ser.validated_data
+    appt, err = create_appointment_from_public_booking(vd)
     if err:
         logger.info("Voice booking error: %s", err)
         upsert_voice_call_log(
@@ -1405,7 +1541,23 @@ def _book_single_try_sync(
             outcome=VoiceCallLog.Outcome.SLOT_OR_RULE_ERROR,
             detail=err[:2000],
         )
-        return "slot", None
+        p_phone = normalize_phone(vd["phone"])
+        patient = Patient.objects.filter(phone=p_phone).first()
+        try:
+            service = Service.objects.get(pk=vd["service_id"])
+        except Service.DoesNotExist:
+            patient = None
+            service = None
+        if (
+            patient
+            and service
+            and service.service_type == Service.ServiceType.CHIROPRACTIC
+            and not service.is_new_client_intake
+        ):
+            must = chiropractic_booking_must_use_intake(patient, service)
+            if must and must == err:
+                return "intake", None, err
+        return "slot", None, err
     upsert_voice_call_log(
         call_sid=call_sid,
         from_number=from_number,
@@ -1413,10 +1565,37 @@ def _book_single_try_sync(
         outcome=VoiceCallLog.Outcome.BOOKED,
         appointment=appt,
     )
-    return "ok", appt
+    return "ok", appt, None
 
 
 _book_single_try_async = sync_to_async(_book_single_try_sync, thread_sensitive=True)
+
+
+async def _handle_chiropractic_intake_block(
+    ws: WebSocket,
+    state: ConversationState,
+    svc: ServiceEntry,
+    server_message: str,
+) -> None:
+    """Chiropractic intake / long-gap / first-visit rule blocked booking — not a time-slot conflict."""
+    names_plain = _intake_chiro_names(state.catalog)
+    state.step = "service"
+    state.services = []
+    state.pending_categories = []
+    state.current_svc_idx = 0
+    state.retries = 0
+    state.last_service_id = None
+    await _speak_llm(
+        ws,
+        f"The booking system cannot book {svc.service_name} for this caller due to chiropractic intake rules. "
+        f"Clinic policy text: {server_message} "
+        f"They must book one of these visit types first: {names_plain}. "
+        "Say this in short, friendly language. Do not suggest trying a different time for the same service. "
+        "Ask which intake visit name they want (massage-only is still fine). "
+        f"REQUIRED FACTS — intake options: {names_plain}",
+        f"I wasn't able to book that visit type — you'll need to schedule {names_plain} first. "
+        "Which one would you like?",
+    )
 
 
 async def _book_single(
@@ -1467,7 +1646,7 @@ async def _book_single(
         f"Date: {svc.appointment_date}, Time: {svc.start_time}"
     )
 
-    status, appt = await _book_single_try_async(
+    status, appt, err_detail = await _book_single_try_async(
         payload,
         call_sid=state.call_sid,
         from_number=state.from_number,
@@ -1475,6 +1654,9 @@ async def _book_single(
     )
     if status == "serializer":
         await _offer_alternative_slots(ws, state, svc, t)
+        return None
+    if status == "intake":
+        await _handle_chiropractic_intake_block(ws, state, svc, err_detail or "")
         return None
     if status == "slot":
         await _offer_alternative_slots(ws, state, svc, t)
@@ -1578,7 +1760,7 @@ _NUDGE_CONTEXTS = {
     "confirm_services": "The caller went silent during service confirmation. Gently ask yes or no.",
     "datetime": "The caller went silent. Gently ask what date and time works for them.",
     "confirm": "The caller went silent during final confirmation. Gently ask if they'd like to book.",
-    "addon_offer": "The caller went silent after one visit was booked. Gently ask if they want to add the other kind of visit too, or if they're all set.",
+    "addon_offer": "The caller went silent after one visit was booked. Gently ask if that was everything, and mention the other service (chiropractic or massage) is available if they want — or they're all set.",
     "service_addon": "The caller went silent while choosing an add-on visit. Gently list options or ask which visit type.",
 }
 
@@ -1589,7 +1771,7 @@ _NUDGE_FALLBACKS = {
     "confirm_services": "Just say yes to confirm or no if you'd like to change anything.",
     "datetime": "What date and time work for you?",
     "confirm": "Should I go ahead and book that for you?",
-    "addon_offer": "Would you like to add the other kind of visit too, or are you happy with what we booked?",
+    "addon_offer": "I'm still here — was that all you needed, or would you like to hear about adding the other visit type?",
     "service_addon": "Which visit type would you like to add?",
 }
 
