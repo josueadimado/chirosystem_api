@@ -91,7 +91,7 @@ def appointment_reminder_body(
 
 def provider_checkin_body(*, patient_name: str, time_display: str) -> str:
     return (
-        f"Relief Chiropractic: {patient_name} checked in (scheduled {time_display}).{sms_footer()}"
+        f"Relief Chiropractic: {patient_name} completed check-in (scheduled {time_display}).{sms_footer()}"
     )
 
 

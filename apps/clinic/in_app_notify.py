@@ -18,7 +18,7 @@ def create_checkin_in_app_notification(appointment_id: int) -> None:
     if not appt:
         return
     patient = f"{appt.patient.first_name} {appt.patient.last_name}".strip() or "A patient"
-    msg = f"{patient} checked in at the kiosk for {format_time_12h(appt.start_time)} today."
+    msg = f"{patient} completed check-in at the kiosk for {format_time_12h(appt.start_time)} today."
     StaffNotification.objects.create(
         recipient_id=appt.provider.user_id,
         kind=StaffNotification.Kind.CHECKIN,

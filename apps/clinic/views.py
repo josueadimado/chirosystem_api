@@ -287,38 +287,14 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         if not provider.services.filter(pk=service.id).exists():
             return Response({"detail": "Provider does not offer this service."}, status=status.HTTP_400_BAD_REQUEST)
 
-        import re as _re
         from datetime import time as time_cls
 
-        # Read business hours from ClinicSettings for the requested day
-        DAY_START_HOUR, DAY_START_MIN = 9, 0
-        DAY_END_HOUR, DAY_END_MIN = 18, 0
+        from .online_booking_hours import effective_public_booking_window_minutes
 
-        day_name = appt_date.strftime("%A")
-        clinic = ClinicSettings.get_solo()
-        bh_list = clinic.business_hours or []
-        for entry in bh_list:
-            if entry.get("day", "").lower() == day_name.lower():
-                hours_str = entry.get("hours", "")
-                if hours_str.lower() in ("closed", ""):
-                    return Response({"available_slots": []})
-                parts = _re.split(r"\s*[–—-]\s*", hours_str)
-                if len(parts) == 2:
-                    for i, part in enumerate(parts):
-                        t_match = _re.match(r"(\d{1,2}):(\d{2})\s*(AM|PM)", part.strip(), _re.I)
-                        if t_match:
-                            h = int(t_match.group(1))
-                            m = int(t_match.group(2))
-                            ap = t_match.group(3).upper()
-                            if ap == "PM" and h != 12:
-                                h += 12
-                            if ap == "AM" and h == 12:
-                                h = 0
-                            if i == 0:
-                                DAY_START_HOUR, DAY_START_MIN = h, m
-                            else:
-                                DAY_END_HOUR, DAY_END_MIN = h, m
-                break
+        win = effective_public_booking_window_minutes(appt_date, service)
+        if win is None:
+            return Response({"available_slots": []})
+        day_start, day_end = win
 
         duration = service.duration_minutes
         if block_minutes_raw:
@@ -341,8 +317,6 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             required_span = duration
 
         SLOT_INTERVAL = 15 if service.service_type == "chiropractic" else max(duration, 15)
-        day_start = DAY_START_HOUR * 60 + DAY_START_MIN
-        day_end = DAY_END_HOUR * 60 + DAY_END_MIN
 
         busy_qs = Appointment.objects.filter(
             provider=provider,
@@ -1257,7 +1231,7 @@ class AdminViewSet(viewsets.ViewSet):
         ):
             if a.status == Appointment.Status.CHECKED_IN:
                 recent_activity.append(
-                    f"{a.patient.first_name} {a.patient.last_name} checked in."
+                    f"{a.patient.first_name} {a.patient.last_name} completed check-in."
                 )
             elif a.status == Appointment.Status.COMPLETED:
                 recent_activity.append(
@@ -2439,7 +2413,7 @@ class KioskViewSet(viewsets.ViewSet):
                 {
                     "result": "already_checked_in",
                     "message": (
-                        "Our records show you are already checked in for today. "
+                        "Our records show you have already completed check-in for today. "
                         "Please have a seat in the waiting area — we will call you when it is time."
                     ),
                     "start_time_display": format_time_12h(appt.start_time),
@@ -2501,12 +2475,12 @@ class KioskViewSet(viewsets.ViewSet):
             Appointment.Status.COMPLETED,
         ):
             return Response(
-                {"detail": "This appointment cannot be checked in."},
+                {"detail": "Check-in is not available for this appointment."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         if appt.status != Appointment.Status.BOOKED:
             return Response(
-                {"detail": "You are already checked in or this visit is in progress."},
+                {"detail": "Check-in is already done or this visit is in progress."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         allowed, _, _ = self._can_kiosk_checkin_now(appt)
@@ -2514,7 +2488,7 @@ class KioskViewSet(viewsets.ViewSet):
             return Response(
                 {
                     "detail": (
-                        "It is too early to check in from this kiosk. Please wait until your scheduled time "
+                        "It is too early for check-in from this kiosk. Please wait until your scheduled time "
                         "(or within the check-in window), or ask the front desk."
                     )
                 },

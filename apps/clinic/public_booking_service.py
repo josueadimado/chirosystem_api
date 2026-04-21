@@ -17,6 +17,7 @@ from rest_framework.exceptions import ValidationError as RestValidationError
 
 from .booking_availability import provider_interval_blocked_online
 from .chiropractic_booking_policy import chiropractic_booking_must_use_intake
+from .online_booking_hours import PUBLIC_BOOKING_HOURS_BLURB, interval_outside_effective_public_window
 from .models import Appointment, Patient, Provider, Service
 from .utils import format_time_12h, normalize_phone
 
@@ -88,6 +89,9 @@ def create_appointment_from_public_booking(validated: dict) -> tuple[Appointment
     end_dt = start_dt + timezone.timedelta(minutes=service.duration_minutes)
     start_time = start_dt.time()
     end_time = end_dt.time()
+
+    if interval_outside_effective_public_window(validated["appointment_date"], start_time, end_time, service):
+        return None, PUBLIC_BOOKING_HOURS_BLURB
 
     if provider_interval_blocked_online(provider.pk, validated["appointment_date"], start_time, end_time):
         return None, "That time is not open for online booking with this provider. Please pick another slot."

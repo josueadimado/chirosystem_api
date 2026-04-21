@@ -563,6 +563,7 @@ def _find_nearby_slots(
     """Find the nearest available slots to a rejected time on the same date."""
     from apps.clinic.models import Provider, Service
     from apps.clinic.booking_availability import provider_interval_blocked_online
+    from apps.clinic.online_booking_hours import effective_public_booking_window_minutes
     from datetime import time as time_cls
 
     if not provider_id:
@@ -574,7 +575,10 @@ def _find_nearby_slots(
 
     duration = service.duration_minutes
     slot_step = 15 if service.service_type == "chiropractic" else max(duration, 15)
-    day_start, day_end = 9 * 60, 18 * 60
+    win = effective_public_booking_window_minutes(appt_date, service)
+    if not win:
+        return []
+    day_start, day_end = win
 
     taken = set()
     for s, e in (
