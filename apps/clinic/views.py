@@ -569,6 +569,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             appointment_id=data["appointment_id"],
             new_date=data["appointment_date"],
             new_start=data["start_time"],
+            sms_consent=bool(data.get("sms_consent")),
         )
         if err:
             code = (

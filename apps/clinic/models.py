@@ -29,6 +29,16 @@ class Patient(TimeStampedModel):
     square_card_id = models.CharField(max_length=255, blank=True)
     card_brand = models.CharField(max_length=20, blank=True)
     card_last4 = models.CharField(max_length=4, blank=True)
+    # SMS (TCPA): recorded when patient checks consent on public booking / reschedule.
+    sms_consent = models.BooleanField(
+        default=False,
+        help_text="True if the patient agreed to SMS appointment reminders via the online booking consent checkbox.",
+    )
+    sms_consent_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When SMS consent was last recorded from the booking site.",
+    )
 
     def __str__(self) -> str:
         return f"{self.first_name} {self.last_name}"

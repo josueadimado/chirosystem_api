@@ -22,6 +22,13 @@ from .models import Appointment, Patient, Provider, Service
 from .utils import format_time_12h, normalize_phone
 
 
+def record_patient_sms_consent_from_booking(patient: Patient) -> None:
+    """Persist SMS reminder consent and timestamp (idempotent refresh of consent time on repeat True)."""
+    patient.sms_consent = True
+    patient.sms_consent_at = timezone.now()
+    patient.save(update_fields=["sms_consent", "sms_consent_at", "updated_at"])
+
+
 def create_appointment_from_public_booking(validated: dict) -> tuple[Appointment | None, str | None]:
     """
     Persist patient + appointment from PublicBookingSerializer.validated_data.
@@ -38,6 +45,8 @@ def create_appointment_from_public_booking(validated: dict) -> tuple[Appointment
             "email": (validated.get("email") or "").strip(),
         },
     )
+    if validated.get("sms_consent"):
+        record_patient_sms_consent_from_booking(patient)
 
     if validated.get("service_id"):
         try:
@@ -170,6 +179,7 @@ def reschedule_appointment_public(
     appointment_id: int,
     new_date,
     new_start,
+    sms_consent: bool = False,
 ) -> tuple[Appointment | None, str | None]:
     """
     Move an existing BOOKED visit to a new open slot. Verifies the patient's phone matches.
@@ -254,6 +264,9 @@ def reschedule_appointment_public(
     appt.save(
         update_fields=["appointment_date", "start_time", "end_time", "sms_reminder_sent_at", "updated_at"]
     )
+
+    if sms_consent:
+        record_patient_sms_consent_from_booking(patient)
 
     aid = appt.id
     change_lines: list[str] = []
