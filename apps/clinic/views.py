@@ -85,6 +85,7 @@ from .square_payment import (
     get_terminal_checkout_status,
 )
 from .booking_availability import provider_interval_blocked_online
+from .booking_provider_eligibility import apply_intake_chiropractic_provider_fallback, provider_can_offer_service_online
 
 # Optional Square / card-on-file fields — defer on read-heavy querysets so SELECT does not
 # reference missing columns if migrations have not been applied yet.
@@ -221,7 +222,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
     permission_classes = [permissions.AllowAny]
 
     def list(self, request):
-        bookable = (
+        bookable_qs = (
             Service.objects.filter(is_active=True, show_in_public_booking=True)
             .annotate(
                 _book_order=Case(
@@ -233,26 +234,25 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             )
             .order_by("_book_order", "name")
         )
-        services = list(
-            bookable.values(
-                "id",
-                "name",
-                "description",
-                "duration_minutes",
-                "price",
-                "service_type",
-                "is_new_client_intake",
-            )
-        )
-        providers_by_service = {}
-        for svc in bookable.prefetch_related("providers"):
-            providers_by_service[svc.id] = [
-                {"id": p.id, "provider_name": str(p)}
-                for p in svc.providers.filter(active=True)
-            ]
-        # Add allow_provider_choice: chiropractic = no choice (admin-assigned doctor), massage = patient chooses
-        for s in services:
-            s["allow_provider_choice"] = s.get("service_type") == "massage"
+        bookable_list = list(bookable_qs.prefetch_related("providers"))
+        services = [
+            {
+                "id": s.id,
+                "name": s.name,
+                "description": s.description or "",
+                "duration_minutes": s.duration_minutes,
+                "price": s.price,
+                "service_type": s.service_type,
+                "is_new_client_intake": s.is_new_client_intake,
+                "allow_provider_choice": s.service_type == "massage",
+            }
+            for s in bookable_list
+        ]
+        providers_by_service = {
+            svc.id: [{"id": p.id, "provider_name": str(p)} for p in svc.providers.filter(active=True)]
+            for svc in bookable_list
+        }
+        apply_intake_chiropractic_provider_fallback(bookable_list, providers_by_service)
         return Response({"services": services, "providers_by_service": providers_by_service})
 
     @action(detail=False, methods=["get"], url_path="availability")
@@ -284,7 +284,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         service = Service.objects.filter(pk=service_id, is_active=True, show_in_public_booking=True).first()
         if not provider or not service:
             return Response({"detail": "Invalid provider or service."}, status=status.HTTP_400_BAD_REQUEST)
-        if not provider.services.filter(pk=service.id).exists():
+        if not provider_can_offer_service_online(provider, service):
             return Response({"detail": "Provider does not offer this service."}, status=status.HTTP_400_BAD_REQUEST)
 
         from datetime import time as time_cls

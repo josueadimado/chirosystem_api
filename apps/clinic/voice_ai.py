@@ -28,7 +28,13 @@ logger = logging.getLogger(__name__)
 
 def _booking_catalog_json() -> dict[str, Any]:
     """Same shape as /api/v1/booking-options/ (minimal fields for the model)."""
-    bookable = Service.objects.filter(is_active=True, show_in_public_booking=True).order_by("name")
+    from .booking_provider_eligibility import apply_intake_chiropractic_provider_fallback
+
+    bookable = list(
+        Service.objects.filter(is_active=True, show_in_public_booking=True)
+        .order_by("name")
+        .prefetch_related("providers")
+    )
     services = []
     providers_by_service: dict[int, list[dict]] = {}
     for svc in bookable:
@@ -47,6 +53,7 @@ def _booking_catalog_json() -> dict[str, Any]:
             {"id": p.id, "provider_name": str(p)}
             for p in svc.providers.filter(active=True)
         ]
+    apply_intake_chiropractic_provider_fallback(bookable, providers_by_service)
     return {"services": services, "providers_by_service": providers_by_service}
 
 

@@ -16,6 +16,7 @@ from django.utils.text import slugify
 from rest_framework.exceptions import ValidationError as RestValidationError
 
 from .booking_availability import provider_interval_blocked_online
+from .booking_provider_eligibility import provider_can_offer_service_online
 from .chiropractic_booking_policy import chiropractic_booking_must_use_intake
 from .online_booking_hours import PUBLIC_BOOKING_HOURS_BLURB, interval_outside_effective_public_window
 from .models import Appointment, Patient, Provider, Service
@@ -74,7 +75,7 @@ def create_appointment_from_public_booking(validated: dict) -> tuple[Appointment
 
     if validated.get("provider_id"):
         provider = Provider.objects.get(pk=validated["provider_id"])
-        if not provider.services.filter(pk=service.id).exists() and provider.services.exists():
+        if not provider_can_offer_service_online(provider, service):
             return None, "This provider does not offer the selected service."
     else:
         User = get_user_model()
