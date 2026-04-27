@@ -644,6 +644,14 @@ class PatientViewSet(viewsets.ModelViewSet):
     serializer_class = PatientSerializer
     permission_classes = [IsOwnerOrDoctor]
 
+    def create(self, request, *args, **kwargs):
+        if getattr(request.user, "role", None) not in ("owner_admin", "staff"):
+            raise PermissionDenied(
+                "Only clinic owner or staff can add a new patient this way. "
+                "Doctors should ask the front desk or use Django admin if your clinic allows it."
+            )
+        return super().create(request, *args, **kwargs)
+
     def destroy(self, request, *args, **kwargs):
         if getattr(request.user, "role", None) not in ("owner_admin", "staff"):
             return Response(
