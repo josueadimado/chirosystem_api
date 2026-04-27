@@ -39,6 +39,12 @@ class Patient(TimeStampedModel):
         blank=True,
         help_text="When SMS consent was last recorded from the booking site.",
     )
+    # When True, public/voice booking skips "must book intake first" for chiropractic (migrated / established patients).
+    online_chiro_intake_waived = models.BooleanField(
+        default=False,
+        help_text="If checked, this patient may book regular (non-intake) chiropractic online even without a completed "
+        "chiropractic visit on file—use for data imports and established patients from before the system.",
+    )
 
     def __str__(self) -> str:
         return f"{self.first_name} {self.last_name}"

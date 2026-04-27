@@ -316,7 +316,9 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         else:
             required_span = duration
 
-        SLOT_INTERVAL = 15 if service.service_type == "chiropractic" else max(duration, 15)
+        # Chiropractic: step by full visit length (e.g. 45 min → 9:00, 9:45, …) so slots align with the schedule.
+        # Massage: step at least by duration (often 60+).
+        SLOT_INTERVAL = duration if service.service_type == Service.ServiceType.CHIROPRACTIC else max(duration, 15)
 
         busy_qs = Appointment.objects.filter(
             provider=provider,
@@ -1504,6 +1506,7 @@ class AdminViewSet(viewsets.ViewSet):
             "card_brand": patient.card_brand or "",
             "card_last4": patient.card_last4 or "",
             "has_saved_card": bool(patient.card_last4),
+            "online_chiro_intake_waived": patient.online_chiro_intake_waived,
             "appointments": _serialize_patient_appointment_history(request, appointments),
         })
 
@@ -1534,6 +1537,13 @@ class AdminViewSet(viewsets.ViewSet):
                 setattr(patient, field, data[field] or "")
         if "date_of_birth" in data:
             patient.date_of_birth = data["date_of_birth"]
+        if "online_chiro_intake_waived" in data:
+            if getattr(request.user, "role", None) not in ("owner_admin", "staff"):
+                return Response(
+                    {"detail": "Only owner or staff can change the online chiropractic intake waiver."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            patient.online_chiro_intake_waived = bool(data["online_chiro_intake_waived"])
         patient.save()
         return Response({"detail": "Saved."})
 
@@ -1785,6 +1795,7 @@ class DoctorViewSet(viewsets.ViewSet):
                 "card_brand": patient.card_brand or "",
                 "card_last4": patient.card_last4 or "",
                 "has_saved_card": bool(patient.card_last4),
+                "online_chiro_intake_waived": patient.online_chiro_intake_waived,
                 "appointments": _serialize_patient_appointment_history(request, appointments),
             }
         )
@@ -1807,7 +1818,8 @@ class DoctorViewSet(viewsets.ViewSet):
         patient = Patient.objects.filter(pk=patient_id).first()
         ser = PatientIntakeUpdateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
-        data = ser.validated_data
+        data = {**ser.validated_data}
+        data.pop("online_chiro_intake_waived", None)
         for field in (
             "address_line1",
             "address_line2",

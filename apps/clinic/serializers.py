@@ -482,6 +482,8 @@ class PatientIntakeUpdateSerializer(serializers.Serializer):
     emergency_contact_name = serializers.CharField(required=False, allow_blank=True, max_length=200)
     emergency_contact_phone = serializers.CharField(required=False, allow_blank=True, max_length=30)
     date_of_birth = serializers.DateField(required=False, allow_null=True)
+    # Only owner_admin/staff may persist this (see AdminViewSet.patient_intake); doctors’ PATCH ignores it.
+    online_chiro_intake_waived = serializers.BooleanField(required=False)
 
 
 class ClinicProfileUpdateSerializer(serializers.Serializer):

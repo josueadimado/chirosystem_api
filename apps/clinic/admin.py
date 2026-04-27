@@ -52,7 +52,35 @@ class ProviderAdmin(admin.ModelAdmin):
     )
 
 
-admin.site.register(Patient)
+@admin.register(Patient)
+class PatientAdmin(admin.ModelAdmin):
+    """Demographics, Square card hints, SMS consent, and online-booking intake waiver for imports."""
+
+    list_display = (
+        "id",
+        "last_name",
+        "first_name",
+        "phone",
+        "online_chiro_intake_waived",
+        "sms_consent",
+        "updated_at",
+    )
+    list_filter = ("online_chiro_intake_waived", "sms_consent")
+    search_fields = ("first_name", "last_name", "phone", "email")
+    readonly_fields = ("created_at", "updated_at")
+    fieldsets = (
+        (None, {"fields": ("first_name", "last_name", "phone", "email", "date_of_birth")}),
+        ("Address & emergency", {"fields": ("address_line1", "address_line2", "city_state_zip", "emergency_contact_name", "emergency_contact_phone")}),
+        ("Square (card on file hints)", {"fields": ("square_customer_id", "square_card_id", "card_brand", "card_last4")}),
+        (
+            "Online booking",
+            {
+                "fields": ("online_chiro_intake_waived", "sms_consent", "sms_consent_at"),
+                "description": "Check “Waive online chiro intake rule” for migrated or established patients who should book regular visits without a completed visit already in this system.",
+            },
+        ),
+        ("Timestamps", {"fields": ("created_at", "updated_at")}),
+    )
 admin.site.register(ProviderUnavailability)
 admin.site.register(Service)
 admin.site.register(Appointment)

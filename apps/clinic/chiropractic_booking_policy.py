@@ -55,6 +55,8 @@ def chiropractic_booking_must_use_intake(patient: Patient, service: Service) -> 
         return None
     if service.is_new_client_intake:
         return None
+    if patient.online_chiro_intake_waived:
+        return None
     intake_qs = public_new_client_intake_services()
     if not intake_qs.exists():
         return None
@@ -91,6 +93,7 @@ def chiropractic_intake_context_for_new_phone_lookup() -> dict:
         "chiropractic_intake_services": intake_list,
         "last_chiropractic_visit_date": None,
         "chiropractic_gap_days": gap,
+        "online_chiro_intake_waived": False,
     }
 
 
@@ -100,6 +103,16 @@ def chiropractic_intake_context_for_patient(patient: Patient) -> dict:
     intake_qs = public_new_client_intake_services()
     intake_list = [{"id": s.id, "name": s.name} for s in intake_qs]
     gap = chiro_returning_gap_days()
+    if patient.online_chiro_intake_waived:
+        return {
+            "chiropractic_returning_gap_requires_intake": False,
+            "chiropractic_first_chiro_requires_intake": False,
+            "chiropractic_new_patient_requires_intake": False,
+            "chiropractic_intake_services": intake_list,
+            "last_chiropractic_visit_date": str(last) if last else None,
+            "chiropractic_gap_days": gap,
+            "online_chiro_intake_waived": True,
+        }
     lapsed = last is not None and (timezone.localdate() - last).days > gap
     gap_requires = bool(lapsed and intake_list)
     first_requires = bool(last is None and intake_list)
@@ -110,4 +123,5 @@ def chiropractic_intake_context_for_patient(patient: Patient) -> dict:
         "chiropractic_intake_services": intake_list,
         "last_chiropractic_visit_date": str(last) if last else None,
         "chiropractic_gap_days": gap,
+        "online_chiro_intake_waived": False,
     }
