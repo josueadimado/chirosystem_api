@@ -289,7 +289,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
 
         from datetime import time as time_cls
 
-        from .online_booking_hours import effective_public_booking_window_minutes
+        from .online_booking_hours import CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES, effective_public_booking_window_minutes
 
         win = effective_public_booking_window_minutes(appt_date, service)
         if win is None:
@@ -316,9 +316,13 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         else:
             required_span = duration
 
-        # Chiropractic: step by full visit length (e.g. 45 min → 9:00, 9:45, …) so slots align with the schedule.
+        # Chiropractic: unified 15-minute start grid for all chiro visit lengths; required_span still uses duration (or block).
         # Massage: step at least by duration (often 60+).
-        SLOT_INTERVAL = duration if service.service_type == Service.ServiceType.CHIROPRACTIC else max(duration, 15)
+        SLOT_INTERVAL = (
+            CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES
+            if service.service_type == Service.ServiceType.CHIROPRACTIC
+            else max(duration, 15)
+        )
 
         busy_qs = Appointment.objects.filter(
             provider=provider,

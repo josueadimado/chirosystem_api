@@ -16,6 +16,10 @@ from datetime import date, time
 
 from .models import ClinicSettings, Service
 
+# Chiropractic: one shared public schedule grid — offered start times every N minutes (e.g. 8:00, 8:15, 8:30).
+# Each visit still occupies its full duration_minutes on the calendar (45 min = three 15-min cells).
+CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES = 15
+
 
 def _hard_policy_open_close_minutes(appt_date: date, service: Service) -> tuple[int, int] | None:
     """Fixed Mon–Fri policy in minutes from midnight; None if online booking closed that calendar day."""

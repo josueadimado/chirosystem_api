@@ -226,6 +226,9 @@ def reschedule_appointment_public(
     start_time = start_dt.time()
     end_time = end_dt.time()
 
+    if interval_outside_effective_public_window(new_date, start_time, end_time, service):
+        return None, PUBLIC_BOOKING_HOURS_BLURB
+
     if provider_interval_blocked_online(provider.pk, new_date, start_time, end_time):
         return None, "That time is not open for online booking with this provider. Please pick another slot."
 
