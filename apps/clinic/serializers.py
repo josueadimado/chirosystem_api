@@ -33,22 +33,6 @@ class PatientSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(result)
         return result
 
-    def validate(self, attrs):
-        phone = attrs.get("phone")
-        if phone is None and self.instance is not None:
-            return attrs
-        check_phone = phone if phone is not None else (self.instance.phone if self.instance else None)
-        if not check_phone:
-            return attrs
-        qs = Patient.objects.filter(phone=check_phone)
-        if self.instance is not None:
-            qs = qs.exclude(pk=self.instance.pk)
-        if qs.exists():
-            raise serializers.ValidationError(
-                {"phone": "A patient with this phone number already exists."},
-            )
-        return attrs
-
 
 class ProviderSerializer(serializers.ModelSerializer):
     provider_name = serializers.CharField(source="user.full_name", read_only=True)

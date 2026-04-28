@@ -20,6 +20,7 @@ from .booking_provider_eligibility import provider_can_offer_service_online
 from .chiropractic_booking_policy import chiropractic_booking_must_use_intake
 from .online_booking_hours import PUBLIC_BOOKING_HOURS_BLURB, interval_outside_effective_public_window
 from .models import Appointment, Patient, Provider, Service
+from .patient_phone import get_or_create_patient_for_public_booking
 from .utils import format_time_12h, normalize_phone
 
 
@@ -38,13 +39,11 @@ def create_appointment_from_public_booking(validated: dict) -> tuple[Appointment
     (slot taken, blocked interval, invalid provider/service combo).
     """
     phone_normalized = normalize_phone(validated["phone"])
-    patient, _ = Patient.objects.update_or_create(
-        phone=phone_normalized,
-        defaults={
-            "first_name": validated["first_name"],
-            "last_name": validated["last_name"],
-            "email": (validated.get("email") or "").strip(),
-        },
+    patient = get_or_create_patient_for_public_booking(
+        phone_normalized=phone_normalized,
+        first_name=validated["first_name"],
+        last_name=validated["last_name"],
+        email=(validated.get("email") or "").strip(),
     )
     if validated.get("sms_consent"):
         record_patient_sms_consent_from_booking(patient)

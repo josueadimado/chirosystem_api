@@ -169,11 +169,14 @@ def twilio_voice_incoming(request):
     import random
     clinic_name = escape(clinic.clinic_name)
 
-    # Detect returning patients by phone before the WebSocket connects
+    # Detect returning patients by phone before the WebSocket connects (one number may be shared in a family)
+    from apps.clinic.patient_phone import patients_matching_phone
+
     patient = None
     norm_phone = normalize_phone(frm)
-    if norm_phone:
-        patient = Patient.objects.filter(phone=norm_phone).first()
+    phone_matches = patients_matching_phone(norm_phone) if norm_phone else []
+    if len(phone_matches) == 1:
+        patient = phone_matches[0]
 
     if patient:
         pname = escape(f"{patient.first_name} {patient.last_name}".strip())

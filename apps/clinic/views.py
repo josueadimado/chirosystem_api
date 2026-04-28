@@ -412,7 +412,13 @@ class BookingOptionsViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["get"], url_path="patient-lookup")
     def patient_lookup(self, request):
-        """Look up existing patient by phone for pre-fill in booking. Public."""
+        """Look up patient(s) by phone for booking pre-fill. Public. Same number may belong to multiple people."""
+        from .chiropractic_booking_policy import (
+            chiropractic_intake_context_for_new_phone_lookup,
+            chiropractic_intake_context_for_patient,
+        )
+        from .patient_phone import names_equal_casefold, patients_matching_phone
+
         phone_raw = request.query_params.get("phone")
         if not phone_raw:
             return Response({"found": False})
@@ -420,30 +426,67 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         if not valid:
             return Response({"found": False})
         norm = normalize_phone(phone_raw)
-        patient = Patient.objects.filter(phone=norm).first()
-        if not patient:
-            # Also try matching normalized against stored (for legacy data)
-            for p in Patient.objects.all():
-                if normalize_phone(p.phone) == norm:
-                    patient = p
-                    break
-        if not patient:
-            from .chiropractic_booking_policy import chiropractic_intake_context_for_new_phone_lookup
+        fn_q = (request.query_params.get("first_name") or "").strip()
+        ln_q = (request.query_params.get("last_name") or "").strip()
 
+        patients = patients_matching_phone(norm)
+        if not patients:
             return Response({"found": False, **chiropractic_intake_context_for_new_phone_lookup()})
 
-        from .chiropractic_booking_policy import chiropractic_intake_context_for_patient
+        narrowed = [p for p in patients if names_equal_casefold(p, fn_q, ln_q)] if (fn_q and ln_q) else []
+
+        def one(patient):
+            return Response(
+                {
+                    "found": True,
+                    "ambiguous_phone": False,
+                    "same_phone_different_person": False,
+                    "first_name": patient.first_name,
+                    "last_name": patient.last_name,
+                    "email": patient.email or "",
+                    "has_saved_card": bool(patient.square_card_id and patient.card_last4),
+                    "card_brand": patient.card_brand or "",
+                    "card_last4": patient.card_last4 or "",
+                    **chiropractic_intake_context_for_patient(patient),
+                }
+            )
+
+        if narrowed:
+            return one(narrowed[0])
+
+        if len(patients) == 1:
+            if fn_q and ln_q:
+                return Response(
+                    {
+                        "found": False,
+                        "ambiguous_phone": False,
+                        "same_phone_different_person": True,
+                        **chiropractic_intake_context_for_new_phone_lookup(),
+                    }
+                )
+            return one(patients[0])
+
+        hm = []
+        for p in patients:
+            hm.append(
+                {
+                    "first_name": p.first_name,
+                    "last_name": p.last_name,
+                    "email": p.email or "",
+                    "has_saved_card": bool(p.square_card_id and p.card_last4),
+                    "card_brand": p.card_brand or "",
+                    "card_last4": p.card_last4 or "",
+                    **chiropractic_intake_context_for_patient(p),
+                }
+            )
 
         return Response(
             {
                 "found": True,
-                "first_name": patient.first_name,
-                "last_name": patient.last_name,
-                "email": patient.email or "",
-                "has_saved_card": bool(patient.square_card_id and patient.card_last4),
-                "card_brand": patient.card_brand or "",
-                "card_last4": patient.card_last4 or "",
-                **chiropractic_intake_context_for_patient(patient),
+                "ambiguous_phone": True,
+                "same_phone_different_person": False,
+                "household_members": hm,
+                **chiropractic_intake_context_for_new_phone_lookup(),
             }
         )
 
@@ -467,25 +510,41 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         """Persist a card on file using a Web Payments token (source_id from card.tokenize())."""
         if not square_configured():
             return Response({"detail": "Card registration is not enabled yet."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        from .patient_phone import get_or_create_patient_for_public_booking, patients_matching_phone
+
         ser = SaveSquareCardSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
         phone_norm = normalize_phone(data["phone"])
-        patient = Patient.objects.filter(phone=phone_norm).first()
-        if not patient:
-            fn = (data.get("first_name") or "").strip()
-            ln = (data.get("last_name") or "").strip()
-            if not fn or not ln:
-                return Response(
-                    {"detail": "Patient not found for this phone; include first_name and last_name to create the profile."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            patient = Patient.objects.create(
-                phone=phone_norm,
+        fn = (data.get("first_name") or "").strip()
+        ln = (data.get("last_name") or "").strip()
+        matches = patients_matching_phone(phone_norm)
+
+        if fn and ln:
+            patient = get_or_create_patient_for_public_booking(
+                phone_normalized=phone_norm,
                 first_name=fn,
                 last_name=ln,
                 email=(data.get("email") or "").strip(),
             )
+        elif len(matches) == 1:
+            patient = matches[0]
+        elif not matches:
+            return Response(
+                {"detail": "Patient not found for this phone; include first_name and last_name to create the profile."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        else:
+            return Response(
+                {
+                    "detail": (
+                        "More than one person uses this phone number. Enter first and last name so we attach the "
+                        "card to the right profile."
+                    ),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         src = data["source_id"]
         vtok = (data.get("verification_token") or "").strip() or None
         try:
@@ -503,6 +562,8 @@ class BookingOptionsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=["get"], url_path="my-appointments")
     def my_appointments(self, request):
         """List upcoming BOOKED visits for this phone that can be managed online. Public."""
+        from .patient_phone import patients_matching_phone
+
         phone_raw = request.query_params.get("phone")
         if not phone_raw:
             return Response({"detail": "phone is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -510,30 +571,29 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         if not valid:
             return Response({"detail": msg or "Invalid phone."}, status=status.HTTP_400_BAD_REQUEST)
         norm = normalize_phone(phone_raw)
-        patient = Patient.objects.filter(phone=norm).first()
-        if not patient:
-            for p in Patient.objects.all():
-                if normalize_phone(p.phone) == norm:
-                    patient = p
-                    break
-        if not patient:
+        patients = patients_matching_phone(norm)
+        if not patients:
             return Response(
                 {
                     "first_name": "",
                     "last_name": "",
                     "email": "",
+                    "ambiguous_phone": False,
                     "appointments": [],
                 }
             )
 
+        patient_ids = [p.id for p in patients]
+        shared = len(patients) > 1
+
         today = timezone.localdate()
         rows = (
             Appointment.objects.filter(
-                patient=patient,
+                patient_id__in=patient_ids,
                 appointment_date__gte=today,
                 status=Appointment.Status.BOOKED,
             )
-            .select_related("provider", "booked_service")
+            .select_related("patient", "provider", "booked_service")
             .order_by("appointment_date", "start_time")
         )
         out = []
@@ -541,6 +601,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             svc = a.booked_service
             if not svc or not svc.is_active or not svc.show_in_public_booking:
                 continue
+            pn = a.patient
             out.append(
                 {
                     "id": a.id,
@@ -552,13 +613,16 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                     "provider_name": str(a.provider),
                     "duration_minutes": svc.duration_minutes,
                     "price": str(svc.price),
+                    "patient_name": f"{pn.first_name} {pn.last_name}".strip(),
                 }
             )
+        one = patients[0]
         return Response(
             {
-                "first_name": patient.first_name,
-                "last_name": patient.last_name,
-                "email": patient.email or "",
+                "first_name": one.first_name if not shared else "",
+                "last_name": one.last_name if not shared else "",
+                "email": one.email or "" if not shared else "",
+                "ambiguous_phone": shared,
                 "appointments": out,
             }
         )
