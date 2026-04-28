@@ -263,9 +263,18 @@ def reschedule_appointment_public(
     appt.appointment_date = new_date
     appt.start_time = start_time
     appt.end_time = end_time
-    appt.sms_reminder_sent_at = None
+    appt.clear_reminder_timestamps()
     appt.save(
-        update_fields=["appointment_date", "start_time", "end_time", "sms_reminder_sent_at", "updated_at"]
+        update_fields=[
+            "appointment_date",
+            "start_time",
+            "end_time",
+            "day_before_reminder_sms_at",
+            "day_before_reminder_email_at",
+            "same_day_reminder_sms_at",
+            "same_day_reminder_email_at",
+            "updated_at",
+        ]
     )
 
     if sms_consent:

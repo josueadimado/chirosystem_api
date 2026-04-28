@@ -168,10 +168,23 @@ class Appointment(TimeStampedModel):
         default="",
         help_text="Clinical or admin notes for future visits—visible to other doctors on this patient's chart.",
     )
-    # Twilio: set when a day-before reminder SMS was sent (cleared if date/time rescheduled)
-    sms_reminder_sent_at = models.DateTimeField(null=True, blank=True)
+    # Filled when each reminder channel was last sent for this appointment (nulled when date/time changes)
+    day_before_reminder_sms_at = models.DateTimeField(null=True, blank=True)
+    day_before_reminder_email_at = models.DateTimeField(null=True, blank=True)
+    same_day_reminder_sms_at = models.DateTimeField(null=True, blank=True)
+    same_day_reminder_email_at = models.DateTimeField(null=True, blank=True)
     # Google Calendar event on the provider's connected personal calendar
     google_calendar_event_id = models.CharField(max_length=255, blank=True)
+
+    def clear_reminder_timestamps(self) -> None:
+        """Clear all reminder send markers (e.g. after reschedule) so reminders can fire again."""
+        self.day_before_reminder_sms_at = None
+        self.day_before_reminder_email_at = None
+        self.same_day_reminder_sms_at = None
+        self.same_day_reminder_email_at = None
+
+    def __str__(self) -> str:
+        return f"{self.appointment_date} {self.start_time} ({self.status})"
 
 
 class ProviderUnavailability(TimeStampedModel):

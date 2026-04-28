@@ -153,10 +153,22 @@ CLINIC_TIMEZONE = os.getenv("CLINIC_TIMEZONE", "America/Detroit")
 CELERY_TIMEZONE = CLINIC_TIMEZONE
 # Kiosk: earliest self-service check-in is this many minutes before the scheduled start (staff can complete check-in earlier in admin).
 KIOSK_EARLY_CHECKIN_MINUTES_BEFORE = int(os.getenv("KIOSK_EARLY_CHECKIN_MINUTES_BEFORE", "15"))
+# Same-day SMS + email: send when this many hours or less remain until start (checked every few minutes by Celery Beat).
+_REMINDER_SDH_RAW = os.getenv("REMINDER_SAME_DAY_LEAD_HOURS", "").strip()
+try:
+    REMINDER_SAME_DAY_LEAD_HOURS = float(_REMINDER_SDH_RAW) if _REMINDER_SDH_RAW else 2.0
+except ValueError:
+    REMINDER_SAME_DAY_LEAD_HOURS = 2.0
+if REMINDER_SAME_DAY_LEAD_HOURS <= 0:
+    REMINDER_SAME_DAY_LEAD_HOURS = 2.0
 CELERY_BEAT_SCHEDULE = {
     "send-daily-appointment-sms-reminders": {
         "task": "apps.notifications.tasks.send_daily_appointment_reminders",
         "schedule": crontab(hour=9, minute=0),
+    },
+    "send-same-day-appointment-reminders": {
+        "task": "apps.notifications.tasks.send_same_day_appointment_reminders",
+        "schedule": crontab(minute="*/10"),
     },
 }
 

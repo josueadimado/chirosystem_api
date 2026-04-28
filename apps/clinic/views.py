@@ -1104,7 +1104,12 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         date_changed = "appointment_date" in data and data["appointment_date"] != inst.appointment_date
         time_changed = "start_time" in data and data["start_time"] != inst.start_time
         if date_changed or time_changed:
-            serializer.save(sms_reminder_sent_at=None)
+            serializer.save(
+                day_before_reminder_sms_at=None,
+                day_before_reminder_email_at=None,
+                same_day_reminder_sms_at=None,
+                same_day_reminder_email_at=None,
+            )
         else:
             serializer.save()
         new = serializer.instance

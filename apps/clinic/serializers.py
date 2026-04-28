@@ -256,7 +256,13 @@ class AppointmentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Appointment
         fields = _APPOINTMENT_FIELD_NAMES + ("waive_late_cancel_fee",)
-        read_only_fields = ("sms_reminder_sent_at", "google_calendar_event_id")
+        read_only_fields = (
+            "day_before_reminder_sms_at",
+            "day_before_reminder_email_at",
+            "same_day_reminder_sms_at",
+            "same_day_reminder_email_at",
+            "google_calendar_event_id",
+        )
 
 
 class AppointmentListSerializer(serializers.ModelSerializer):
