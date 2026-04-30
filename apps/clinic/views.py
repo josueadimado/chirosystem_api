@@ -61,6 +61,7 @@ from .serializers import (
     VisitSerializer,
     VoiceCallLogSerializer,
     complete_visit_with_services,
+    revise_unpaid_visit_billing,
 )
 from .square_helpers import (
     get_application_id,
@@ -165,17 +166,17 @@ def _invoice_bill_preview_requested(request) -> bool:
 
 
 def _printable_invoice_line(rs, pos_default):
-    """Patient bill JSON row: full fees for insurance; patient_due = amount owed for that line."""
-    from decimal import Decimal
+    """Bill table row: fees and line_total are documented amounts.
 
+    patient_due repeats the line total for display (including insurance/documentation lines)
+    so the statement shows dollars in every row. Invoice subtotal/total_amount still exclude
+    lines where charges_patient is False."""
     svc = rs.service
     base_desc = (svc.description or svc.name)[:120]
     if rs.charges_patient:
         desc = base_desc
-        patient_due = rs.total_price
     else:
-        desc = f"{base_desc} — no patient charge (insurance / documentation)".strip()[:220]
-        patient_due = Decimal("0")
+        desc = f"{base_desc} — not added to patient total below (insurance / documentation)".strip()[:220]
     return {
         "service_offered": svc.name,
         "cpt_code": svc.billing_code or "\u2014",
@@ -184,7 +185,7 @@ def _printable_invoice_line(rs, pos_default):
         "units": str(rs.quantity),
         "pos": pos_default,
         "line_total": str(rs.total_price),
-        "patient_due": str(patient_due),
+        "patient_due": str(rs.total_price),
         "charges_patient": rs.charges_patient,
     }
 
@@ -2098,6 +2099,16 @@ class DoctorViewSet(viewsets.ViewSet):
         visit = Visit.objects.filter(appointment_id=pk, provider=provider).select_related("appointment__booked_service").first()
         if not visit:
             return Response({"detail": "Visit not found."}, status=status.HTTP_404_NOT_FOUND)
+        if visit.appointment.status != Appointment.Status.IN_CONSULTATION:
+            return Response(
+                {
+                    "detail": (
+                        "This visit is not in progress. To add services or change billing while waiting on payment, "
+                        "tap Edit billing on that appointment."
+                    ),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         ser = DoctorCompleteVisitSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
@@ -2135,6 +2146,116 @@ class DoctorViewSet(viewsets.ViewSet):
         invoice.refresh_from_db()
         followup = build_invoice_payment_followup_dict(
             invoice, try_saved_card=data.get("charge_saved_card_if_present", True)
+        )
+        followup.pop("already_paid", None)
+        return Response(followup)
+
+    @action(detail=True, methods=["get"], url_path="billing_for_edit")
+    def billing_for_edit(self, request, pk=None):
+        """Load current chart + line items for a visit awaiting payment so the doctor can revise billing."""
+        provider = self._get_provider(request)
+        if not provider:
+            return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
+        appointment = Appointment.objects.filter(pk=pk, provider=provider).first()
+        if not appointment:
+            return Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
+        if appointment.status != Appointment.Status.AWAITING_PAYMENT:
+            return Response(
+                {"detail": "You can only edit billing when the visit is awaiting payment."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        visit = (
+            Visit.objects.filter(appointment=appointment, provider=provider)
+            .prefetch_related(
+                Prefetch(
+                    "rendered_services",
+                    queryset=VisitRenderedService.objects.select_related("service").order_by("id"),
+                )
+            )
+            .first()
+        )
+        if not visit:
+            return Response({"detail": "Visit not found."}, status=status.HTTP_404_NOT_FOUND)
+        invoice = Invoice.objects.filter(appointment=appointment, visit=visit).first()
+        if not invoice:
+            return Response({"detail": "No invoice for this visit."}, status=status.HTTP_404_NOT_FOUND)
+        if invoice.status == Invoice.Status.PAID:
+            return Response({"detail": "This invoice is already paid."}, status=status.HTTP_400_BAD_REQUEST)
+        if invoice.status not in (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT):
+            return Response(
+                {"detail": "Cannot edit billing for this invoice in its current state."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        rendered = [
+            {
+                "service_id": rs.service_id,
+                "quantity": rs.quantity,
+                "unit_price": str(rs.unit_price),
+            }
+            for rs in visit.rendered_services.all()
+        ]
+        return Response(
+            {
+                "doctor_notes": visit.doctor_notes or "",
+                "diagnosis": visit.diagnosis or "",
+                "rendered_services": rendered,
+                "invoice_id": invoice.id,
+                "invoice_number": invoice.invoice_number,
+                "total_amount": str(invoice.total_amount),
+            }
+        )
+
+    @action(detail=True, methods=["post"], url_path="revise_visit_billing")
+    def revise_visit_billing(self, request, pk=None):
+        """Update visit lines and unpaid invoice while appointment is awaiting payment."""
+        provider = self._get_provider(request)
+        if not provider:
+            return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
+        visit = Visit.objects.filter(appointment_id=pk, provider=provider).select_related("appointment").first()
+        if not visit:
+            return Response({"detail": "Visit not found."}, status=status.HTTP_404_NOT_FOUND)
+        if visit.appointment.status != Appointment.Status.AWAITING_PAYMENT:
+            return Response(
+                {"detail": "You can only revise billing while awaiting payment."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        ser = DoctorCompleteVisitSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        rendered_payload = []
+        for line in data["rendered_services"]:
+            svc = Service.objects.get(pk=line["service_id"])
+            if not svc.is_active or not svc.visible_for_primary_service_type(provider.primary_service_type):
+                return Response(
+                    {
+                        "detail": (
+                            f'Service "{svc.name}" is not available for your provider type '
+                            "or is inactive. Refresh and pick from the allowed list."
+                        ),
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            unit = line["unit_price"] if line.get("unit_price") is not None else svc.price
+            rendered_payload.append(
+                {
+                    "service_id": svc.id,
+                    "quantity": line.get("quantity", 1),
+                    "unit_price": str(unit),
+                }
+            )
+        payload = {
+            "doctor_notes": data.get("doctor_notes", ""),
+            "diagnosis": data.get("diagnosis", ""),
+            "rendered_services": rendered_payload,
+        }
+        try:
+            invoice = revise_unpaid_visit_billing(visit, payload)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        invoice.refresh_from_db()
+        followup = build_invoice_payment_followup_dict(
+            invoice, try_saved_card=data.get("charge_saved_card_if_present", False)
         )
         followup.pop("already_paid", None)
         return Response(followup)

@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
+from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -569,4 +570,57 @@ def complete_visit_with_services(visit: Visit, payload: dict) -> Invoice:
     appointment = visit.appointment
     appointment.status = Appointment.Status.AWAITING_PAYMENT
     appointment.save(update_fields=["status", "updated_at"])
+    return invoice
+
+
+def revise_unpaid_visit_billing(visit: Visit, payload: dict) -> Invoice:
+    """Update visit chart lines and invoice totals while appointment is awaiting payment (invoice not paid)."""
+    appt = visit.appointment
+    if appt.status != Appointment.Status.AWAITING_PAYMENT:
+        raise ValueError("You can only edit billing while the visit is awaiting payment.")
+    if visit.status != Visit.Status.COMPLETED:
+        raise ValueError("Visit must be completed before revising billing.")
+
+    try:
+        invoice = Invoice.objects.get(visit=visit)
+    except Invoice.DoesNotExist as exc:
+        raise ValueError("No invoice found for this visit.") from exc
+
+    if invoice.status == Invoice.Status.PAID:
+        raise ValueError("This invoice is already paid — billing cannot be changed here.")
+    if invoice.status not in (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT):
+        raise ValueError("This invoice cannot be revised in its current state.")
+
+    with transaction.atomic():
+        visit.doctor_notes = payload.get("doctor_notes", "")
+        update_fields = ["doctor_notes", "updated_at"]
+        if "diagnosis" in payload:
+            visit.diagnosis = payload.get("diagnosis", "") or ""
+            update_fields.insert(1, "diagnosis")
+        visit.save(update_fields=update_fields)
+
+        subtotal = Decimal("0")
+        visit.rendered_services.all().delete()
+        for line in payload["rendered_services"]:
+            service = Service.objects.get(pk=line["service_id"])
+            qty = Decimal(str(line.get("quantity", 1)))
+            unit_price = Decimal(str(line.get("unit_price", service.price)))
+            total = qty * unit_price
+            charges_patient = service.charges_patient
+            if charges_patient:
+                subtotal += total
+            VisitRenderedService.objects.create(
+                visit=visit,
+                service=service,
+                quantity=int(qty),
+                unit_price=unit_price,
+                total_price=total,
+                charges_patient=charges_patient,
+            )
+
+        invoice.subtotal = subtotal
+        invoice.tax = Decimal("0")
+        invoice.total_amount = subtotal
+        invoice.save(update_fields=["subtotal", "tax", "total_amount", "updated_at"])
+
     return invoice
