@@ -7,7 +7,7 @@ from django.core.signing import TimestampSigner
 from typing import Optional
 
 from django.db import transaction
-from django.db.models import Case, IntegerField, Prefetch, Q, Value, When
+from django.db.models import Case, IntegerField, Prefetch, Q, Sum, Value, When
 from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -134,6 +134,9 @@ def _invoice_bill_dict(inv: Invoice, *, preview: bool) -> dict:
     addr_display = pat.city_state_zip or "St Joseph, MI 49085"
     if pat.address_line1:
         addr_display = ", ".join(filter(None, [pat.address_line1, pat.city_state_zip])) or addr_display
+    documented_agg = visit.rendered_services.aggregate(s=Sum("total_price"))
+    documented_subtotal = documented_agg["s"] if documented_agg["s"] is not None else Decimal("0")
+    documented_subtotal = documented_subtotal.quantize(Decimal("0.01"))
     return {
         **header,
         "bill_title": "Patient Bill — PREVIEW (not paid yet)" if preview else "Patient Bill",
@@ -144,7 +147,10 @@ def _invoice_bill_dict(inv: Invoice, *, preview: bool) -> dict:
         "patient_address": addr_display,
         "diagnosis": (visit.diagnosis or "").strip() or "\u2014",
         "lines": lines,
-        "subtotal": str(inv.subtotal),
+        # Bill "Subtotal" = sum of all documented line amounts (including insurance-only rows).
+        "subtotal": str(documented_subtotal),
+        # Patient-chargeable portion before tax (matches Invoice.subtotal; used for optional UI).
+        "patient_subtotal": str(inv.subtotal),
         "tax": str(inv.tax),
         "total_amount": str(inv.total_amount),
         "status": inv.status,
@@ -168,15 +174,16 @@ def _invoice_bill_preview_requested(request) -> bool:
 def _printable_invoice_line(rs, pos_default):
     """Bill table row: fees and line_total are documented amounts.
 
-    patient_due repeats the line total for display (including insurance/documentation lines)
-    so the statement shows dollars in every row. Invoice subtotal/total_amount still exclude
-    lines where charges_patient is False."""
+    patient_due is the amount that counts toward the patient's balance (0 when insurance/documentation only).
+    Invoice subtotal/total_amount still exclude lines where charges_patient is False.
+    """
     svc = rs.service
     base_desc = (svc.description or svc.name)[:120]
     if rs.charges_patient:
         desc = base_desc
     else:
         desc = f"{base_desc} — not added to patient total below (insurance / documentation)".strip()[:220]
+    patient_due = str(rs.total_price) if rs.charges_patient else "0.00"
     return {
         "service_offered": svc.name,
         "cpt_code": svc.billing_code or "\u2014",
@@ -185,7 +192,7 @@ def _printable_invoice_line(rs, pos_default):
         "units": str(rs.quantity),
         "pos": pos_default,
         "line_total": str(rs.total_price),
-        "patient_due": str(rs.total_price),
+        "patient_due": patient_due,
         "charges_patient": rs.charges_patient,
     }
 
