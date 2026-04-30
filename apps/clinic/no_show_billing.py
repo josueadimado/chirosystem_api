@@ -135,6 +135,7 @@ def _apply_penalty_fee_for_appointment(
             quantity=1,
             unit_price=fee,
             total_price=fee,
+            charges_patient=True,
         )
         invoice = Invoice.objects.create(
             patient=appointment.patient,

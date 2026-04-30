@@ -128,6 +128,12 @@ class Service(TimeStampedModel):
         help_text="If True, online chiropractic booking allows patients returning after a long gap (e.g. 2+ years since last completed chiro visit). "
         "Mark one bookable visit type as new patient / reactivation intake.",
     )
+    charges_patient = models.BooleanField(
+        default=True,
+        help_text="If True (typical visit/product), this line is included in the amount the patient pays. "
+        "If False, the service still appears on the printed bill with CPT/description for insurance reimbursement, "
+        "but its fee is not added to the invoice total.",
+    )
 
     def visible_for_primary_service_type(self, primary_service_type: str) -> bool:
         """Whether this service may appear on the in-room bill for a provider with the given booking category."""
@@ -232,6 +238,11 @@ class VisitRenderedService(TimeStampedModel):
     quantity = models.PositiveIntegerField(default=1)
     unit_price = models.DecimalField(max_digits=10, decimal_places=2)
     total_price = models.DecimalField(max_digits=10, decimal_places=2)
+    # Snapshot of Service.charges_patient at visit completion (invoice math uses this).
+    charges_patient = models.BooleanField(
+        default=True,
+        help_text="If False, this line is shown on the printed bill for insurance but not included in patient invoice totals.",
+    )
 
 
 class Invoice(TimeStampedModel):

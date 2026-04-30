@@ -542,13 +542,16 @@ def complete_visit_with_services(visit: Visit, payload: dict) -> Invoice:
         qty = Decimal(str(line.get("quantity", 1)))
         unit_price = Decimal(str(line.get("unit_price", service.price)))
         total = qty * unit_price
-        subtotal += total
+        charges_patient = service.charges_patient
+        if charges_patient:
+            subtotal += total
         VisitRenderedService.objects.create(
             visit=visit,
             service=service,
             quantity=int(qty),
             unit_price=unit_price,
             total_price=total,
+            charges_patient=charges_patient,
         )
 
     invoice = Invoice.objects.create(

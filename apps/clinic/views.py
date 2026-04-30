@@ -121,6 +121,74 @@ def _clinic_settings_bill_header():
     }
 
 
+def _invoice_bill_dict(inv: Invoice, *, preview: bool) -> dict:
+    """Shared JSON for printable / preview patient bill."""
+    visit = inv.visit
+    header = _clinic_settings_bill_header()
+    lines = [
+        _printable_invoice_line(rs, header["pos_default"])
+        for rs in visit.rendered_services.all().order_by("id")
+    ]
+    pat = inv.patient
+    addr_display = pat.city_state_zip or "St Joseph, MI 49085"
+    if pat.address_line1:
+        addr_display = ", ".join(filter(None, [pat.address_line1, pat.city_state_zip])) or addr_display
+    return {
+        **header,
+        "bill_title": "Patient Bill — PREVIEW (not paid yet)" if preview else "Patient Bill",
+        "is_preview": preview,
+        "invoice_number": inv.invoice_number,
+        "date_of_service": str(inv.appointment.appointment_date),
+        "patient_name": f"{pat.first_name} {pat.last_name}",
+        "patient_address": addr_display,
+        "diagnosis": (visit.diagnosis or "").strip() or "\u2014",
+        "lines": lines,
+        "subtotal": str(inv.subtotal),
+        "tax": str(inv.tax),
+        "total_amount": str(inv.total_amount),
+        "status": inv.status,
+    }
+
+
+def _invoice_bill_access_ok_for_preview(inv: Invoice) -> bool:
+    """Invoice states where a bill PDF/HTML can be generated (unpaid preview or paid final)."""
+    return inv.status in (
+        Invoice.Status.ISSUED,
+        Invoice.Status.OVERDUE,
+        Invoice.Status.PAID,
+    )
+
+
+def _invoice_bill_preview_requested(request) -> bool:
+    v = (request.query_params.get("preview") or "").strip().lower()
+    return v in ("1", "true", "yes")
+
+
+def _printable_invoice_line(rs, pos_default):
+    """Patient bill JSON row: full fees for insurance; patient_due = amount owed for that line."""
+    from decimal import Decimal
+
+    svc = rs.service
+    base_desc = (svc.description or svc.name)[:120]
+    if rs.charges_patient:
+        desc = base_desc
+        patient_due = rs.total_price
+    else:
+        desc = f"{base_desc} — no patient charge (insurance / documentation)".strip()[:220]
+        patient_due = Decimal("0")
+    return {
+        "service_offered": svc.name,
+        "cpt_code": svc.billing_code or "\u2014",
+        "description": desc,
+        "fees": str(rs.unit_price),
+        "units": str(rs.quantity),
+        "pos": pos_default,
+        "line_total": str(rs.total_price),
+        "patient_due": str(patient_due),
+        "charges_patient": rs.charges_patient,
+    }
+
+
 def _can_edit_handoff_notes(request, appointment: Appointment) -> bool:
     role = getattr(request.user, "role", None)
     if role in ("owner_admin", "staff"):
@@ -159,6 +227,7 @@ def _serialize_patient_appointment_history(request, appointments):
                         "quantity": rs.quantity,
                         "unit_price": str(rs.unit_price),
                         "line_total": str(rs.total_price),
+                        "charges_patient": rs.charges_patient,
                     }
                 )
         visit_payload = None
@@ -1471,7 +1540,7 @@ class AdminViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["get"], url_path="invoice_bill")
     def admin_invoice_bill(self, request):
-        """Print-ready patient bill for admin. Only after payment."""
+        """Print-ready patient bill for admin. Add ?preview=1 for unpaid (issued/overdue) preview."""
         invoice_id = request.query_params.get("invoice_id")
         if not invoice_id:
             return Response({"detail": "invoice_id is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -1483,47 +1552,24 @@ class AdminViewSet(viewsets.ViewSet):
         )
         if not inv:
             return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
+        preview = _invoice_bill_preview_requested(request)
+        if preview:
+            if not _invoice_bill_access_ok_for_preview(inv):
+                return Response(
+                    {"detail": "Cannot preview bill for this invoice status.", "invoice_status": inv.status},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            is_preview = inv.status != Invoice.Status.PAID
+            return Response(_invoice_bill_dict(inv, preview=is_preview))
         if inv.status != Invoice.Status.PAID:
             return Response(
-                {"detail": "Patient bill is available only after the invoice is paid.", "invoice_status": inv.status},
+                {
+                    "detail": "Patient bill is available only after the invoice is paid. Use ?preview=1 to preview before payment.",
+                    "invoice_status": inv.status,
+                },
                 status=status.HTTP_409_CONFLICT,
             )
-        visit = inv.visit
-        header = _clinic_settings_bill_header()
-        lines = []
-        for rs in visit.rendered_services.all().order_by("id"):
-            svc = rs.service
-            lines.append(
-                {
-                    "service_offered": svc.name,
-                    "cpt_code": svc.billing_code or "\u2014",
-                    "description": (svc.description or svc.name)[:120],
-                    "fees": str(rs.unit_price),
-                    "units": str(rs.quantity),
-                    "pos": header["pos_default"],
-                    "line_total": str(rs.total_price),
-                }
-            )
-        pat = inv.patient
-        addr_display = pat.city_state_zip or "St Joseph, MI 49085"
-        if pat.address_line1:
-            addr_display = ", ".join(filter(None, [pat.address_line1, pat.city_state_zip])) or addr_display
-        return Response(
-            {
-                **header,
-                "bill_title": "Patient Bill",
-                "invoice_number": inv.invoice_number,
-                "date_of_service": str(inv.appointment.appointment_date),
-                "patient_name": f"{pat.first_name} {pat.last_name}",
-                "patient_address": addr_display,
-                "diagnosis": (visit.diagnosis or "").strip() or "\u2014",
-                "lines": lines,
-                "subtotal": str(inv.subtotal),
-                "tax": str(inv.tax),
-                "total_amount": str(inv.total_amount),
-                "status": inv.status,
-            }
-        )
+        return Response(_invoice_bill_dict(inv, preview=False))
 
     @action(detail=False, methods=["get"])
     def patients(self, request):
@@ -1939,7 +1985,7 @@ class DoctorViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["get"], url_path="invoice_bill")
     def invoice_bill(self, request):
-        """Print-ready patient bill (matches clinic statement layout) for doctor's own invoice. Only after payment."""
+        """Print-ready patient bill for doctor's own invoice. Add ?preview=1 before payment (issued/overdue)."""
         provider = self._get_provider(request)
         if not provider:
             return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
@@ -1956,51 +2002,25 @@ class DoctorViewSet(viewsets.ViewSet):
             return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
         if inv.appointment.provider_id != provider.id:
             return Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
+        preview = _invoice_bill_preview_requested(request)
+        if preview:
+            if not _invoice_bill_access_ok_for_preview(inv):
+                return Response(
+                    {"detail": "Cannot preview bill for this invoice status.", "invoice_status": inv.status},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            is_preview = inv.status != Invoice.Status.PAID
+            return Response(_invoice_bill_dict(inv, preview=is_preview))
         if inv.status != Invoice.Status.PAID:
             return Response(
                 {
                     "detail": "Patient bill printing is available only after the invoice is paid. "
-                    "Finish card payment or desk checkout first.",
+                    "Use ?preview=1 to preview before payment, or finish card payment / desk checkout first.",
                     "invoice_status": inv.status,
                 },
                 status=status.HTTP_409_CONFLICT,
             )
-        visit = inv.visit
-        header = _clinic_settings_bill_header()
-        lines = []
-        for rs in visit.rendered_services.all().order_by("id"):
-            svc = rs.service
-            lines.append(
-                {
-                    "service_offered": svc.name,
-                    "cpt_code": svc.billing_code or "—",
-                    "description": (svc.description or svc.name)[:120],
-                    "fees": str(rs.unit_price),
-                    "units": str(rs.quantity),
-                    "pos": header["pos_default"],
-                    "line_total": str(rs.total_price),
-                }
-            )
-        pat = inv.patient
-        addr_display = pat.city_state_zip or "St Joseph, MI 49085"
-        if pat.address_line1:
-            addr_display = ", ".join(filter(None, [pat.address_line1, pat.city_state_zip])) or addr_display
-        return Response(
-            {
-                **header,
-                "bill_title": "Patient Bill",
-                "invoice_number": inv.invoice_number,
-                "date_of_service": str(inv.appointment.appointment_date),
-                "patient_name": f"{pat.first_name} {pat.last_name}",
-                "patient_address": addr_display,
-                "diagnosis": (visit.diagnosis or "").strip() or "—",
-                "lines": lines,
-                "subtotal": str(inv.subtotal),
-                "tax": str(inv.tax),
-                "total_amount": str(inv.total_amount),
-                "status": inv.status,
-            }
-        )
+        return Response(_invoice_bill_dict(inv, preview=False))
 
     @action(detail=False, methods=["get"], url_path="invoice_search")
     def invoice_search(self, request):
