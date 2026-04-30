@@ -692,6 +692,7 @@ def intent_to_booking_payload(
         "last_name": ln[:100],
         "phone": phone,
         "email": "",
+        "sms_consent": True,
         "service_id": svc["id"],
         "service_duration_minutes": int(svc["duration_minutes"]),
         "service_price": Decimal(str(svc["price"])),

@@ -1,0 +1,69 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block title %}{{ title }} | {{ site_title|default:_('Django site admin') }}{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+  <a href="{% url 'admin:index' %}">{% trans 'Home' %}</a>
+  &rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+  &rsaquo; <a href="{% url 'admin:clinic_clinicsettings_changelist' %}">{{ opts.verbose_name_plural|capfirst }}</a>
+  &rsaquo; {% trans "Send test SMS" %}
+</div>
+{% endblock %}
+
+{% block content %}
+<h1>{% trans "Send test SMS (Twilio)" %}</h1>
+
+{% if not twilio_ready %}
+<p class="errornote">
+  {% blocktrans %}
+  Twilio environment variables are incomplete on this server. Fix configuration
+  before testing (same vars as production SMS).
+  {% endblocktrans %}
+</p>
+{% endif %}
+
+<p>
+  {% blocktrans %}
+  This uses the same Twilio settings as real reminders and confirmations
+  (environment variables on the server). Check the Twilio console message log
+  if the text does not arrive.
+  {% endblocktrans %}
+</p>
+
+<dl style="margin: 1em 0;">
+  <dt><strong>{% trans "From" %}</strong></dt>
+  <dd><code>{{ from_display }}</code></dd>
+</dl>
+
+<form method="post" id="twilio-test-sms-form">
+  {% csrf_token %}
+  {% if form.non_field_errors %}
+  <p class="errornote">{{ form.non_field_errors }}</p>
+  {% endif %}
+
+  <fieldset class="module aligned">
+    <div class="form-row{% if form.phone.errors %} errors{% endif %}">
+      {{ form.phone.errors }}
+      <label for="{{ form.phone.id_for_label }}" class="required">{{ form.phone.label }}:</label>
+      {{ form.phone }}
+      {% if form.phone.help_text %}<p class="help">{{ form.phone.help_text }}</p>{% endif %}
+    </div>
+    <div class="form-row{% if form.message.errors %} errors{% endif %}">
+      {{ form.message.errors }}
+      <label for="{{ form.message.id_for_label }}" class="required">{{ form.message.label }}:</label>
+      {{ form.message }}
+      {% if form.message.help_text %}<p class="help">{{ form.message.help_text }}</p>{% endif %}
+    </div>
+  </fieldset>
+
+  <div class="submit-row">
+    <input type="submit" value="{% trans 'Send test SMS' %}" class="default">
+  </div>
+</form>
+
+<p style="margin-top: 2em;">
+  <a href="{{ clinic_settings_change_url }}">&larr; {% trans "Back to clinic settings" %}</a>
+</p>
+{% endblock %}

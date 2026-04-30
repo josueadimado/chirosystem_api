@@ -318,7 +318,7 @@ class PublicBookingSerializer(serializers.Serializer):
     last_name = serializers.CharField(max_length=100)
     phone = serializers.CharField(max_length=20)
     email = serializers.EmailField(required=False, allow_blank=True)
-    # Public booking site sends True when the SMS consent checkbox is checked; voice/other clients may omit (default False).
+    # Web: True when the SMS consent checkbox is checked. Voice booking sends True (phone channel).
     sms_consent = serializers.BooleanField(required=False, default=False)
     provider_id = serializers.IntegerField(required=False, allow_null=True)
     provider_name = serializers.CharField(max_length=200, required=False, allow_blank=True)

@@ -1662,6 +1662,9 @@ async def _book_single(
         "last_name": state.last_name[:100],
         "phone": phone,
         "email": "",
+        # Voice is phone-only; treating completion of a phone booking as SMS opt-in
+        # matches web checkbox behavior for confirmations + day-of / day-before reminders.
+        "sms_consent": True,
         "service_id": svc.service_id,
         "service_duration_minutes": int(svc.service_duration),
         "service_price": Decimal(str(svc.service_price)),

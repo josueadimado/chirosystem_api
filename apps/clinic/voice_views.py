@@ -522,6 +522,7 @@ def _do_book(request, sid, frm, conv):
         "last_name": conv.get("last_name", "")[:100],
         "phone": phone,
         "email": "",
+        "sms_consent": True,
         "service_id": conv.get("service_id"),
         "service_duration_minutes": int(conv.get("service_duration", 15)),
         "service_price": Decimal(str(conv.get("service_price", "0"))),

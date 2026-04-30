@@ -25,15 +25,17 @@ def twilio_configured() -> bool:
     return bool(sid and token and (from_num or msg_svc))
 
 
-def send_sms(*, to_e164: str, body: str) -> str | None:
+def send_sms_detailed(*, to_e164: str, body: str) -> tuple[str | None, str | None]:
     """
-    Send an SMS via Twilio. Uses Messaging Service SID if configured
-    (required for 10DLC compliance), otherwise falls back to raw phone number.
-    Returns Message SID on success, None on skip/failure.
+    Send an SMS via Twilio. Returns (message_sid, error_message).
+    On success, error_message is None. On failure or skip, message_sid is None.
     """
     if not twilio_configured():
         logger.debug("Twilio not configured; skip SMS to %s", to_e164)
-        return None
+        return None, (
+            "Twilio is not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, "
+            "and either TWILIO_PHONE_NUMBER or TWILIO_MESSAGING_SERVICE_SID."
+        )
     sid, token, from_num, msg_svc = _twilio_creds()
     try:
         from twilio.rest import Client
@@ -46,10 +48,20 @@ def send_sms(*, to_e164: str, body: str) -> str | None:
             params["from_"] = from_num
         msg = client.messages.create(**params)
         logger.info("SMS sent: sid=%s to=%s status=%s", msg.sid, to_e164, msg.status)
-        return msg.sid
-    except Exception:
+        return msg.sid, None
+    except Exception as e:
         logger.exception("Twilio SMS failed to=%s", to_e164)
-        return None
+        return None, str(e)
+
+
+def send_sms(*, to_e164: str, body: str) -> str | None:
+    """
+    Send an SMS via Twilio. Uses Messaging Service SID if configured
+    (required for 10DLC compliance), otherwise falls back to raw phone number.
+    Returns Message SID on success, None on skip/failure.
+    """
+    sid, _err = send_sms_detailed(to_e164=to_e164, body=body)
+    return sid
 
 
 def sms_footer() -> str:
