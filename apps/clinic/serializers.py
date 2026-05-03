@@ -579,7 +579,13 @@ def revise_unpaid_visit_billing(visit: Visit, payload: dict) -> Invoice:
     if appt.status != Appointment.Status.AWAITING_PAYMENT:
         raise ValueError("You can only edit billing while the visit is awaiting payment.")
     if visit.status != Visit.Status.COMPLETED:
-        raise ValueError("Visit must be completed before revising billing.")
+        # Rare inconsistent rows: invoice exists but visit never flipped to completed — repair and continue.
+        if visit.status in (Visit.Status.IN_PROGRESS, Visit.Status.OPEN):
+            visit.status = Visit.Status.COMPLETED
+            visit.completed_at = visit.completed_at or timezone.now()
+            visit.save(update_fields=["status", "completed_at", "updated_at"])
+        else:
+            raise ValueError("Visit must be completed before revising billing.")
 
     try:
         invoice = Invoice.objects.get(visit=visit)

@@ -123,7 +123,7 @@ def _clinic_settings_bill_header():
 
 
 def _invoice_bill_dict(inv: Invoice, *, preview: bool) -> dict:
-    """Shared JSON for printable / preview patient bill."""
+    """Shared JSON for printable / preview patient bill — always reads live visit lines and invoice totals from the DB."""
     visit = inv.visit
     header = _clinic_settings_bill_header()
     lines = [
@@ -1525,7 +1525,8 @@ class AdminViewSet(viewsets.ViewSet):
     def billing_invoices(self, request):
         """Invoices for admin billing UI (patient name + totals)."""
         qs = _defer_patient_card_fields(
-            Invoice.objects.select_related("patient").order_by("-issued_at"),
+            Invoice.objects.select_related("patient", "appointment", "appointment__booked_service")
+            .order_by("-issued_at"),
             patient_prefix="patient",
         )[:250]
         return Response(
@@ -1536,6 +1537,13 @@ class AdminViewSet(viewsets.ViewSet):
                     "patient_id": inv.patient_id,
                     "patient_name": f"{inv.patient.first_name} {inv.patient.last_name}",
                     "status": inv.status,
+                    "kind": inv.kind,
+                    "appointment_id": inv.appointment_id,
+                    "appointment_status": inv.appointment.status if inv.appointment_id else None,
+                    "appointment_date": str(inv.appointment.appointment_date)
+                    if inv.appointment_id
+                    else None,
+                    "booked_service_id": inv.appointment.booked_service_id if inv.appointment_id else None,
                     "total_amount": str(inv.total_amount),
                     "subtotal": str(inv.subtotal),
                     "tax": str(inv.tax),
@@ -1545,6 +1553,203 @@ class AdminViewSet(viewsets.ViewSet):
                 for inv in qs
             ]
         )
+
+    def _admin_parse_appointment_id(self, request, *, source="query"):
+        """Read appointment_id from query params (GET) or body (POST)."""
+        raw = request.query_params.get("appointment_id") if source == "query" else request.data.get("appointment_id")
+        if raw is None:
+            return None, Response({"detail": "appointment_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            return int(raw), None
+        except (TypeError, ValueError):
+            return None, Response({"detail": "Invalid appointment_id."}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="visit_snapshot")
+    def visit_snapshot(self, request):
+        """Owner/staff: chart + billing lines summary for schedule detail panel."""
+        denied = self._admin_staff_only(request)
+        if denied:
+            return denied
+        aid, err = self._admin_parse_appointment_id(request, source="query")
+        if err:
+            return err
+        appt = (
+            Appointment.objects.filter(pk=aid)
+            .select_related("patient", "provider", "booked_service")
+            .first()
+        )
+        if not appt:
+            return Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
+        visit = (
+            Visit.objects.filter(appointment=appt)
+            .prefetch_related(
+                Prefetch(
+                    "rendered_services",
+                    queryset=VisitRenderedService.objects.select_related("service").order_by("id"),
+                )
+            )
+            .first()
+        )
+        inv = Invoice.objects.filter(appointment=appt).first()
+        rendered = []
+        if visit:
+            for rs in visit.rendered_services.all():
+                rendered.append({
+                    "service_id": rs.service_id,
+                    "service_name": rs.service.name,
+                    "billing_code": rs.service.billing_code or "",
+                    "quantity": rs.quantity,
+                    "unit_price": str(rs.unit_price),
+                    "line_total": str(rs.total_price),
+                    "charges_patient": rs.charges_patient,
+                })
+        inv_payload = None
+        if inv:
+            inv_payload = {
+                "id": inv.id,
+                "invoice_number": inv.invoice_number,
+                "total_amount": str(inv.total_amount),
+                "status": inv.status,
+            }
+        return Response({
+            "appointment_id": appt.id,
+            "appointment_status": appt.status,
+            "patient_name": f"{appt.patient.first_name} {appt.patient.last_name}",
+            "patient_id": appt.patient_id,
+            "provider_name": str(appt.provider),
+            "provider_id": appt.provider_id,
+            "booked_service_id": appt.booked_service_id,
+            "service_name": appt.booked_service.name if appt.booked_service else "",
+            "appointment_date": str(appt.appointment_date),
+            "clinical_handoff_notes": appt.clinical_handoff_notes or "",
+            "visit_id": visit.id if visit else None,
+            "visit_status": visit.status if visit else None,
+            "reason_for_visit": (visit.reason_for_visit or "") if visit else "",
+            "doctor_notes": (visit.doctor_notes or "") if visit else "",
+            "diagnosis": (visit.diagnosis or "") if visit else "",
+            "rendered_services": rendered,
+            "invoice": inv_payload,
+        })
+
+    @action(detail=False, methods=["get"], url_path="visit_billing_for_edit")
+    def visit_billing_for_edit(self, request):
+        """Owner/staff: same payload as doctor billing_for_edit for awaiting-payment visits."""
+        denied = self._admin_staff_only(request)
+        if denied:
+            return denied
+        aid, err = self._admin_parse_appointment_id(request, source="query")
+        if err:
+            return err
+        appointment = Appointment.objects.filter(pk=aid).first()
+        if not appointment:
+            return Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
+        if appointment.status != Appointment.Status.AWAITING_PAYMENT:
+            return Response(
+                {"detail": "You can only edit billing when the visit is awaiting payment."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        visit = (
+            Visit.objects.filter(appointment=appointment)
+            .prefetch_related(
+                Prefetch(
+                    "rendered_services",
+                    queryset=VisitRenderedService.objects.select_related("service").order_by("id"),
+                )
+            )
+            .first()
+        )
+        if not visit:
+            return Response({"detail": "Visit not found."}, status=status.HTTP_404_NOT_FOUND)
+        invoice = Invoice.objects.filter(appointment=appointment, visit=visit).first()
+        if not invoice:
+            return Response({"detail": "No invoice for this visit."}, status=status.HTTP_404_NOT_FOUND)
+        if invoice.status == Invoice.Status.PAID:
+            return Response({"detail": "This invoice is already paid."}, status=status.HTTP_400_BAD_REQUEST)
+        if invoice.status not in (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT):
+            return Response(
+                {"detail": "Cannot edit billing for this invoice in its current state."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        rendered = [
+            {
+                "service_id": rs.service_id,
+                "quantity": rs.quantity,
+                "unit_price": str(rs.unit_price),
+            }
+            for rs in visit.rendered_services.all()
+        ]
+        return Response({
+            "doctor_notes": visit.doctor_notes or "",
+            "diagnosis": visit.diagnosis or "",
+            "rendered_services": rendered,
+            "invoice_id": invoice.id,
+            "invoice_number": invoice.invoice_number,
+            "total_amount": str(invoice.total_amount),
+        })
+
+    @action(detail=False, methods=["post"], url_path="revise_visit_billing")
+    def admin_revise_visit_billing(self, request):
+        """Owner/staff: update visit lines and unpaid invoice (awaiting payment)."""
+        denied = self._admin_staff_only(request)
+        if denied:
+            return denied
+        body = dict(request.data) if hasattr(request.data, "items") else {}
+        raw_aid = body.pop("appointment_id", None)
+        if raw_aid is None:
+            return Response({"detail": "appointment_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            aid = int(raw_aid)
+        except (TypeError, ValueError):
+            return Response({"detail": "Invalid appointment_id."}, status=status.HTTP_400_BAD_REQUEST)
+        visit = Visit.objects.filter(appointment_id=aid).select_related("appointment", "provider").first()
+        if not visit:
+            return Response({"detail": "Visit not found."}, status=status.HTTP_404_NOT_FOUND)
+        if visit.appointment.status != Appointment.Status.AWAITING_PAYMENT:
+            return Response(
+                {"detail": "You can only revise billing while awaiting payment."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        ser = DoctorCompleteVisitSerializer(data=body)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        provider = visit.provider
+        rendered_payload = []
+        for line in data["rendered_services"]:
+            svc = Service.objects.get(pk=line["service_id"])
+            if not svc.is_active or not svc.visible_for_primary_service_type(provider.primary_service_type):
+                return Response(
+                    {
+                        "detail": (
+                            f'Service "{svc.name}" is not available for this provider type '
+                            "or is inactive. Refresh and pick from the allowed list."
+                        ),
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            unit = line["unit_price"] if line.get("unit_price") is not None else svc.price
+            rendered_payload.append(
+                {
+                    "service_id": svc.id,
+                    "quantity": line.get("quantity", 1),
+                    "unit_price": str(unit),
+                }
+            )
+        payload = {
+            "doctor_notes": data.get("doctor_notes", ""),
+            "diagnosis": data.get("diagnosis", ""),
+            "rendered_services": rendered_payload,
+        }
+        try:
+            invoice = revise_unpaid_visit_billing(visit, payload)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        invoice.refresh_from_db()
+        followup = build_invoice_payment_followup_dict(
+            invoice, try_saved_card=data.get("charge_saved_card_if_present", False)
+        )
+        followup.pop("already_paid", None)
+        return Response(followup)
 
     @action(detail=False, methods=["get"], url_path="invoice_bill")
     def admin_invoice_bill(self, request):
