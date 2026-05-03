@@ -61,6 +61,15 @@ logger = logging.getLogger("voice_relay")
 app = FastAPI(title="ChiroFlow Voice Relay")
 
 MAX_RETRIES = 5
+
+
+def _silence_max_retries() -> int:
+    """How many empty STT results before we say goodbye (ConversationRelay sometimes sends empty prompts)."""
+    try:
+        n = int(getattr(settings, "VOICE_SILENCE_MAX_RETRIES", 8))
+    except (TypeError, ValueError):
+        n = 8
+    return max(3, min(25, n))
 BETWEEN_SERVICE_BUFFER_MINUTES = 15
 
 
@@ -1871,7 +1880,7 @@ async def voice_websocket(ws: WebSocket):
 
                 if not speech:
                     state.retries += 1
-                    if state.retries >= MAX_RETRIES:
+                    if state.retries >= _silence_max_retries():
                         await async_upsert_voice_call_log(
                             call_sid=state.call_sid,
                             from_number=state.from_number,
@@ -1932,15 +1941,31 @@ async def voice_websocket(ws: WebSocket):
                         await _send_text(ws, "I'm here! Go ahead whenever you're ready.")
 
             elif msg_type == "error":
-                logger.error(
-                    "Voice WS ConversationRelay error: %s",
-                    msg.get("description", "unknown"),
+                desc = (
+                    msg.get("description")
+                    or msg.get("message")
+                    or msg.get("code")
+                    or json.dumps(msg, default=str)[:800]
                 )
+                logger.error("Voice WS ConversationRelay error (call=%s): %s", (state.call_sid[:8] if state else "?"), desc)
+                if state:
+                    await async_upsert_voice_call_log(
+                        call_sid=state.call_sid,
+                        from_number=state.from_number,
+                        outcome=VoiceCallLog.Outcome.OPENAI_FAILED,
+                        detail=f"relay:{desc}"[:2000],
+                    )
 
     except WebSocketDisconnect:
         _last_responses.pop(id(ws), None)
         if state:
             logger.info("Voice WS [%s] disconnected", state.call_sid[:8])
+            await async_upsert_voice_call_log(
+                call_sid=state.call_sid,
+                from_number=state.from_number,
+                outcome=VoiceCallLog.Outcome.DISCONNECTED,
+                detail="websocket_closed",
+            )
     except Exception:
         _last_responses.pop(id(ws), None)
         logger.exception("Voice WS unexpected error")

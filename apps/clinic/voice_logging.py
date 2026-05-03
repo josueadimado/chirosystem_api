@@ -30,7 +30,15 @@ def upsert_voice_call_log(
     if transcript is not None:
         obj.transcript = (transcript or "")[:8000]
     if outcome:
-        obj.outcome = outcome
+        # Do not replace a terminal success / intentional hang-up with a generic TCP disconnect.
+        if outcome == VoiceCallLog.Outcome.DISCONNECTED and obj.outcome in (
+            VoiceCallLog.Outcome.BOOKED,
+            VoiceCallLog.Outcome.EMPTY_SPEECH,
+            VoiceCallLog.Outcome.ABANDONED_RETRIES,
+        ):
+            pass
+        else:
+            obj.outcome = outcome
     if detail:
         obj.detail = (detail or "")[:2000]
     if appointment is not None:

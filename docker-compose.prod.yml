@@ -84,7 +84,9 @@ services:
       POSTGRES_PORT: "5432"
       DATABASE_URL: postgresql://${POSTGRES_USER:-chiroflow_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-chiroflow}
       CELERY_BROKER_URL: redis://redis:6379/0
-    command: uvicorn voice_relay:app --host 0.0.0.0 --port 8001 --workers 2
+    # Single worker: ConversationRelay is one long-lived WebSocket per call; multiple workers
+    # can mis-route or confuse load balancers unless sticky sessions are configured.
+    command: uvicorn voice_relay:app --host 0.0.0.0 --port 8001 --workers 1 --timeout-keep-alive 120
     depends_on:
       db:
         condition: service_healthy

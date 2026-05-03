@@ -209,6 +209,14 @@ OPENAI_VOICE_MODEL = os.getenv("OPENAI_VOICE_MODEL", "gpt-5.4-nano").strip() or 
 # Voice relay: stream LLM tokens to Twilio (lower perceived delay). Set VOICE_LLM_STREAM=false to disable.
 VOICE_LLM_STREAM = os.getenv("VOICE_LLM_STREAM", "true").strip().lower() in ("1", "true", "yes")
 # If false, silence nudges use fixed phrases only (skips an OpenAI round trip).
+# Empty transcripts from ConversationRelay (silence / STT hiccup) before we hang up with a goodbye.
+# Increase if calls feel like they “drop” too quickly when the caller is still on the line (default 8).
+try:
+    VOICE_SILENCE_MAX_RETRIES = int(os.getenv("VOICE_SILENCE_MAX_RETRIES", "8"))
+except ValueError:
+    VOICE_SILENCE_MAX_RETRIES = 8
+VOICE_SILENCE_MAX_RETRIES = max(3, min(25, VOICE_SILENCE_MAX_RETRIES))
+
 VOICE_LLM_FOR_SILENCE_NUDGES = os.getenv("VOICE_LLM_FOR_SILENCE_NUDGES", "").strip().lower() in (
     "1",
     "true",

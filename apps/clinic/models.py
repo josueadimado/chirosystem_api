@@ -323,6 +323,7 @@ class VoiceCallLog(TimeStampedModel):
         SLOT_OR_RULE_ERROR = "slot_or_rule_error", "Slot taken or not bookable"
         BOOKED = "booked", "Appointment created"
         ABANDONED_RETRIES = "abandoned_retries", "Hung up after retries"
+        DISCONNECTED = "disconnected", "Disconnected mid-call"
 
     call_sid = models.CharField(max_length=64, unique=True, db_index=True)
     from_number = models.CharField(max_length=32, blank=True)
