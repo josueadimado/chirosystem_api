@@ -434,6 +434,28 @@ def _lookup_patient(from_number: str) -> Patient | None:
         return Patient.objects.filter(phone=normalized).first()
 
 
+def _chiropractic_intake_block_for_caller(from_number: str, service_id: int) -> str | None:
+    """
+    Sync-only: intake policy check for voice (must run in thread via sync_to_async from WebSocket handlers).
+    """
+    if not from_number:
+        return None
+    patient = _lookup_patient(from_number)
+    if not patient:
+        return None
+    try:
+        s_obj = Service.objects.get(pk=service_id)
+    except Service.DoesNotExist:
+        return None
+    return chiropractic_booking_must_use_intake(patient, s_obj)
+
+
+_chiropractic_intake_block_for_caller_async = sync_to_async(
+    _chiropractic_intake_block_for_caller,
+    thread_sensitive=True,
+)
+
+
 def _returning_patient_voice_setup(from_number: str) -> dict | None:
     """Load returning-patient context from DB (sync only). Returns None if unknown caller."""
     patient = _lookup_patient(from_number)
@@ -715,29 +737,26 @@ async def handle_service(ws: WebSocket, state: ConversationState, speech: str):
         if is_yes or any(p in lower for p in _SAME_AGAIN_PHRASES):
             last_svc = next((s for s in all_services if s["id"] == state.last_service_id), None)
             if last_svc:
-                patient = _lookup_patient(state.from_number)
-                if patient and last_svc.get("service_type") == "chiropractic":
-                    try:
-                        s_obj = Service.objects.get(pk=last_svc["id"])
-                        block = chiropractic_booking_must_use_intake(patient, s_obj)
-                        if block:
-                            names_plain = _intake_chiro_names(catalog)
-                            state.retries = 0
-                            await _speak_llm(
-                                ws,
-                                "The caller is returning and asked to book the same visit type as last time, "
-                                f"but clinic rules require a first-time-style chiropractic visit first. "
-                                f"Policy detail: {block} "
-                                f"They should choose one of these intake visit types: {names_plain}. "
-                                "Explain briefly and warmly. Do NOT call them a brand-new patient if they're returning — "
-                                "say they need this type of visit first due to timing or records. "
-                                f"REQUIRED FACTS — allowed intake names: {names_plain}",
-                                f"I can book that for you soon — first we need to schedule {names_plain} "
-                                "per clinic policy when someone's in this situation. Which of those would you like?",
-                            )
-                            return
-                    except Service.DoesNotExist:
-                        pass
+                if last_svc.get("service_type") == "chiropractic":
+                    block = await _chiropractic_intake_block_for_caller_async(
+                        state.from_number, last_svc["id"]
+                    )
+                    if block:
+                        names_plain = _intake_chiro_names(catalog)
+                        state.retries = 0
+                        await _speak_llm(
+                            ws,
+                            "The caller is returning and asked to book the same visit type as last time, "
+                            f"but clinic rules require a first-time-style chiropractic visit first. "
+                            f"Policy detail: {block} "
+                            f"They should choose one of these intake visit types: {names_plain}. "
+                            "Explain briefly and warmly. Do NOT call them a brand-new patient if they're returning — "
+                            "say they need this type of visit first due to timing or records. "
+                            f"REQUIRED FACTS — allowed intake names: {names_plain}",
+                            f"I can book that for you soon — first we need to schedule {names_plain} "
+                            "per clinic policy when someone's in this situation. Which of those would you like?",
+                        )
+                        return
                 matched = [last_svc]
                 # Skip normal matching and go straight to resolved
                 state.retries = 0
@@ -849,16 +868,13 @@ async def _finish_service_selection(ws: WebSocket, state: ConversationState):
         )
     else:
         svc = state.services[0]
-        patient = _lookup_patient(state.from_number) if state.from_number else None
-        if patient and svc.service_type == "chiropractic":
-            try:
-                s_obj = Service.objects.get(pk=svc.service_id)
-                block = chiropractic_booking_must_use_intake(patient, s_obj)
-                if block:
-                    await _handle_chiropractic_intake_block(ws, state, svc, block)
-                    return
-            except Service.DoesNotExist:
-                pass
+        if svc.service_type == "chiropractic" and state.from_number:
+            block = await _chiropractic_intake_block_for_caller_async(
+                state.from_number, svc.service_id
+            )
+            if block:
+                await _handle_chiropractic_intake_block(ws, state, svc, block)
+                return
         state.step = "datetime"
         await _speak_llm(
             ws,
@@ -1974,15 +1990,16 @@ async def voice_websocket(ws: WebSocket):
                 outcome=VoiceCallLog.Outcome.DISCONNECTED,
                 detail="websocket_closed",
             )
-    except Exception:
+    except Exception as exc:
         _last_responses.pop(id(ws), None)
         logger.exception("Voice WS unexpected error")
+        detail = f"{type(exc).__name__}: {exc}"[:2000]
         if state:
             await async_upsert_voice_call_log(
                 call_sid=state.call_sid,
                 from_number=state.from_number,
                 outcome=VoiceCallLog.Outcome.OPENAI_FAILED,
-                detail="WebSocket error",
+                detail=detail,
             )
 
 
