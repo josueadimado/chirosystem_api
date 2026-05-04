@@ -60,7 +60,7 @@ logger = logging.getLogger("voice_relay")
 
 app = FastAPI(title="ChiroFlow Voice Relay")
 
-MAX_RETRIES = 5
+BETWEEN_SERVICE_BUFFER_MINUTES = 15
 
 
 def _silence_max_retries() -> int:
@@ -70,7 +70,15 @@ def _silence_max_retries() -> int:
     except (TypeError, ValueError):
         n = 8
     return max(3, min(25, n))
-BETWEEN_SERVICE_BUFFER_MINUTES = 15
+
+
+def _step_max_retries() -> int:
+    """How many times to re-prompt when we can't match a name, service, date, etc. before ending the call."""
+    try:
+        n = int(getattr(settings, "VOICE_STEP_MAX_RETRIES", 8))
+    except (TypeError, ValueError):
+        n = 8
+    return max(3, min(15, n))
 
 
 def _inter_visit_buffer_minutes(prev: "ServiceEntry", next_svc: "ServiceEntry") -> int:
@@ -650,7 +658,7 @@ async def handle_name(ws: WebSocket, state: ConversationState, speech: str):
 
     if not fn:
         state.retries += 1
-        if state.retries >= MAX_RETRIES:
+        if state.retries >= _step_max_retries():
             await async_upsert_voice_call_log(
                 call_sid=state.call_sid, from_number=state.from_number,
                 outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES, detail="name",
@@ -748,7 +756,7 @@ async def handle_service(ws: WebSocket, state: ConversationState, speech: str):
 
     if not matched:
         state.retries += 1
-        if state.retries >= MAX_RETRIES:
+        if state.retries >= _step_max_retries():
             await async_upsert_voice_call_log(
                 call_sid=state.call_sid, from_number=state.from_number,
                 outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES,
@@ -879,7 +887,7 @@ async def handle_pick_service(ws: WebSocket, state: ConversationState, speech: s
 
     if not picked:
         state.retries += 1
-        if state.retries >= MAX_RETRIES:
+        if state.retries >= _step_max_retries():
             await async_upsert_voice_call_log(
                 call_sid=state.call_sid, from_number=state.from_number,
                 outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES,
@@ -1067,7 +1075,7 @@ async def handle_confirm_services(ws: WebSocket, state: ConversationState, speec
 
     if not is_yes:
         state.retries += 1
-        if state.retries >= MAX_RETRIES:
+        if state.retries >= _step_max_retries():
             await async_upsert_voice_call_log(
                 call_sid=state.call_sid, from_number=state.from_number,
                 outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES, detail="confirm_services",
@@ -1115,7 +1123,7 @@ async def handle_datetime(ws: WebSocket, state: ConversationState, speech: str):
 
     if not appt_date or not start_time:
         state.retries += 1
-        if state.retries >= MAX_RETRIES:
+        if state.retries >= _step_max_retries():
             await async_upsert_voice_call_log(
                 call_sid=state.call_sid, from_number=state.from_number,
                 outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES,
@@ -1235,7 +1243,7 @@ async def handle_confirm(ws: WebSocket, state: ConversationState, speech: str):
 
     if not is_yes:
         state.retries += 1
-        if state.retries >= MAX_RETRIES:
+        if state.retries >= _step_max_retries():
             await async_upsert_voice_call_log(
                 call_sid=state.call_sid, from_number=state.from_number,
                 outcome=VoiceCallLog.Outcome.ABANDONED_RETRIES, detail="confirm",
@@ -1357,7 +1365,7 @@ async def handle_addon_offer(ws: WebSocket, state: ConversationState, speech: st
         return
 
     state.retries += 1
-    if state.retries >= MAX_RETRIES:
+    if state.retries >= _step_max_retries():
         booked_final = pending
         state.pending_final_booked = None
         await _build_final_message(ws, state, booked_final)
@@ -1387,7 +1395,7 @@ async def handle_service_addon(ws: WebSocket, state: ConversationState, speech: 
 
     if not matched:
         state.retries += 1
-        if state.retries >= MAX_RETRIES:
+        if state.retries >= _step_max_retries():
             pending = state.pending_final_booked
             state.pending_final_booked = None
             if pending:
