@@ -48,6 +48,7 @@ from .serializers import (
     SaveSquareCardSerializer,
     TerminalCheckoutSerializer,
     TerminalCheckoutStatusSerializer,
+    TerminalCheckoutTestSerializer,
     PaymentCompleteSerializer,
     PaymentSerializer,
     PublicBookingSerializer,
@@ -83,6 +84,7 @@ from .square_pos import (
 from .square_payment import (
     build_invoice_payment_followup_dict,
     create_terminal_checkout_for_invoice,
+    create_terminal_checkout_test,
     get_terminal_checkout_status,
 )
 from .booking_availability import provider_interval_blocked_online
@@ -1520,6 +1522,41 @@ class AdminViewSet(viewsets.ViewSet):
         from .square_helpers import get_square_payment_status_for_admin
 
         return Response(get_square_payment_status_for_admin())
+
+    @action(detail=False, methods=["post"], url_path="terminal_checkout_test")
+    def terminal_checkout_test(self, request):
+        """Owner/staff: send a dollar amount to the Square Terminal to verify the device receives the prompt."""
+        denied = self._admin_staff_only(request)
+        if denied:
+            return denied
+        if not square_configured():
+            return Response({"detail": "Square is not configured."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        ser = TerminalCheckoutTestSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        amt = ser.validated_data["amount"]
+        cents = int(Decimal(amt) * 100)
+        try:
+            out = create_terminal_checkout_test(cents)
+        except Exception as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response(out)
+
+    @action(detail=False, methods=["get"], url_path="terminal_checkout_status")
+    def terminal_checkout_status(self, request):
+        """Owner/staff: poll a Terminal checkout (same as doctor route; works for admin test checkouts)."""
+        denied = self._admin_staff_only(request)
+        if denied:
+            return denied
+        if not square_configured():
+            return Response({"detail": "Square is not configured."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        ser = TerminalCheckoutStatusSerializer(data=request.query_params)
+        ser.is_valid(raise_exception=True)
+        cid = ser.validated_data["checkout_id"]
+        try:
+            out = get_terminal_checkout_status(cid)
+        except Exception as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response(out)
 
     @action(detail=False, methods=["get"], url_path="billing_invoices")
     def billing_invoices(self, request):

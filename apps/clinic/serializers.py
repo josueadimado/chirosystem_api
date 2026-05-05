@@ -488,6 +488,17 @@ class TerminalCheckoutStatusSerializer(serializers.Serializer):
     checkout_id = serializers.CharField(max_length=255)
 
 
+class TerminalCheckoutTestSerializer(serializers.Serializer):
+    """USD amount for admin Terminal test (no invoice)."""
+
+    amount = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        min_value=Decimal("1.00"),
+        max_value=Decimal("9999.99"),
+    )
+
+
 class PatientIntakeUpdateSerializer(serializers.Serializer):
     address_line1 = serializers.CharField(required=False, allow_blank=True, max_length=200)
     address_line2 = serializers.CharField(required=False, allow_blank=True, max_length=200)

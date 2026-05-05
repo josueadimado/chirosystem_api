@@ -237,6 +237,44 @@ def create_terminal_checkout_for_invoice(invoice: Invoice) -> dict:
     return {"checkout_id": co.id, "status": getattr(co, "status", None) or "PENDING"}
 
 
+def create_terminal_checkout_test(amount_cents: int) -> dict:
+    """
+    Admin-only: charge a test amount on the configured Terminal without an invoice.
+
+    Uses a non-numeric reference_id so polling never attaches this payment to an invoice.
+    """
+    from square.requests.device_checkout_options import DeviceCheckoutOptionsParams
+    from square.requests.money import MoneyParams
+    from square.requests.terminal_checkout import TerminalCheckoutParams
+
+    device_id = get_terminal_device_id()
+    if not device_id:
+        raise ValueError("SQUARE_DEVICE_ID is not set — pair your Terminal in the Square Dashboard and paste the device id.")
+
+    if amount_cents < _MIN_AMOUNT_CENTS:
+        raise ValueError("Amount is below the minimum for card processing.")
+
+    ref = f"admtest_{uuid.uuid4().hex}"[:40]
+
+    client = get_square_client()
+    res = client.terminal.checkouts.create(
+        idempotency_key=str(uuid.uuid4()),
+        checkout=TerminalCheckoutParams(
+            amount_money=MoneyParams(amount=amount_cents, currency="USD"),
+            reference_id=ref,
+            note="Admin Terminal connectivity test",
+            device_options=DeviceCheckoutOptionsParams(device_id=device_id),
+            payment_type="CARD_PRESENT",
+        ),
+    )
+    if res.errors:
+        raise RuntimeError(res.errors[0].detail if res.errors else "Terminal checkout failed")
+    co = res.checkout
+    if not co or not co.id:
+        raise RuntimeError("Square did not return a terminal checkout id.")
+    return {"checkout_id": co.id, "status": getattr(co, "status", None) or "PENDING"}
+
+
 def get_terminal_checkout_status(checkout_id: str) -> dict:
     """Poll Terminal checkout; if completed, mark invoice paid when possible."""
     client = get_square_client()
