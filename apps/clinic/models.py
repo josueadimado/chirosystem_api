@@ -45,6 +45,12 @@ class Patient(TimeStampedModel):
         help_text="If checked, this patient may book regular (non-intake) chiropractic online even without a completed "
         "chiropractic visit on file—use for data imports and established patients from before the system.",
     )
+    credit_balance = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=Decimal("0"),
+        help_text="In-house prepaid credit available to apply to future invoices.",
+    )
 
     def __str__(self) -> str:
         return f"{self.first_name} {self.last_name}"
@@ -53,6 +59,7 @@ class Patient(TimeStampedModel):
 class Provider(TimeStampedModel):
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     title = models.CharField(max_length=100, blank=True)
+    credential = models.CharField(max_length=100, blank=True, help_text="Displayed on printed patient bills, e.g. DC, PT, LMT.")
     specialty = models.CharField(max_length=100, blank=True)
     active = models.BooleanField(default=True)
     primary_service_type = models.CharField(
@@ -271,6 +278,17 @@ class Invoice(TimeStampedModel):
     subtotal = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     tax = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     discount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    credit_applied_total = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=Decimal("0"),
+        help_text="Total in-house patient credit applied to this invoice over time.",
+    )
+    professional_discount_reason = models.TextField(
+        blank=True,
+        default="",
+        help_text="Optional internal note for why a professional discount was applied. Not shown on patient-facing printed bills.",
+    )
     total_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.ISSUED)
     issued_at = models.DateTimeField(auto_now_add=True)
@@ -308,6 +326,33 @@ class StaffNotification(TimeStampedModel):
             models.Index(fields=["recipient", "created_at"]),
             models.Index(fields=["recipient", "read_at"]),
         ]
+
+
+class PatientCreditTransaction(TimeStampedModel):
+    class Kind(models.TextChoices):
+        TOP_UP = "top_up", "Top up"
+        APPLY_TO_INVOICE = "apply_to_invoice", "Applied to invoice"
+        ADJUSTMENT = "adjustment", "Manual adjustment"
+
+    patient = models.ForeignKey(Patient, on_delete=models.CASCADE, related_name="credit_transactions")
+    invoice = models.ForeignKey(
+        Invoice,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="credit_transactions",
+    )
+    kind = models.CharField(max_length=30, choices=Kind.choices)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    balance_after = models.DecimalField(max_digits=10, decimal_places=2)
+    note = models.CharField(max_length=300, blank=True, default="")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="created_credit_transactions",
+    )
 
 
 class VoiceCallLog(TimeStampedModel):

@@ -21,6 +21,7 @@ from .models import (
     ClinicSettings,
     Invoice,
     Patient,
+    PatientCreditTransaction,
     Payment,
     Provider,
     ProviderUnavailability,
@@ -43,7 +44,10 @@ from .serializers import (
     ClinicProfileUpdateSerializer,
     DoctorCompleteVisitSerializer,
     InvoiceSerializer,
+    InvoiceApplyCreditSerializer,
     PatientIntakeUpdateSerializer,
+    PatientCreditTopUpSerializer,
+    PatientCreditTransactionSerializer,
     PatientSerializer,
     SaveSquareCardSerializer,
     TerminalCheckoutSerializer,
@@ -83,8 +87,11 @@ from .square_pos import (
 )
 from .square_payment import (
     build_invoice_payment_followup_dict,
+    create_payment_link_for_credit_topup,
     create_terminal_checkout_for_invoice,
+    create_terminal_checkout_for_credit_topup,
     create_terminal_checkout_test,
+    get_frontend_base_url,
     get_terminal_checkout_status,
 )
 from .booking_availability import provider_interval_blocked_online
@@ -148,15 +155,40 @@ def _invoice_bill_dict(inv: Invoice, *, preview: bool) -> dict:
         "patient_name": f"{pat.first_name} {pat.last_name}",
         "patient_address": addr_display,
         "diagnosis": (visit.diagnosis or "").strip() or "\u2014",
+        "provider_name": str(inv.appointment.provider) if inv.appointment and inv.appointment.provider else "",
+        "provider_credential": (
+            (inv.appointment.provider.credential or inv.appointment.provider.title or "").strip()
+            if inv.appointment and inv.appointment.provider
+            else ""
+        ),
         "lines": lines,
         # Bill "Subtotal" = sum of all documented line amounts (including insurance-only rows).
         "subtotal": str(documented_subtotal),
         # Patient-chargeable portion before tax (matches Invoice.subtotal; used for optional UI).
         "patient_subtotal": str(inv.subtotal),
+        "discount": str(inv.discount),
+        "credit_applied_total": str(inv.credit_applied_total),
         "tax": str(inv.tax),
         "total_amount": str(inv.total_amount),
         "status": inv.status,
     }
+
+
+def _set_appointment_status_after_invoice_paid(inv: Invoice) -> None:
+    appt = inv.appointment
+    if inv.kind == Invoice.Kind.NO_SHOW_FEE:
+        target_status = Appointment.Status.NO_SHOW
+    elif inv.kind == Invoice.Kind.LATE_CANCEL_FEE:
+        target_status = Appointment.Status.CANCELLED
+    else:
+        target_status = Appointment.Status.COMPLETED
+    if appt.status != target_status:
+        appt.status = target_status
+        if target_status == Appointment.Status.CANCELLED:
+            appt.completed_at = None
+        elif not appt.completed_at:
+            appt.completed_at = timezone.now()
+        appt.save(update_fields=["status", "completed_at", "updated_at"])
 
 
 def _invoice_bill_access_ok_for_preview(inv: Invoice) -> bool:
@@ -255,6 +287,10 @@ def _serialize_patient_appointment_history(request, appointments):
         if inv:
             inv_payload = {
                 "invoice_number": inv.invoice_number,
+                "subtotal": str(inv.subtotal),
+                "discount": str(inv.discount),
+                "credit_applied_total": str(inv.credit_applied_total),
+                "professional_discount_reason": inv.professional_discount_reason or "",
                 "total_amount": str(inv.total_amount),
                 "status": inv.status,
             }
@@ -1337,6 +1373,86 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         payment = serializer.save(invoice=invoice)
         return Response(PaymentSerializer(payment).data, status=status.HTTP_201_CREATED)
 
+    @action(detail=True, methods=["post"], url_path="apply_credit")
+    def apply_credit(self, request, pk=None):
+        """Apply available patient credit to this invoice (full or partial)."""
+        invoice = self.get_object()
+        if invoice.status == Invoice.Status.PAID:
+            return Response({"detail": "This invoice is already paid."}, status=status.HTTP_400_BAD_REQUEST)
+        if invoice.status not in (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT):
+            return Response({"detail": "This invoice cannot accept credit right now."}, status=status.HTTP_400_BAD_REQUEST)
+
+        ser = InvoiceApplyCreditSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        req_amount = ser.validated_data.get("amount")
+
+        with transaction.atomic():
+            inv = Invoice.objects.select_for_update().select_related("patient", "appointment").get(pk=invoice.pk)
+            patient = Patient.objects.select_for_update().get(pk=inv.patient_id)
+            due = Decimal(inv.total_amount or "0")
+            available = Decimal(patient.credit_balance or "0")
+            if due <= 0:
+                return Response({"detail": "No remaining amount due on this invoice."}, status=status.HTTP_400_BAD_REQUEST)
+            if available <= 0:
+                return Response(
+                    {"detail": "No patient credit available to apply.", "patient_credit_balance": str(patient.credit_balance)},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            apply_cap = req_amount if req_amount is not None else available
+            if apply_cap <= 0:
+                return Response({"detail": "Amount must be greater than zero."}, status=status.HTTP_400_BAD_REQUEST)
+            applied = min(available, due, apply_cap)
+            if applied <= 0:
+                return Response({"detail": "No credit could be applied."}, status=status.HTTP_400_BAD_REQUEST)
+
+            patient.credit_balance = (available - applied).quantize(Decimal("0.01"))
+            patient.save(update_fields=["credit_balance", "updated_at"])
+
+            PatientCreditTransaction.objects.create(
+                patient=patient,
+                invoice=inv,
+                kind=PatientCreditTransaction.Kind.APPLY_TO_INVOICE,
+                amount=applied,
+                balance_after=patient.credit_balance,
+                note=f"Applied to {inv.invoice_number}",
+                created_by=request.user,
+            )
+
+            Payment.objects.create(
+                invoice=inv,
+                patient=patient,
+                amount=applied,
+                payment_method=Payment.Method.MANUAL,
+                payment_reference=f"patient_credit:{inv.invoice_number}",
+                status=Payment.Status.SUCCESSFUL,
+                paid_at=timezone.now(),
+            )
+
+            inv.credit_applied_total = (Decimal(inv.credit_applied_total or "0") + applied).quantize(Decimal("0.01"))
+            inv.total_amount = (due - applied).quantize(Decimal("0.01"))
+            paid_now = inv.total_amount <= Decimal("0")
+            if paid_now:
+                inv.total_amount = Decimal("0.00")
+                inv.status = Invoice.Status.PAID
+                inv.paid_at = timezone.now()
+                inv.save(update_fields=["credit_applied_total", "total_amount", "status", "paid_at", "updated_at"])
+                _set_appointment_status_after_invoice_paid(inv)
+            else:
+                inv.save(update_fields=["credit_applied_total", "total_amount", "updated_at"])
+
+        return Response(
+            {
+                "invoice_id": inv.id,
+                "invoice_number": inv.invoice_number,
+                "applied_credit": str(applied),
+                "remaining_due": str(inv.total_amount),
+                "patient_credit_balance": str(patient.credit_balance),
+                "invoice_status": inv.status,
+                "already_paid": paid_now,
+            }
+        )
+
 
 class PaymentViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = _defer_patient_card_fields(
@@ -1541,6 +1657,124 @@ class AdminViewSet(viewsets.ViewSet):
             return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
         return Response(out)
 
+    @action(detail=False, methods=["post"], url_path="patient_credit_topup_terminal")
+    def patient_credit_topup_terminal(self, request):
+        """Owner/staff: charge card-present amount on Terminal and add it to patient wallet on completion."""
+        denied = self._admin_staff_only(request)
+        if denied:
+            return denied
+        if not square_configured():
+            return Response({"detail": "Square is not configured."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        raw_pid = request.data.get("patient_id")
+        raw_amount = request.data.get("amount")
+        if raw_pid is None:
+            return Response({"detail": "patient_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            patient_id = int(raw_pid)
+        except (TypeError, ValueError):
+            return Response({"detail": "Invalid patient_id."}, status=status.HTTP_400_BAD_REQUEST)
+        patient = Patient.objects.filter(pk=patient_id).first()
+        if not patient:
+            return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            amount = Decimal(str(raw_amount))
+        except Exception:
+            return Response({"detail": "Invalid amount."}, status=status.HTTP_400_BAD_REQUEST)
+        if amount < Decimal("1.00"):
+            return Response({"detail": "Minimum top-up is $1.00."}, status=status.HTTP_400_BAD_REQUEST)
+        amount = amount.quantize(Decimal("0.01"))
+        try:
+            out = create_terminal_checkout_for_credit_topup(
+                patient_id=patient_id,
+                amount_usd=amount,
+                note=f"Credit top-up for {patient.first_name} {patient.last_name}",
+            )
+        except Exception as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response(
+            {
+                **out,
+                "patient_id": patient.id,
+                "patient_name": f"{patient.first_name} {patient.last_name}",
+                "amount": str(amount),
+            }
+        )
+
+    @action(detail=False, methods=["post"], url_path="credit-topup-link")
+    def credit_topup_link(self, request):
+        """
+        Public self-serve credit top-up:
+        identify patient by phone (+ optional first/last for shared phones), then create Square payment link.
+        """
+        from .patient_phone import names_equal_casefold, patients_matching_phone
+
+        if not square_configured():
+            return Response({"detail": "Online credit top-up is not enabled yet."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        phone_raw = request.data.get("phone")
+        amount_raw = request.data.get("amount")
+        fn = (request.data.get("first_name") or "").strip()
+        ln = (request.data.get("last_name") or "").strip()
+        if not phone_raw:
+            return Response({"detail": "phone is required."}, status=status.HTTP_400_BAD_REQUEST)
+        valid, msg = validate_phone(phone_raw)
+        if not valid:
+            return Response({"detail": msg}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            amount = Decimal(str(amount_raw))
+        except Exception:
+            return Response({"detail": "Invalid amount."}, status=status.HTTP_400_BAD_REQUEST)
+        if amount < Decimal("1.00"):
+            return Response({"detail": "Minimum top-up is $1.00."}, status=status.HTTP_400_BAD_REQUEST)
+        amount = amount.quantize(Decimal("0.01"))
+
+        matches = patients_matching_phone(normalize_phone(phone_raw))
+        if not matches:
+            return Response(
+                {"detail": "No patient profile found for that phone. Ask front desk to create your profile first."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        narrowed = [p for p in matches if names_equal_casefold(p, fn, ln)] if (fn and ln) else []
+        if narrowed:
+            patient = narrowed[0]
+        elif len(matches) == 1:
+            patient = matches[0]
+        else:
+            household = [{"first_name": p.first_name, "last_name": p.last_name} for p in matches]
+            return Response(
+                {
+                    "detail": "More than one person uses this phone. Enter first and last name to continue.",
+                    "ambiguous_phone": True,
+                    "household_members": household,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        base = get_frontend_base_url()
+        success_url = f"{base}/payment/success?square=1&credit_topup=1&patient={patient.id}"
+        cancel_url = f"{base}/payment/cancel?square=1&credit_topup=1&patient={patient.id}"
+        checkout_url, _ref = create_payment_link_for_credit_topup(
+            patient_id=patient.id,
+            amount_usd=amount,
+            patient_label=f"{patient.first_name} {patient.last_name}",
+            success_url=success_url,
+            cancel_url=cancel_url,
+        )
+        if not checkout_url:
+            return Response(
+                {"detail": "Could not start online payment right now. Please try again or ask front desk."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(
+            {
+                "checkout_url": checkout_url,
+                "patient_name": f"{patient.first_name} {patient.last_name}",
+                "amount": str(amount),
+                "credit_balance": str(patient.credit_balance),
+            }
+        )
+
     @action(detail=False, methods=["get"], url_path="terminal_checkout_status")
     def terminal_checkout_status(self, request):
         """Owner/staff: poll a Terminal checkout (same as doctor route; works for admin test checkouts)."""
@@ -1573,6 +1807,7 @@ class AdminViewSet(viewsets.ViewSet):
                     "invoice_number": inv.invoice_number,
                     "patient_id": inv.patient_id,
                     "patient_name": f"{inv.patient.first_name} {inv.patient.last_name}",
+                    "patient_credit_balance": str(inv.patient.credit_balance),
                     "status": inv.status,
                     "kind": inv.kind,
                     "appointment_id": inv.appointment_id,
@@ -1583,12 +1818,82 @@ class AdminViewSet(viewsets.ViewSet):
                     "booked_service_id": inv.appointment.booked_service_id if inv.appointment_id else None,
                     "total_amount": str(inv.total_amount),
                     "subtotal": str(inv.subtotal),
+                    "discount": str(inv.discount),
+                    "credit_applied_total": str(inv.credit_applied_total),
+                    "professional_discount_reason": inv.professional_discount_reason or "",
                     "tax": str(inv.tax),
                     "issued_at": inv.issued_at.isoformat() if inv.issued_at else None,
                     "paid_at": inv.paid_at.isoformat() if inv.paid_at else None,
                 }
                 for inv in qs
             ]
+        )
+
+    @action(detail=False, methods=["post"], url_path="patient_credit_topup")
+    def patient_credit_topup(self, request):
+        """Owner/staff: add prepaid credit to a patient's internal wallet."""
+        denied = self._admin_staff_only(request)
+        if denied:
+            return denied
+        ser = PatientCreditTopUpSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        pid = ser.validated_data["patient_id"]
+        amount = Decimal(ser.validated_data["amount"])
+        note = (ser.validated_data.get("note") or "").strip()
+
+        with transaction.atomic():
+            patient = Patient.objects.select_for_update().filter(pk=pid).first()
+            if not patient:
+                return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
+            patient.credit_balance = (Decimal(patient.credit_balance or "0") + amount).quantize(Decimal("0.01"))
+            patient.save(update_fields=["credit_balance", "updated_at"])
+            tx = PatientCreditTransaction.objects.create(
+                patient=patient,
+                kind=PatientCreditTransaction.Kind.TOP_UP,
+                amount=amount,
+                balance_after=patient.credit_balance,
+                note=note,
+                created_by=request.user,
+            )
+        return Response(
+            {
+                "detail": "Credit added.",
+                "patient_id": patient.id,
+                "patient_name": f"{patient.first_name} {patient.last_name}",
+                "credited_amount": str(amount),
+                "credit_balance": str(patient.credit_balance),
+                "transaction_id": tx.id,
+            }
+        )
+
+    @action(detail=False, methods=["get"], url_path="patient_credit_ledger")
+    def patient_credit_ledger(self, request):
+        denied = self._admin_staff_only(request)
+        if denied:
+            return denied
+        raw = request.query_params.get("patient_id")
+        if not raw:
+            return Response({"detail": "patient_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            pid = int(raw)
+        except (TypeError, ValueError):
+            return Response({"detail": "Invalid patient_id."}, status=status.HTTP_400_BAD_REQUEST)
+        patient = Patient.objects.filter(pk=pid).first()
+        if not patient:
+            return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
+        rows = (
+            PatientCreditTransaction.objects.filter(patient_id=pid)
+            .select_related("invoice", "created_by")
+            .order_by("-created_at")[:100]
+        )
+        data = PatientCreditTransactionSerializer(rows, many=True).data
+        return Response(
+            {
+                "patient_id": patient.id,
+                "patient_name": f"{patient.first_name} {patient.last_name}",
+                "credit_balance": str(patient.credit_balance),
+                "transactions": data,
+            }
         )
 
     def _admin_parse_appointment_id(self, request, *, source="query"):
@@ -1645,6 +1950,10 @@ class AdminViewSet(viewsets.ViewSet):
             inv_payload = {
                 "id": inv.id,
                 "invoice_number": inv.invoice_number,
+                "subtotal": str(inv.subtotal),
+                "discount": str(inv.discount),
+                "credit_applied_total": str(inv.credit_applied_total),
+                "professional_discount_reason": inv.professional_discount_reason or "",
                 "total_amount": str(inv.total_amount),
                 "status": inv.status,
             }
@@ -1721,6 +2030,8 @@ class AdminViewSet(viewsets.ViewSet):
             "rendered_services": rendered,
             "invoice_id": invoice.id,
             "invoice_number": invoice.invoice_number,
+            "discount": str(invoice.discount),
+            "professional_discount_reason": invoice.professional_discount_reason or "",
             "total_amount": str(invoice.total_amount),
         })
 
@@ -1775,6 +2086,8 @@ class AdminViewSet(viewsets.ViewSet):
             "doctor_notes": data.get("doctor_notes", ""),
             "diagnosis": data.get("diagnosis", ""),
             "rendered_services": rendered_payload,
+            "professional_discount": str(data.get("professional_discount", Decimal("0"))),
+            "professional_discount_reason": data.get("professional_discount_reason", ""),
         }
         try:
             invoice = revise_unpaid_visit_billing(visit, payload)
@@ -2386,6 +2699,8 @@ class DoctorViewSet(viewsets.ViewSet):
             "doctor_notes": data.get("doctor_notes", ""),
             "diagnosis": data.get("diagnosis", ""),
             "rendered_services": rendered_payload,
+            "professional_discount": str(data.get("professional_discount", Decimal("0"))),
+            "professional_discount_reason": data.get("professional_discount_reason", ""),
         }
         invoice = complete_visit_with_services(visit, payload)
         visit.appointment.status = Appointment.Status.AWAITING_PAYMENT
@@ -2450,6 +2765,8 @@ class DoctorViewSet(viewsets.ViewSet):
                 "rendered_services": rendered,
                 "invoice_id": invoice.id,
                 "invoice_number": invoice.invoice_number,
+                "discount": str(invoice.discount),
+                "professional_discount_reason": invoice.professional_discount_reason or "",
                 "total_amount": str(invoice.total_amount),
             }
         )
@@ -2496,6 +2813,8 @@ class DoctorViewSet(viewsets.ViewSet):
             "doctor_notes": data.get("doctor_notes", ""),
             "diagnosis": data.get("diagnosis", ""),
             "rendered_services": rendered_payload,
+            "professional_discount": str(data.get("professional_discount", Decimal("0"))),
+            "professional_discount_reason": data.get("professional_discount_reason", ""),
         }
         try:
             invoice = revise_unpaid_visit_billing(visit, payload)

@@ -10,13 +10,14 @@ from decimal import Decimal
 from django.db import transaction
 from django.utils import timezone
 
-from .models import Appointment, Invoice, Payment
+from .models import Appointment, Invoice, Patient, PatientCreditTransaction, Payment
 from .square_helpers import ensure_square_customer, get_location_id, get_square_client, get_terminal_device_id
 
 logger = logging.getLogger(__name__)
 
 # Square card payments are typically >= 100 cents in production; keep a small floor for dev.
 _MIN_AMOUNT_CENTS = 100
+_CREDIT_TOPUP_REF_PREFIX = "ct_"
 
 
 def mark_invoice_paid_from_square(invoice: Invoice, square_payment_id: str) -> bool:
@@ -87,6 +88,64 @@ def mark_invoice_paid_from_square(invoice: Invoice, square_payment_id: str) -> b
 
 def _money_cents(invoice: Invoice) -> int:
     return int(Decimal(invoice.total_amount) * 100)
+
+
+def build_credit_topup_reference(*, patient_id: int, amount_cents: int) -> str:
+    nonce = uuid.uuid4().hex[:8]
+    return f"{_CREDIT_TOPUP_REF_PREFIX}{int(patient_id)}_{int(amount_cents)}_{nonce}"[:40]
+
+
+def parse_credit_topup_reference(ref: str | None) -> tuple[int, int] | None:
+    if not ref:
+        return None
+    text = ref.strip()
+    if not text.startswith(_CREDIT_TOPUP_REF_PREFIX):
+        return None
+    parts = text.split("_")
+    if len(parts) != 4:
+        return None
+    try:
+        patient_id = int(parts[1])
+        amount_cents = int(parts[2])
+        return patient_id, amount_cents
+    except ValueError:
+        return None
+
+
+def apply_credit_topup_from_square_payment(
+    *,
+    square_payment_id: str,
+    reference_id: str,
+    amount_cents: int,
+) -> bool:
+    """
+    Idempotently apply a completed Square payment as patient wallet credit.
+    """
+    parsed = parse_credit_topup_reference(reference_id)
+    if not parsed:
+        return False
+    patient_id, expected_cents = parsed
+    if amount_cents <= 0 or amount_cents != expected_cents:
+        return False
+    if PatientCreditTransaction.objects.filter(note=f"square_payment:{square_payment_id}").exists():
+        return True
+
+    with transaction.atomic():
+        patient = Patient.objects.select_for_update().filter(pk=patient_id).first()
+        if not patient:
+            return False
+        amount = (Decimal(amount_cents) / Decimal("100")).quantize(Decimal("0.01"))
+        patient.credit_balance = (Decimal(patient.credit_balance or "0") + amount).quantize(Decimal("0.01"))
+        patient.save(update_fields=["credit_balance", "updated_at"])
+        PatientCreditTransaction.objects.create(
+            patient=patient,
+            kind=PatientCreditTransaction.Kind.TOP_UP,
+            amount=amount,
+            balance_after=patient.credit_balance,
+            note=f"square_payment:{square_payment_id}",
+            created_by=None,
+        )
+    return True
 
 
 def try_charge_saved_card(invoice: Invoice) -> dict:
@@ -201,6 +260,69 @@ def create_payment_link_for_invoice(
     return None
 
 
+def create_payment_link_for_credit_topup(
+    *,
+    patient_id: int,
+    amount_usd: Decimal,
+    patient_label: str = "",
+    success_url: str,
+    cancel_url: str | None = None,
+) -> tuple[str | None, str]:
+    """
+    Hosted Square checkout for wallet credit top-up.
+    Returns (url, reference_id). reference_id encodes patient + cents for webhook verification.
+    """
+    from square.requests.money import MoneyParams
+    from square.requests.order import OrderParams
+    from square.requests.order_line_item import OrderLineItemParams
+
+    loc = get_location_id()
+    if not loc:
+        return None, ""
+
+    cents = int(Decimal(amount_usd) * 100)
+    if cents < _MIN_AMOUNT_CENTS:
+        return None, ""
+
+    nonce = uuid.uuid4().hex[:8]
+    reference_id = f"ct_{int(patient_id)}_{cents}_{nonce}"[:40]
+    line_name = "Patient credit top-up"
+    if patient_label.strip():
+        line_name = f"Credit top-up — {patient_label.strip()}"[:120]
+
+    client = get_square_client()
+    order = OrderParams(
+        location_id=loc,
+        reference_id=reference_id,
+        line_items=[
+            OrderLineItemParams(
+                quantity="1",
+                name=line_name,
+                item_type="ITEM",
+                base_price_money=MoneyParams(amount=cents, currency="USD"),
+            )
+        ],
+    )
+    from django.conf import settings as dj_settings
+
+    send_cancel = bool(cancel_url and getattr(dj_settings, "SQUARE_CHECKOUT_SEND_CANCEL_URL", False))
+    checkout_options: dict = {"redirect_url": success_url}
+    if send_cancel and cancel_url:
+        checkout_options["cancel_url"] = cancel_url
+
+    res = client.checkout.payment_links.create(
+        idempotency_key=str(uuid.uuid4()),
+        description=f"Patient credit top-up {patient_label}".strip()[:200],
+        order=order,
+        checkout_options=checkout_options,
+    )
+    if res.errors:
+        logger.warning("Square credit top-up link error: %s", res.errors)
+        return None, reference_id
+    pl = res.payment_link
+    return (pl.url if pl and pl.url else None), reference_id
+
+
 def create_terminal_checkout_for_invoice(invoice: Invoice) -> dict:
     """
     Send a card-present payment to the configured Square Terminal device.
@@ -235,6 +357,43 @@ def create_terminal_checkout_for_invoice(invoice: Invoice) -> dict:
     if not co or not co.id:
         raise RuntimeError("Square did not return a terminal checkout id.")
     return {"checkout_id": co.id, "status": getattr(co, "status", None) or "PENDING"}
+
+
+def create_terminal_checkout_for_credit_topup(*, patient_id: int, amount_usd: Decimal, note: str = "") -> dict:
+    """
+    Send a card-present top-up charge to the configured Square Terminal.
+    The webhook / poller applies credit by encoded reference_id.
+    """
+    from square.requests.device_checkout_options import DeviceCheckoutOptionsParams
+    from square.requests.money import MoneyParams
+    from square.requests.terminal_checkout import TerminalCheckoutParams
+
+    device_id = get_terminal_device_id()
+    if not device_id:
+        raise ValueError("SQUARE_DEVICE_ID is not set — pair your Terminal in the Square Dashboard and paste the device id.")
+
+    amount_cents = int(Decimal(amount_usd) * 100)
+    if amount_cents < _MIN_AMOUNT_CENTS:
+        raise ValueError("Amount is below the minimum for card processing.")
+
+    reference_id = build_credit_topup_reference(patient_id=patient_id, amount_cents=amount_cents)
+    client = get_square_client()
+    res = client.terminal.checkouts.create(
+        idempotency_key=str(uuid.uuid4()),
+        checkout=TerminalCheckoutParams(
+            amount_money=MoneyParams(amount=amount_cents, currency="USD"),
+            reference_id=reference_id,
+            note=(note or f"Patient credit top-up ({patient_id})")[:500],
+            device_options=DeviceCheckoutOptionsParams(device_id=device_id),
+            payment_type="CARD_PRESENT",
+        ),
+    )
+    if res.errors:
+        raise RuntimeError(res.errors[0].detail if res.errors else "Terminal checkout failed")
+    co = res.checkout
+    if not co or not co.id:
+        raise RuntimeError("Square did not return a terminal checkout id.")
+    return {"checkout_id": co.id, "status": getattr(co, "status", None) or "PENDING", "reference_id": reference_id}
 
 
 def create_terminal_checkout_test(amount_cents: int) -> dict:
@@ -294,6 +453,16 @@ def get_terminal_checkout_status(checkout_id: str) -> dict:
             inv = Invoice.objects.filter(pk=int(ref), status=Invoice.Status.ISSUED).first()
             if inv:
                 mark_invoice_paid_from_square(inv, pid)
+        else:
+            parsed = parse_credit_topup_reference(ref)
+            if parsed:
+                _, expected_cents = parsed
+                applied = apply_credit_topup_from_square_payment(
+                    square_payment_id=pid,
+                    reference_id=ref,
+                    amount_cents=expected_cents,
+                )
+                out["credit_applied"] = bool(applied)
     return out
 
 
@@ -318,6 +487,7 @@ def build_invoice_payment_followup_dict(invoice: Invoice, *, try_saved_card: boo
             "invoice_id": invoice.id,
             "invoice_number": invoice.invoice_number,
             "total_amount": str(invoice.total_amount),
+            "patient_credit_balance": str(invoice.patient.credit_balance),
             "already_paid": True,
             "payment": {
                 "status": "charged_saved_card",
@@ -342,6 +512,7 @@ def build_invoice_payment_followup_dict(invoice: Invoice, *, try_saved_card: boo
             "invoice_id": invoice.id,
             "invoice_number": invoice.invoice_number,
             "total_amount": str(invoice.total_amount),
+            "patient_credit_balance": str(invoice.patient.credit_balance),
             "already_paid": False,
             "payment": payment,
         }
@@ -358,6 +529,7 @@ def build_invoice_payment_followup_dict(invoice: Invoice, *, try_saved_card: boo
                 "invoice_id": invoice.id,
                 "invoice_number": invoice.invoice_number,
                 "total_amount": str(invoice.total_amount),
+                "patient_credit_balance": str(invoice.patient.credit_balance),
                 "already_paid": True,
                 "payment": {
                     "status": "charged_saved_card",
@@ -380,6 +552,7 @@ def build_invoice_payment_followup_dict(invoice: Invoice, *, try_saved_card: boo
         "invoice_id": invoice.id,
         "invoice_number": invoice.invoice_number,
         "total_amount": str(invoice.total_amount),
+        "patient_credit_balance": str(invoice.patient.credit_balance),
         "already_paid": False,
         "payment": payment,
     }

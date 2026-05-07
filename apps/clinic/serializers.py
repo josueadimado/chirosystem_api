@@ -10,6 +10,7 @@ from .models import (
     Appointment,
     Invoice,
     Patient,
+    PatientCreditTransaction,
     Payment,
     Provider,
     ProviderUnavailability,
@@ -55,6 +56,7 @@ class ProviderSerializer(serializers.ModelSerializer):
             "username",
             "provider_name",
             "title",
+            "credential",
             "specialty",
             "primary_service_type",
             "active",
@@ -449,6 +451,19 @@ class DoctorCompleteVisitSerializer(serializers.Serializer):
     doctor_notes = serializers.CharField(required=False, allow_blank=True, default="")
     diagnosis = serializers.CharField(required=False, allow_blank=True, default="")
     rendered_services = serializers.ListField(child=serializers.DictField(), allow_empty=False)
+    professional_discount = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        required=False,
+        min_value=Decimal("0"),
+        default=Decimal("0"),
+    )
+    professional_discount_reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=1000,
+        default="",
+    )
     charge_saved_card_if_present = serializers.BooleanField(default=True)
 
     def validate_rendered_services(self, value):
@@ -537,6 +552,22 @@ class ClinicProfileUpdateSerializer(serializers.Serializer):
         return value
 
 
+class PatientCreditTopUpSerializer(serializers.Serializer):
+    patient_id = serializers.IntegerField(min_value=1)
+    amount = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0.01"))
+    note = serializers.CharField(required=False, allow_blank=True, max_length=300, default="")
+
+
+class InvoiceApplyCreditSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0.01"), required=False)
+
+
+class PatientCreditTransactionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PatientCreditTransaction
+        fields = "__all__"
+
+
 def complete_visit_with_services(visit: Visit, payload: dict) -> Invoice:
     visit.doctor_notes = payload.get("doctor_notes", "")
     update_fields = ["doctor_notes", "status", "completed_at", "updated_at"]
@@ -566,6 +597,16 @@ def complete_visit_with_services(visit: Visit, payload: dict) -> Invoice:
             charges_patient=charges_patient,
         )
 
+    discount = Decimal(str(payload.get("professional_discount", "0") or "0"))
+    discount_reason = (payload.get("professional_discount_reason", "") or "").strip()
+    if discount < 0:
+        discount = Decimal("0")
+    if discount > subtotal:
+        discount = subtotal
+    if discount == Decimal("0"):
+        discount_reason = ""
+    total_amount = subtotal - discount
+
     invoice = Invoice.objects.create(
         patient=visit.patient,
         appointment=visit.appointment,
@@ -573,8 +614,9 @@ def complete_visit_with_services(visit: Visit, payload: dict) -> Invoice:
         invoice_number=f"INV-{visit.id}-{int(timezone.now().timestamp())}",
         subtotal=subtotal,
         tax=Decimal("0"),
-        discount=Decimal("0"),
-        total_amount=subtotal,
+        discount=discount,
+        professional_discount_reason=discount_reason,
+        total_amount=total_amount,
         status=Invoice.Status.ISSUED,
     )
 
@@ -635,9 +677,30 @@ def revise_unpaid_visit_billing(visit: Visit, payload: dict) -> Invoice:
                 charges_patient=charges_patient,
             )
 
+        discount = Decimal(str(payload.get("professional_discount", "0") or "0"))
+        discount_reason = (payload.get("professional_discount_reason", "") or "").strip()
+        if discount < 0:
+            discount = Decimal("0")
+        if discount > subtotal:
+            discount = subtotal
+        if discount == Decimal("0"):
+            discount_reason = ""
+        total_amount = subtotal - discount
+
         invoice.subtotal = subtotal
         invoice.tax = Decimal("0")
-        invoice.total_amount = subtotal
-        invoice.save(update_fields=["subtotal", "tax", "total_amount", "updated_at"])
+        invoice.discount = discount
+        invoice.professional_discount_reason = discount_reason
+        invoice.total_amount = total_amount
+        invoice.save(
+            update_fields=[
+                "subtotal",
+                "tax",
+                "discount",
+                "professional_discount_reason",
+                "total_amount",
+                "updated_at",
+            ]
+        )
 
     return invoice

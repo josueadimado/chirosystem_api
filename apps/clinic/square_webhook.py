@@ -15,7 +15,11 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
 from .models import Invoice
-from .square_payment import mark_invoice_paid_from_square
+from .square_payment import (
+    apply_credit_topup_from_square_payment,
+    mark_invoice_paid_from_square,
+    parse_credit_topup_reference,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +56,36 @@ def _invoice_id_from_reference(ref: str | None) -> int | None:
     return None
 
 
+def _handle_credit_topup_payment(payment: dict) -> bool:
+    """
+    Credit wallet top-up from completed Square payment link.
+    Idempotent by Square payment id stored in credit transaction note.
+    """
+    if (payment.get("status") or "").upper() != "COMPLETED":
+        return False
+    pid = (payment.get("id") or "").strip()
+    ref = (payment.get("reference_id") or "").strip()
+    if not pid or not ref:
+        return False
+    info = parse_credit_topup_reference(ref)
+    if not info:
+        return False
+    _, expected_cents = info
+    amt_obj = payment.get("amount_money") or {}
+    paid_cents = amt_obj.get("amount")
+    if not isinstance(paid_cents, int) or paid_cents <= 0:
+        return False
+    if paid_cents != expected_cents:
+        logger.warning("Credit top-up mismatch for ref=%s expected=%s actual=%s", ref, expected_cents, paid_cents)
+        return False
+
+    return apply_credit_topup_from_square_payment(
+        square_payment_id=pid,
+        reference_id=ref,
+        amount_cents=paid_cents,
+    )
+
+
 def _handle_payment_object(payment: dict) -> None:
     if not payment:
         return
@@ -59,6 +93,8 @@ def _handle_payment_object(payment: dict) -> None:
         return
     pid = payment.get("id")
     if not pid:
+        return
+    if _handle_credit_topup_payment(payment):
         return
     inv_id = _invoice_id_from_reference(payment.get("reference_id"))
     if not inv_id:
