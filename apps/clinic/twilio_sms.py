@@ -77,11 +77,11 @@ def booking_confirmation_body(
     provider_display: str,
     estimated_payment: str = "",
 ) -> str:
-    pay = f" Est. {estimated_payment} due at visit." if estimated_payment else ""
+    pay = f" {estimated_payment} due at visit." if estimated_payment else ""
     return (
         f"Relief Chiropractic: Hi {first_name}, your {service_name} is confirmed for "
         f"{appt_date_display} at {appt_time_display}.{pay} "
-        f"We'll text and email reminders the day before and shortly before your visit.{sms_footer()}"
+        f"We'll text reminders the day before and shortly before your visit.{sms_footer()}"
     )
 
 

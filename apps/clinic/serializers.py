@@ -331,6 +331,7 @@ class PublicBookingSerializer(serializers.Serializer):
     service_price = serializers.DecimalField(max_digits=10, decimal_places=2)
     appointment_date = serializers.DateField()
     start_time = serializers.TimeField(input_formats=["%I:%M %p", "%H:%M"])
+    reason_for_visit = serializers.CharField(required=False, allow_blank=True, max_length=2000, default="")
 
     def validate(self, attrs):
         valid, msg = validate_phone(attrs.get("phone", ""))

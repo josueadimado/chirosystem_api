@@ -19,7 +19,7 @@ from .booking_availability import provider_interval_blocked_online
 from .booking_provider_eligibility import provider_can_offer_service_online
 from .chiropractic_booking_policy import chiropractic_booking_must_use_intake
 from .online_booking_hours import PUBLIC_BOOKING_HOURS_BLURB, interval_outside_effective_public_window
-from .models import Appointment, Patient, Provider, Service
+from .models import Appointment, Patient, Provider, Service, Visit
 from .patient_phone import get_or_create_patient_for_public_booking
 from .utils import format_time_12h, normalize_phone
 
@@ -131,6 +131,18 @@ def create_appointment_from_public_booking(validated: dict) -> tuple[Appointment
         end_time=end_time,
         status=Appointment.Status.BOOKED,
     )
+
+    reason_for_visit = (validated.get("reason_for_visit") or "").strip()
+    if reason_for_visit:
+        Visit.objects.get_or_create(
+            appointment=appointment,
+            defaults={
+                "patient": patient,
+                "provider": provider,
+                "status": Visit.Status.OPEN,
+                "reason_for_visit": reason_for_visit,
+            },
+        )
 
     def queue_after_book():
         import logging as _log
@@ -364,14 +376,8 @@ def cancel_appointment_public(*, phone_normalized: str, appointment_id: int) -> 
         return None, "This visit can no longer be cancelled online. Please call the clinic."
 
     svc = appt.booked_service
-    if not svc or not svc.is_active or not svc.show_in_public_booking:
-        return None, "This visit cannot be cancelled online. Please call the clinic."
-
-    if svc.service_type not in (
-        Service.ServiceType.CHIROPRACTIC,
-        Service.ServiceType.MASSAGE,
-    ):
-        return None, "This visit type cannot be cancelled online. Please call the clinic."
+    # Allow cancellation for already-booked visits even if the service was later hidden/inactivated.
+    # Restricting by current service visibility blocks legitimate patient self-service cancels.
 
     now = timezone.now()
     start_dt = timezone.make_aware(datetime.combine(appt.appointment_date, appt.start_time))
@@ -379,8 +385,8 @@ def cancel_appointment_public(*, phone_normalized: str, appointment_id: int) -> 
         return None, "You can only cancel online before your appointment start time. Please call the clinic."
 
     notice = start_dt - now
-    apply_late_massage_fee = (
-        svc.service_type == Service.ServiceType.MASSAGE and notice < timedelta(hours=24)
+    apply_late_massage_fee = bool(
+        svc and svc.service_type == Service.ServiceType.MASSAGE and notice < timedelta(hours=24)
     )
 
     try:
