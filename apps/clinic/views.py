@@ -1706,6 +1706,11 @@ class AdminViewSet(viewsets.ViewSet):
         Public self-serve credit top-up:
         identify patient by phone (+ optional first/last for shared phones), then create Square payment link.
         """
+        return Response(
+            {"detail": "Self-service credit top-up is disabled. Please contact the clinic front desk."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
         from .patient_phone import names_equal_casefold, patients_matching_phone
 
         if not square_configured():
