@@ -34,6 +34,7 @@ from .models import (
 from .public_booking_service import (
     cancel_appointment_public,
     create_appointment_from_public_booking,
+    public_online_booking_calendar_span_minutes,
     reschedule_appointment_public,
 )
 from .utils import format_time_12h, normalize_phone, validate_phone
@@ -374,18 +375,14 @@ class BookingOptionsViewSet(viewsets.ViewSet):
     def availability(self, request):
         """Return available time slots for a date/provider/service. Public.
 
-        Optional ``block_minutes``: when booking multiple services back-to-back with the *same*
-        provider, pass the total minutes from the start of the first visit through the end of the
-        last (including each service duration and any breaks between them). Only slots where the
-        entire block fits in working hours and is free on the calendar are returned. If omitted,
-        only ``service.duration_minutes`` is used (single-visit behavior).
+        Uses a 15-minute start grid for all service types. Chiropractic blocks ``duration_minutes``;
+        massage blocks ``duration_minutes`` plus a fixed post-visit buffer on the provider calendar.
         """
         from datetime import datetime
 
         date_str = request.query_params.get("date")
         provider_id = request.query_params.get("provider_id")
         service_id = request.query_params.get("service_id")
-        block_minutes_raw = (request.query_params.get("block_minutes") or "").strip()
         if not all([date_str, provider_id, service_id]):
             return Response(
                 {"detail": "date, provider_id, and service_id are required."},
@@ -405,39 +402,15 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         from datetime import time as time_cls
 
         from .online_booking_hours import CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES, effective_public_booking_window_minutes
+        from .patient_phone import patient_matches_phone_normalized
 
         win = effective_public_booking_window_minutes(appt_date, service)
         if win is None:
             return Response({"available_slots": []})
         day_start, day_end = win
 
-        duration = service.duration_minutes
-        if block_minutes_raw:
-            try:
-                block_val = int(block_minutes_raw)
-            except ValueError:
-                return Response({"detail": "block_minutes must be a positive integer."}, status=status.HTTP_400_BAD_REQUEST)
-            if block_val < duration:
-                return Response(
-                    {
-                        "detail": "block_minutes cannot be less than the first service duration "
-                        f"({duration} minutes)."
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            if block_val > 24 * 60:
-                return Response({"detail": "block_minutes is too large."}, status=status.HTTP_400_BAD_REQUEST)
-            required_span = block_val
-        else:
-            required_span = duration
-
-        # Chiropractic: unified 15-minute start grid for all chiro visit lengths; required_span still uses duration (or block).
-        # Massage: step at least by duration (often 60+).
-        SLOT_INTERVAL = (
-            CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES
-            if service.service_type == Service.ServiceType.CHIROPRACTIC
-            else max(duration, 15)
-        )
+        required_span = public_online_booking_calendar_span_minutes(service)
+        SLOT_INTERVAL = CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES
 
         busy_qs = Appointment.objects.filter(
             provider=provider,
@@ -475,13 +448,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             patient_ex = ex_appt.patient
-            phone_ok = normalize_phone(patient_ex.phone) == norm_ex
-            if not phone_ok:
-                for p in Patient.objects.all():
-                    if p.pk == patient_ex.pk and normalize_phone(p.phone) == norm_ex:
-                        phone_ok = True
-                        break
-            if not phone_ok:
+            if not patient_matches_phone_normalized(patient_ex, norm_ex):
                 return Response(
                     {"detail": "Could not verify that appointment for rescheduling."},
                     status=status.HTTP_400_BAD_REQUEST,
@@ -677,6 +644,8 @@ class BookingOptionsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=["get"], url_path="my-appointments")
     def my_appointments(self, request):
         """List upcoming BOOKED visits for this phone that can be managed online. Public."""
+        from datetime import datetime as dt_mod
+
         from .patient_phone import patients_matching_phone
 
         phone_raw = request.query_params.get("phone")
@@ -690,18 +659,17 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         if not patients:
             return Response(
                 {
-                    "first_name": "",
-                    "last_name": "",
-                    "email": "",
-                    "ambiguous_phone": False,
-                    "appointments": [],
-                }
+                    "detail": "We couldn't find a patient profile with this phone number. "
+                    "Double-check the number or call the clinic for help.",
+                },
+                status=status.HTTP_404_NOT_FOUND,
             )
 
         patient_ids = [p.id for p in patients]
         shared = len(patients) > 1
 
-        today = timezone.localdate()
+        now = timezone.now()
+        today = now.date()
         rows = (
             Appointment.objects.filter(
                 patient_id__in=patient_ids,
@@ -716,6 +684,10 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             svc = a.booked_service
             if not svc or not svc.is_active or not svc.show_in_public_booking:
                 continue
+            if a.appointment_date == today:
+                start_aware = timezone.make_aware(dt_mod.combine(a.appointment_date, a.start_time))
+                if start_aware <= now:
+                    continue
             pn = a.patient
             out.append(
                 {
@@ -724,6 +696,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                     "start_time": format_time_12h(a.start_time),
                     "service_id": svc.id,
                     "service_name": svc.name,
+                    "service_type": svc.service_type,
                     "provider_id": a.provider_id,
                     "provider_name": str(a.provider),
                     "duration_minutes": svc.duration_minutes,
@@ -745,6 +718,8 @@ class BookingOptionsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=["post"], url_path="reschedule")
     def reschedule(self, request):
         """Patient self-service: move a BOOKED visit to a new open slot (phone must match). Public."""
+        from .online_booking_hours import PUBLIC_BOOKING_HOURS_BLURB
+
         ser = PublicRescheduleSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
@@ -757,11 +732,14 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             sms_consent=bool(data.get("sms_consent")),
         )
         if err:
-            code = (
-                status.HTTP_409_CONFLICT
-                if "no longer available" in err.lower() or "not open" in err.lower()
-                else status.HTTP_400_BAD_REQUEST
+            err_lower = err.lower()
+            is_slot_conflict = (
+                "no longer available" in err_lower
+                or "not open for online booking" in err_lower
+                or err == PUBLIC_BOOKING_HOURS_BLURB
+                or "pick a time later today" in err_lower
             )
+            code = status.HTTP_409_CONFLICT if is_slot_conflict else status.HTTP_400_BAD_REQUEST
             return Response({"detail": err}, status=code)
 
         patient = appt.patient

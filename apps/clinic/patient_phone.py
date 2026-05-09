@@ -6,6 +6,19 @@ from .models import Patient
 from .utils import normalize_phone
 
 
+def patient_matches_phone_normalized(patient: Patient, phone_normalized: str) -> bool:
+    """
+    True if this patient's phone matches ``phone_normalized`` using the same rules as
+    ``patients_matching_phone`` (exact stored E.164 match, or legacy formatted numbers
+    that normalize to the same value).
+    """
+    if not (phone_normalized or "").strip():
+        return False
+    if (patient.phone or "").strip() == phone_normalized:
+        return True
+    return normalize_phone(patient.phone) == phone_normalized
+
+
 def patients_matching_phone(phone_normalized: str) -> list[Patient]:
     """
     All patients whose phone matches ``phone_normalized``: exact DB match first,

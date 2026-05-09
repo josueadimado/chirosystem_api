@@ -28,7 +28,7 @@ services:
       context: .
       dockerfile: Dockerfile
     environment:
-      # So Django allows Host: api when Next.js (same Compose network) proxies to http://api:8000.
+      # So Django allows Host: api when Next.js (same Compose network) proxies to http://api:8001.
       DOCKER_ENV: "true"
       # Override .env defaults so Celery/Django never use localhost:6379 inside a container.
       CELERY_BROKER_URL: redis://redis:6379/0
@@ -38,11 +38,11 @@ services:
     command: >
       sh -c "python manage.py migrate --noinput &&
              if [ -n \"$$DJANGO_ADMIN_USERNAME\" ] && [ -n \"$$DJANGO_ADMIN_PASSWORD\" ]; then python manage.py create_admin_from_env; fi &&
-             python manage.py runserver 0.0.0.0:8000"
-    # Default host 8001 avoids clash with other apps using 8000. Inside the container the app still listens on 8000.
-    # To use host port 8000 instead: API_HOST_PORT=8000 (and point the web app at http://localhost:8000/api/v1).
+             python manage.py runserver 0.0.0.0:8001"
+    # Default maps host 8001 → container 8001 (same number as logs; avoids confusion with "8000 only inside Docker").
+    # To use another host port: API_HOST_PORT=8000 maps host 8000 → container 8001 (set NEXT_PUBLIC_API_BASE_URL / proxy accordingly).
     ports:
-      - "${API_HOST_PORT:-8001}:8000"
+      - "${API_HOST_PORT:-8001}:8001"
     env_file:
       - .env
     volumes:

@@ -20,8 +20,19 @@ from .booking_provider_eligibility import provider_can_offer_service_online
 from .chiropractic_booking_policy import chiropractic_booking_must_use_intake
 from .online_booking_hours import PUBLIC_BOOKING_HOURS_BLURB, interval_outside_effective_public_window
 from .models import Appointment, Patient, Provider, Service, Visit
-from .patient_phone import get_or_create_patient_for_public_booking
+from .patient_phone import get_or_create_patient_for_public_booking, patient_matches_phone_normalized
 from .utils import format_time_12h, normalize_phone
+
+# Post-massage turnover reserved on the provider calendar for public online booking (not billed time).
+MASSAGE_PUBLIC_BOOKING_BUFFER_AFTER_MINUTES = 15
+
+
+def public_online_booking_calendar_span_minutes(service: Service) -> int:
+    """Minutes [start, end) blocked on the provider schedule for overlap checks and slot listing."""
+    n = int(service.duration_minutes)
+    if service.service_type == Service.ServiceType.MASSAGE:
+        return n + MASSAGE_PUBLIC_BOOKING_BUFFER_AFTER_MINUTES
+    return n
 
 
 def record_patient_sms_consent_from_booking(patient: Patient) -> None:
@@ -95,7 +106,8 @@ def create_appointment_from_public_booking(validated: dict) -> tuple[Appointment
         )
 
     start_dt = timezone.datetime.combine(validated["appointment_date"], validated["start_time"])
-    end_dt = start_dt + timezone.timedelta(minutes=service.duration_minutes)
+    span = public_online_booking_calendar_span_minutes(service)
+    end_dt = start_dt + timezone.timedelta(minutes=span)
     start_time = start_dt.time()
     end_time = end_dt.time()
 
@@ -206,13 +218,7 @@ def reschedule_appointment_public(
         return None, "We could not find that appointment."
 
     patient = appt.patient
-    phone_ok = normalize_phone(patient.phone) == phone_normalized
-    if not phone_ok:
-        for p in Patient.objects.all():
-            if p.pk == patient.pk and normalize_phone(p.phone) == phone_normalized:
-                phone_ok = True
-                break
-    if not phone_ok:
+    if not patient_matches_phone_normalized(patient, phone_normalized):
         return None, "That phone number does not match this appointment. Please call the clinic for help."
 
     if appt.status != Appointment.Status.BOOKED:
@@ -233,7 +239,8 @@ def reschedule_appointment_public(
             return None, "Pick a time later today that has not passed yet."
 
     start_dt = datetime.combine(new_date, new_start)
-    end_dt = start_dt + timedelta(minutes=service.duration_minutes)
+    span = public_online_booking_calendar_span_minutes(service)
+    end_dt = start_dt + timedelta(minutes=span)
     start_time = start_dt.time()
     end_time = end_dt.time()
 
@@ -363,13 +370,7 @@ def cancel_appointment_public(*, phone_normalized: str, appointment_id: int) -> 
         return None, "We could not find that appointment."
 
     patient = appt.patient
-    phone_ok = normalize_phone(patient.phone) == phone_normalized
-    if not phone_ok:
-        for p in Patient.objects.all():
-            if p.pk == patient.pk and normalize_phone(p.phone) == phone_normalized:
-                phone_ok = True
-                break
-    if not phone_ok:
+    if not patient_matches_phone_normalized(patient, phone_normalized):
         return None, "That phone number does not match this appointment. Please call the clinic for help."
 
     if appt.status != Appointment.Status.BOOKED:

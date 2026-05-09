@@ -610,6 +610,7 @@ def _find_nearby_slots(
     from apps.clinic.models import Provider, Service
     from apps.clinic.booking_availability import provider_interval_blocked_online
     from apps.clinic.online_booking_hours import CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES, effective_public_booking_window_minutes
+    from apps.clinic.public_booking_service import public_online_booking_calendar_span_minutes
     from datetime import time as time_cls
 
     if not provider_id:
@@ -619,12 +620,8 @@ def _find_nearby_slots(
     if not provider or not service:
         return []
 
-    duration = service.duration_minutes
-    slot_step = (
-        CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES
-        if service.service_type == Service.ServiceType.CHIROPRACTIC
-        else max(duration, 15)
-    )
+    required_span = public_online_booking_calendar_span_minutes(service)
+    slot_step = CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES
     win = effective_public_booking_window_minutes(appt_date, service)
     if not win:
         return []
@@ -645,11 +642,11 @@ def _find_nearby_slots(
     slots: list[tuple[int, str]] = []
     cursor = day_start
     target_min = rejected_time.hour * 60 + rejected_time.minute if rejected_time else 600
-    while cursor + duration <= day_end:
-        if not any(cursor <= t < cursor + duration for t in taken):
+    while cursor + required_span <= day_end:
+        if not any(cursor <= t < cursor + required_span for t in taken):
             h, m = divmod(cursor, 60)
             st = time_cls(hour=h, minute=m)
-            et_total = cursor + duration
+            et_total = cursor + required_span
             eh, em = divmod(et_total, 60)
             et = time_cls(hour=min(eh, 23), minute=em if eh < 24 else 59)
             if not provider_interval_blocked_online(provider.pk, appt_date, st, et):

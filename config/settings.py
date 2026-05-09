@@ -122,6 +122,11 @@ USE_TZ = True
 
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+# WhiteNoise warns if this path is missing (common in fresh Docker images before collectstatic).
+try:
+    STATIC_ROOT.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # In Docker, use redis://redis:6379/0 (Compose service name). Many .env files set REDIS_URL only.
