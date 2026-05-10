@@ -70,6 +70,7 @@ from .serializers import (
     complete_visit_with_services,
     revise_unpaid_visit_billing,
 )
+from .pagination import StandardPageNumberPagination
 from .square_helpers import (
     get_application_id,
     get_location_id,
@@ -905,6 +906,24 @@ class PatientViewSet(viewsets.ModelViewSet):
     queryset = Patient.objects.all().order_by("-updated_at")
     serializer_class = PatientSerializer
     permission_classes = [IsOwnerOrDoctor]
+    pagination_class = StandardPageNumberPagination
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        raw = (self.request.query_params.get("search") or "").strip()
+        if not raw:
+            return qs
+        terms = [t for t in raw.split() if t]
+        if not terms:
+            return qs
+        for term in terms:
+            qs = qs.filter(
+                Q(first_name__icontains=term)
+                | Q(last_name__icontains=term)
+                | Q(email__icontains=term)
+                | Q(phone__icontains=term)
+            )
+        return qs
 
     def create(self, request, *args, **kwargs):
         if getattr(request.user, "role", None) not in ("owner_admin", "staff"):
