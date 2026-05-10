@@ -11,7 +11,14 @@ from django.db import transaction
 from django.utils import timezone
 
 from .models import Appointment, Invoice, Patient, PatientCreditTransaction, Payment
-from .square_helpers import ensure_square_customer, get_location_id, get_square_client, get_terminal_device_id
+from .square_helpers import (
+    ensure_square_customer,
+    get_kiosk_terminal_device_id,
+    get_location_id,
+    get_square_client,
+    get_terminal_device_id,
+    square_configured,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -357,6 +364,90 @@ def create_terminal_checkout_for_invoice(invoice: Invoice) -> dict:
     if not co or not co.id:
         raise RuntimeError("Square did not return a terminal checkout id.")
     return {"checkout_id": co.id, "status": getattr(co, "status", None) or "PENDING"}
+
+
+def try_push_terminal_checkout_to_kiosk(invoice: Invoice) -> None:
+    """
+    Best-effort: send amount due to the clinic kiosk Square Terminal (Terminal API checkout).
+
+    Uses the same Create Terminal Checkout call as the desk reader with device id from
+    get_kiosk_terminal_device_id(). Never raises — failures are logged only (bill is already saved).
+
+    Terminal Checkout exposes total on the device; patient name, visit date, and item labels are
+    included in the checkout ``note`` field (Square truncates as needed).
+    """
+    from square.requests.device_checkout_options import DeviceCheckoutOptionsParams
+    from square.requests.money import MoneyParams
+    from square.requests.terminal_checkout import TerminalCheckoutParams
+
+    try:
+        if not square_configured():
+            return
+
+        device_id = get_kiosk_terminal_device_id()
+        if not device_id:
+            logger.debug("try_push_terminal_checkout_to_kiosk: no kiosk or fallback device id configured")
+            return
+
+        inv = Invoice.objects.select_related("patient", "appointment", "visit").filter(pk=invoice.pk).first()
+        if not inv or inv.status == Invoice.Status.PAID or inv.status == Invoice.Status.VOID:
+            return
+
+        amount_cents = _money_cents(inv)
+        if amount_cents < _MIN_AMOUNT_CENTS:
+            logger.debug("try_push_terminal_checkout_to_kiosk: amount below minimum (%s cents)", amount_cents)
+            return
+
+        patient = inv.patient
+        patient_name = f"{patient.first_name or ''} {patient.last_name or ''}".strip() or "Patient"
+        appt = inv.appointment
+        visit_date = str(appt.appointment_date) if appt else ""
+
+        line_parts: list[str] = []
+        visit_obj = inv.visit
+        if visit_obj:
+            for rs in visit_obj.rendered_services.select_related("service").all():
+                svc_name = (rs.service.name if rs.service else "Service")[:80]
+                line_parts.append(f"{rs.quantity}× {svc_name}")
+        lines_joined = "; ".join(line_parts)[:320]
+
+        note_core = f"{patient_name} · Date {visit_date} · {inv.invoice_number}"
+        if lines_joined:
+            note = f"{note_core} · {lines_joined}"
+        else:
+            note = note_core
+        note = note[:500]
+
+        client = get_square_client()
+        res = client.terminal.checkouts.create(
+            idempotency_key=str(uuid.uuid4()),
+            checkout=TerminalCheckoutParams(
+                amount_money=MoneyParams(amount=amount_cents, currency="USD"),
+                reference_id=str(inv.id)[:40],
+                note=note,
+                device_options=DeviceCheckoutOptionsParams(device_id=device_id),
+                payment_type="CARD_PRESENT",
+            ),
+        )
+        if res.errors:
+            logger.warning(
+                "Kiosk Terminal checkout failed after bill save (non-blocking): %s",
+                getattr(res.errors[0], "detail", None) or res.errors,
+            )
+            return
+        co = res.checkout
+        logger.info(
+            "Kiosk Terminal checkout queued for invoice %s checkout_id=%s device=%s…",
+            inv.id,
+            getattr(co, "id", None),
+            device_id[:8],
+        )
+    except Exception as exc:
+        logger.warning(
+            "Kiosk Terminal checkout failed after bill save (non-blocking): %s",
+            exc,
+            exc_info=True,
+        )
 
 
 def create_terminal_checkout_for_credit_topup(*, patient_id: int, amount_usd: Decimal, note: str = "") -> dict:

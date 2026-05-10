@@ -94,6 +94,7 @@ from .square_payment import (
     create_terminal_checkout_test,
     get_frontend_base_url,
     get_terminal_checkout_status,
+    try_push_terminal_checkout_to_kiosk,
 )
 from .booking_availability import provider_interval_blocked_online
 from .booking_provider_eligibility import apply_intake_chiropractic_provider_fallback, provider_can_offer_service_online
@@ -3011,6 +3012,9 @@ class DoctorViewSet(viewsets.ViewSet):
             invoice, try_saved_card=data.get("charge_saved_card_if_present", True)
         )
         followup.pop("already_paid", None)
+        invoice.refresh_from_db()
+        if invoice.status != Invoice.Status.PAID:
+            try_push_terminal_checkout_to_kiosk(invoice)
         return Response(followup)
 
     @action(detail=True, methods=["get"], url_path="billing_for_edit")
@@ -3125,6 +3129,9 @@ class DoctorViewSet(viewsets.ViewSet):
             invoice, try_saved_card=data.get("charge_saved_card_if_present", False)
         )
         followup.pop("already_paid", None)
+        invoice.refresh_from_db()
+        if invoice.status != Invoice.Status.PAID:
+            try_push_terminal_checkout_to_kiosk(invoice)
         return Response(followup)
 
     @action(detail=False, methods=["post"], url_path="prepare_invoice_payment")

@@ -46,6 +46,17 @@ def get_terminal_device_id() -> str:
     return os.environ.get("SQUARE_DEVICE_ID", "").strip()
 
 
+def get_kiosk_terminal_device_id() -> str:
+    """
+    Square Terminal device id for the patient-facing kiosk display/checkout.
+    When unset, falls back to SQUARE_DEVICE_ID so single-terminal clinics still work.
+    """
+    raw = (os.environ.get("SQUARE_KIOSK_DEVICE_ID") or getattr(settings, "SQUARE_KIOSK_DEVICE_ID", "") or "").strip()
+    if raw:
+        return raw
+    return get_terminal_device_id()
+
+
 def _square_locations_http_ping() -> tuple[bool, str | None, set[str]]:
     """
     Call Square ListLocations with the configured token (admin health check).
