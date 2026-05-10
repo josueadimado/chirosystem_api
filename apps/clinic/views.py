@@ -32,6 +32,7 @@ from .models import (
     VoiceCallLog,
 )
 from .public_booking_service import (
+    _appointment_start_aware_in_clinic_tz,
     cancel_appointment_public,
     create_appointment_from_public_booking,
     public_online_booking_calendar_span_minutes,
@@ -129,8 +130,22 @@ def _clinic_settings_bill_header():
         "city_state_zip": s.city_state_zip,
         "phone": s.phone,
         "email": s.email or "",
+        "employer_tax_id": (s.employer_tax_id or "").strip(),
         "pos_default": s.pos_default,
     }
+
+
+def _format_bill_display_date(d) -> str:
+    """Human-readable date for printed bills (e.g. 'Aug 24, 2025')."""
+    from datetime import date, datetime
+
+    if d is None:
+        return ""
+    if isinstance(d, datetime):
+        d = d.date()
+    if not isinstance(d, date):
+        return str(d)
+    return f"{d.strftime('%b')} {d.day}, {d.year}"
 
 
 def _invoice_bill_dict(inv: Invoice, *, preview: bool) -> dict:
@@ -148,12 +163,22 @@ def _invoice_bill_dict(inv: Invoice, *, preview: bool) -> dict:
     documented_agg = visit.rendered_services.aggregate(s=Sum("total_price"))
     documented_subtotal = documented_agg["s"] if documented_agg["s"] is not None else Decimal("0")
     documented_subtotal = documented_subtotal.quantize(Decimal("0.01"))
+
+    pay_sum = inv.payments.filter(status=Payment.Status.SUCCESSFUL).aggregate(s=Sum("amount"))["s"]
+    pay_sum = pay_sum if pay_sum is not None else Decimal("0")
+    patient_pay_and_credits = (pay_sum + inv.credit_applied_total).quantize(Decimal("0.01"))
+
+    billing_anchor = inv.paid_at.date() if inv.paid_at else inv.appointment.appointment_date
+
     return {
         **header,
         "bill_title": "Patient Bill — PREVIEW (not paid yet)" if preview else "Patient Bill",
         "is_preview": preview,
         "invoice_number": inv.invoice_number,
+        "patient_id": pat.pk,
         "date_of_service": str(inv.appointment.appointment_date),
+        "billing_date_display": _format_bill_display_date(billing_anchor),
+        "statement_date_display": _format_bill_display_date(timezone.localdate()),
         "patient_name": f"{pat.first_name} {pat.last_name}",
         "patient_address": addr_display,
         "diagnosis": (visit.diagnosis or "").strip() or "\u2014",
@@ -170,6 +195,9 @@ def _invoice_bill_dict(inv: Invoice, *, preview: bool) -> dict:
         "patient_subtotal": str(inv.subtotal),
         "discount": str(inv.discount),
         "credit_applied_total": str(inv.credit_applied_total),
+        "insurance_payments_total": "0.00",
+        "patient_payments_total": str(patient_pay_and_credits),
+        "payments_card_cash_total": str(pay_sum.quantize(Decimal("0.01"))),
         "tax": str(inv.tax),
         "total_amount": str(inv.total_amount),
         "status": inv.status,
@@ -698,7 +726,6 @@ class BookingOptionsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=["get"], url_path="my-appointments")
     def my_appointments(self, request):
         """List upcoming BOOKED visits for this phone that can be managed online. Public."""
-        from datetime import datetime as dt_mod
 
         from .patient_phone import patients_matching_phone
 
@@ -739,7 +766,10 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             if not svc or not svc.is_active or not svc.show_in_public_booking:
                 continue
             if a.appointment_date == today:
-                start_aware = timezone.make_aware(dt_mod.combine(a.appointment_date, a.start_time))
+                try:
+                    start_aware = _appointment_start_aware_in_clinic_tz(a)
+                except Exception:
+                    continue
                 if start_aware <= now:
                     continue
             pn = a.patient
@@ -821,10 +851,27 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
         norm = normalize_phone(data["phone"])
-        appt, err = cancel_appointment_public(
-            phone_normalized=norm,
-            appointment_id=data["appointment_id"],
-        )
+        try:
+            appt, err = cancel_appointment_public(
+                phone_normalized=norm,
+                appointment_id=data["appointment_id"],
+            )
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "cancel_appointment_public crashed appointment_id=%s",
+                data.get("appointment_id"),
+            )
+            return Response(
+                {
+                    "detail": (
+                        "Something went wrong cancelling online. Please try again or call the clinic "
+                        "so we can cancel this visit for you."
+                    ),
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         if err:
             return Response({"detail": err}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -1907,11 +1954,12 @@ class AdminViewSet(viewsets.ViewSet):
             "city_state_zip",
             "phone",
             "email",
+            "employer_tax_id",
             "pos_default",
         ):
             if field in data:
                 val = data[field]
-                setattr(solo, field, (val or "") if field == "email" else val)
+                setattr(solo, field, (val or "") if field in ("email", "employer_tax_id") else val)
         if "no_show_fee" in data:
             solo.no_show_fee = data["no_show_fee"]
         if "business_hours" in data:

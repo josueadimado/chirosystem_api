@@ -534,6 +534,7 @@ class ClinicProfileUpdateSerializer(serializers.Serializer):
     city_state_zip = serializers.CharField(max_length=200, required=False, allow_blank=True)
     phone = serializers.CharField(max_length=40, required=False, allow_blank=True)
     email = serializers.EmailField(required=False, allow_blank=True)
+    employer_tax_id = serializers.CharField(max_length=32, required=False, allow_blank=True)
     pos_default = serializers.CharField(max_length=10, required=False, allow_blank=True)
     no_show_fee = serializers.DecimalField(
         max_digits=10,

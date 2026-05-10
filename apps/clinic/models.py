@@ -435,6 +435,12 @@ class ClinicSettings(TimeStampedModel):
     city_state_zip = models.CharField(max_length=200, default="St Joseph, MI 49085")
     phone = models.CharField(max_length=40, default="269-408-0303")
     email = models.EmailField(blank=True, default="")
+    employer_tax_id = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        help_text="Employer / office tax ID printed on patient bills (e.g. EIN). Optional.",
+    )
     pos_default = models.CharField(
         max_length=10,
         default="11",

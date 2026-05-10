@@ -30,6 +30,39 @@ logger = logging.getLogger(__name__)
 MASSAGE_PUBLIC_BOOKING_BUFFER_AFTER_MINUTES = 15
 
 
+def _appointment_start_aware_in_clinic_tz(appt: Appointment) -> datetime:
+    """
+    Appointment start as an aware datetime in the clinic TIME_ZONE.
+
+    Used instead of ``make_aware(combine(...))`` without tzinfo, which can raise on DST gaps
+    and surface as HTTP 500 during patient cancel / listing checks.
+    """
+    from zoneinfo import ZoneInfo
+
+    from django.conf import settings
+
+    tz_name = getattr(settings, "TIME_ZONE", "UTC") or "UTC"
+    try:
+        clinic_tz = ZoneInfo(str(tz_name))
+    except Exception:
+        clinic_tz = ZoneInfo("UTC")
+    return datetime.combine(appt.appointment_date, appt.start_time, tzinfo=clinic_tz)
+
+
+def _local_now_passed_appointment_start(appt: Appointment) -> bool:
+    """
+    True when clinic-local clock is already at or past the appointment start (date + time).
+
+    Cheap guard when we only need a wall-clock comparison (e.g. my-appointments list).
+    """
+    local_now = timezone.localtime(timezone.now())
+    if appt.appointment_date > local_now.date():
+        return False
+    if appt.appointment_date < local_now.date():
+        return True
+    return local_now.time() >= appt.start_time
+
+
 def public_online_booking_calendar_span_minutes(service: Service) -> int:
     """Minutes [start, end) blocked on the provider schedule for overlap checks and slot listing."""
     n = int(service.duration_minutes)
@@ -283,7 +316,14 @@ def reschedule_appointment_public(
         return None, "Pick today or a future date."
 
     if new_date == today:
-        slot_dt = timezone.make_aware(datetime.combine(new_date, new_start))
+        from types import SimpleNamespace
+
+        try:
+            slot_dt = _appointment_start_aware_in_clinic_tz(
+                SimpleNamespace(appointment_date=new_date, start_time=new_start),
+            )
+        except Exception:
+            return None, "Pick a valid time for today."
         if slot_dt <= timezone.now():
             return None, "Pick a time later today that has not passed yet."
 
@@ -434,8 +474,16 @@ def cancel_appointment_public(*, phone_normalized: str, appointment_id: int) -> 
     # Allow cancellation for already-booked visits even if the service was later hidden/inactivated.
     # Restricting by current service visibility blocks legitimate patient self-service cancels.
 
+    try:
+        start_dt = _appointment_start_aware_in_clinic_tz(appt)
+    except Exception:
+        logger.exception(
+            "Could not compute appointment start time for cancellation appointment_id=%s",
+            appt.id,
+        )
+        return None, "We could not process this cancellation online. Please call the clinic."
+
     now = timezone.now()
-    start_dt = timezone.make_aware(datetime.combine(appt.appointment_date, appt.start_time))
     if now >= start_dt:
         return None, "You can only cancel online before your appointment start time. Please call the clinic."
 
@@ -492,8 +540,15 @@ def cancel_appointment_public(*, phone_normalized: str, appointment_id: int) -> 
                 return None, str(inner[0])
             return None, inner if isinstance(inner, str) else str(inner)
         return None, str(detail)
+    except Exception:
+        logger.exception(
+            "cancel_appointment_public failed during transaction appointment_id=%s",
+            appointment_id,
+        )
+        return None, "We could not complete this cancellation online. Please call the clinic."
 
-    assert locked is not None
+    if locked is None:
+        return None, "We could not complete this cancellation online. Please call the clinic."
     aid = locked.id
 
     def queue_calendar():
