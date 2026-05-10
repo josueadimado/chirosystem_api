@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
-from django.db import transaction
+from django.db import IntegrityError, OperationalError, transaction
 from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework.exceptions import ValidationError as RestValidationError
@@ -540,6 +540,23 @@ def cancel_appointment_public(*, phone_normalized: str, appointment_id: int) -> 
                 return None, str(inner[0])
             return None, inner if isinstance(inner, str) else str(inner)
         return None, str(detail)
+    except IntegrityError:
+        logger.exception(
+            "cancel_appointment_public IntegrityError (likely billing row conflict) appointment_id=%s",
+            appointment_id,
+        )
+        return None, (
+            "This visit could not be cancelled online because billing data on file conflicts with "
+            "cancellation (for example an open invoice). Please call the clinic so we can cancel it for you."
+        )
+    except OperationalError:
+        logger.exception(
+            "cancel_appointment_public database OperationalError appointment_id=%s",
+            appointment_id,
+        )
+        return None, (
+            "The server could not reach the database just now. Please try again in a minute, or call the clinic."
+        )
     except Exception:
         logger.exception(
             "cancel_appointment_public failed during transaction appointment_id=%s",
@@ -548,6 +565,10 @@ def cancel_appointment_public(*, phone_normalized: str, appointment_id: int) -> 
         return None, "We could not complete this cancellation online. Please call the clinic."
 
     if locked is None:
+        logger.error(
+            "cancel_appointment_public finished transaction but locked is None appointment_id=%s",
+            appointment_id,
+        )
         return None, "We could not complete this cancellation online. Please call the clinic."
     aid = locked.id
 
