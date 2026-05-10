@@ -60,7 +60,7 @@ def chiropractic_booking_must_use_intake(patient: Patient, service: Service) -> 
     intake_qs = public_new_client_intake_services()
     if not intake_qs.exists():
         return None
-    names = ", ".join(intake_qs.values_list("name", flat=True)[:8])
+    names = ", ".join(s.label_for_public_booking() for s in intake_qs[:8])
 
     last = last_completed_chiropractic_visit_date(patient)
     if last is None:
@@ -83,7 +83,7 @@ def chiropractic_booking_must_use_intake(patient: Patient, service: Service) -> 
 def chiropractic_intake_context_for_new_phone_lookup() -> dict:
     """Patient-lookup JSON when the phone number is not in the system yet (treat as new to the practice)."""
     intake_qs = public_new_client_intake_services()
-    intake_list = [{"id": s.id, "name": s.name} for s in intake_qs]
+    intake_list = [{"id": s.id, "name": s.label_for_public_booking()} for s in intake_qs]
     gap = chiro_returning_gap_days()
     new_requires = bool(intake_list)
     return {
@@ -101,7 +101,7 @@ def chiropractic_intake_context_for_patient(patient: Patient) -> dict:
     """Fields merged into public patient-lookup JSON for booking UI (existing patient)."""
     last = last_completed_chiropractic_visit_date(patient)
     intake_qs = public_new_client_intake_services()
-    intake_list = [{"id": s.id, "name": s.name} for s in intake_qs]
+    intake_list = [{"id": s.id, "name": s.label_for_public_booking()} for s in intake_qs]
     gap = chiro_returning_gap_days()
     if patient.online_chiro_intake_waived:
         return {

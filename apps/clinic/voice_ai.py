@@ -41,7 +41,7 @@ def _booking_catalog_json() -> dict[str, Any]:
         services.append(
             {
                 "id": svc.id,
-                "name": svc.name,
+                "name": svc.label_for_public_booking(),
                 "duration_minutes": svc.duration_minutes,
                 "price": str(svc.price),
                 "service_type": svc.service_type,

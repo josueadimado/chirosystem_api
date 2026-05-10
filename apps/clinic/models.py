@@ -107,6 +107,13 @@ class Service(TimeStampedModel):
         MASSAGE = "massage", "Massage"
 
     name = models.CharField(max_length=200)
+    public_booking_name = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        help_text="Optional. When set, patients see this on the public booking site, voice booking, and in confirmations "
+        "instead of Name. Schedules, doctor portal, and billing always use Name.",
+    )
     description = models.TextField(blank=True)
     duration_minutes = models.PositiveIntegerField(default=30)
     price = models.DecimalField(max_digits=10, decimal_places=2)
@@ -152,6 +159,11 @@ class Service(TimeStampedModel):
 
     def __str__(self) -> str:
         return self.name
+
+    def label_for_public_booking(self) -> str:
+        """Patient-facing service title (web/voice booking, SMS/email). Falls back to name if unset."""
+        alt = (self.public_booking_name or "").strip()
+        return alt if alt else self.name
 
 
 class Appointment(TimeStampedModel):

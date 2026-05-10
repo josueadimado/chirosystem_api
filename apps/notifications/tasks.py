@@ -70,7 +70,7 @@ def send_booking_confirmation_sms_task(appointment_id: int) -> str:
     if not to:
         return "no_phone"
 
-    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%a %b %d, %Y")
     time_disp = format_time_12h(appt.start_time)
     est_pay = format_usd_plain(appt.booked_service.price) if appt.booked_service else ""
@@ -111,7 +111,7 @@ def send_booking_confirmation_email_task(appointment_id: int) -> str:
         return "no_email"
 
     first_name = appt.patient.first_name.strip() or "there"
-    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%A, %B %d, %Y")
     time_disp = format_time_12h(appt.start_time)
     est_pay = format_usd_plain(appt.booked_service.price) if appt.booked_service else ""
@@ -182,7 +182,7 @@ def send_daily_appointment_reminders() -> dict:
 
     for appt in candidates:
         patient = appt.patient
-        service_name = appt.booked_service.name if appt.booked_service else "appointment"
+        service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
         date_disp = appt.appointment_date.strftime("%a %b %d, %Y")
         time_disp = format_time_12h(appt.start_time)
         est_pay = format_usd_plain(appt.booked_service.price) if appt.booked_service else ""
@@ -291,7 +291,7 @@ def send_same_day_appointment_reminders() -> dict:
             continue
 
         patient = appt.patient
-        service_name = appt.booked_service.name if appt.booked_service else "appointment"
+        service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
         date_disp = appt.appointment_date.strftime("%a %b %d, %Y")
         time_disp = format_time_12h(appt.start_time)
         est_pay = format_usd_plain(appt.booked_service.price) if appt.booked_service else ""
@@ -423,6 +423,7 @@ def notify_provider_new_booking_task(appointment_id: int) -> str:
     if not appt:
         return "appointment_missing"
     patient_name = f"{appt.patient.first_name} {appt.patient.last_name}".strip()
+    # Staff SMS: use internal service name so the schedule matches the EMR (e.g. "Miscellaneous").
     service_name = appt.booked_service.name if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%a %b %d, %Y")
     time_disp = format_time_12h(appt.start_time)
@@ -526,7 +527,7 @@ def send_patient_cancel_confirmation_sms_task(appointment_id: int) -> str:
     if not to:
         return "no_phone"
 
-    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%a %b %d, %Y")
     time_disp = format_time_12h(appt.start_time)
     body = patient_cancel_confirmation_sms_body(
@@ -566,7 +567,7 @@ def send_patient_cancel_confirmation_email_task(appointment_id: int) -> str:
         return "no_email"
 
     first_name = appt.patient.first_name.strip() or "there"
-    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%A, %B %d, %Y")
     time_disp = format_time_12h(appt.start_time)
     provider_name = str(appt.provider)
@@ -622,7 +623,7 @@ def send_patient_reschedule_confirmation_sms_task(appointment_id: int) -> str:
     if not to:
         return "no_phone"
 
-    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%a %b %d, %Y")
     time_disp = format_time_12h(appt.start_time)
     body = patient_reschedule_confirmation_sms_body(
@@ -662,7 +663,7 @@ def send_patient_reschedule_confirmation_email_task(appointment_id: int) -> str:
         return "no_email"
 
     first_name = appt.patient.first_name.strip() or "there"
-    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%A, %B %d, %Y")
     time_disp = format_time_12h(appt.start_time)
     provider_name = str(appt.provider)
@@ -712,7 +713,7 @@ def send_provider_dashboard_reschedule_patient_sms_task(appointment_id: int) -> 
     to = (p.phone or "").strip()
     if not to:
         return "no_phone"
-    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%a %b %d, %Y")
     time_disp = format_time_12h(appt.start_time)
     body = provider_dashboard_reschedule_patient_sms_body(
@@ -746,7 +747,7 @@ def send_provider_dashboard_reschedule_patient_email_task(appointment_id: int) -
     if not email:
         return "no_email"
     first = appt.patient.first_name.strip() or "there"
-    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%A, %B %d, %Y")
     time_disp = format_time_12h(appt.start_time)
     prov = str(appt.provider)
@@ -791,7 +792,7 @@ def send_provider_dashboard_book_next_patient_sms_task(appointment_id: int) -> s
     to = (appt.patient.phone or "").strip()
     if not to:
         return "no_phone"
-    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%a %b %d, %Y")
     time_disp = format_time_12h(appt.start_time)
     body = provider_dashboard_book_next_patient_sms_body(
@@ -825,7 +826,7 @@ def send_provider_dashboard_book_next_patient_email_task(appointment_id: int) ->
     if not email:
         return "no_email"
     first = appt.patient.first_name.strip() or "there"
-    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%A, %B %d, %Y")
     time_disp = format_time_12h(appt.start_time)
     prov = str(appt.provider)
