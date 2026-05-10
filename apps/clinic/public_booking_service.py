@@ -496,8 +496,11 @@ def cancel_appointment_public(*, phone_normalized: str, appointment_id: int) -> 
     try:
         with transaction.atomic():
             try:
+                # booked_service is nullable → select_related + FOR UPDATE becomes an outer join on Postgres,
+                # which raises "FOR UPDATE cannot be applied to the nullable side of an outer join".
+                # Lock only appointment rows; related rows are still readable in the same transaction.
                 locked = (
-                    Appointment.objects.select_for_update()
+                    Appointment.objects.select_for_update(of=("self",))
                     .select_related("patient", "booked_service", "provider")
                     .get(pk=appt.id)
                 )

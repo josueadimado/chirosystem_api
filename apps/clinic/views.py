@@ -1475,7 +1475,11 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                 logger.exception("Post-commit dispatch failed (email) reschedule appt=%s", aid)
 
         with transaction.atomic():
-            locked = Appointment.objects.select_for_update().select_related("provider", "booked_service").get(pk=aid)
+            locked = (
+                Appointment.objects.select_for_update(of=("self",))
+                .select_related("provider", "booked_service")
+                .get(pk=aid)
+            )
             if locked.status not in (Appointment.Status.BOOKED, Appointment.Status.CHECKED_IN):
                 return Response(
                     {"detail": "Appointment status changed; refresh and try again."},
