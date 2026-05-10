@@ -406,7 +406,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
 
         win = effective_public_booking_window_minutes(appt_date, service)
         if win is None:
-            return Response({"available_slots": []})
+            return Response({"available_slots": [], "slot_start_times": []})
         day_start, day_end = win
 
         required_span = public_online_booking_calendar_span_minutes(service)
@@ -421,49 +421,100 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         exclude_raw = (request.query_params.get("exclude_appointment_id") or "").strip()
         phone_for_exclude = (request.query_params.get("phone") or "").strip()
         if exclude_raw:
-            if not phone_for_exclude:
+            if phone_for_exclude:
+                valid_ex, msg_ex = validate_phone(phone_for_exclude)
+                if not valid_ex:
+                    return Response({"detail": msg_ex or "Invalid phone."}, status=status.HTTP_400_BAD_REQUEST)
+                norm_ex = normalize_phone(phone_for_exclude)
+                try:
+                    exclude_pk = int(exclude_raw)
+                except ValueError:
+                    return Response(
+                        {"detail": "exclude_appointment_id must be a number."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                ex_appt = (
+                    Appointment.objects.select_related("patient")
+                    .filter(pk=exclude_pk, status=Appointment.Status.BOOKED)
+                    .first()
+                )
+                if not ex_appt:
+                    return Response(
+                        {"detail": "Could not verify that appointment for rescheduling."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                patient_ex = ex_appt.patient
+                if not patient_matches_phone_normalized(patient_ex, norm_ex):
+                    return Response(
+                        {"detail": "Could not verify that appointment for rescheduling."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if ex_appt.provider_id != provider.pk:
+                    return Response(
+                        {"detail": "That visit is with a different provider."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if ex_appt.booked_service_id != service.id:
+                    return Response(
+                        {"detail": "That visit does not match this service."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                busy_qs = busy_qs.exclude(pk=exclude_pk)
+            elif request.user.is_authenticated and getattr(request.user, "role", None) in (
+                "doctor",
+                "owner_admin",
+                "staff",
+            ):
+                from .provider_self_schedule import user_may_manage_appointment
+
+                try:
+                    exclude_pk = int(exclude_raw)
+                except ValueError:
+                    return Response(
+                        {"detail": "exclude_appointment_id must be a number."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                ex_appt = (
+                    Appointment.objects.select_related("provider", "booked_service", "patient")
+                    .filter(pk=exclude_pk)
+                    .first()
+                )
+                if not ex_appt:
+                    return Response(
+                        {"detail": "Could not verify that appointment for rescheduling."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if ex_appt.status not in (
+                    Appointment.Status.BOOKED,
+                    Appointment.Status.CHECKED_IN,
+                ):
+                    return Response(
+                        {"detail": "Only booked or checked-in visits can use reschedule slot preview."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if not user_may_manage_appointment(request.user, ex_appt):
+                    return Response(
+                        {"detail": "You do not have access to this appointment."},
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+                if ex_appt.provider_id != provider.pk:
+                    return Response(
+                        {"detail": "That visit is with a different provider."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if ex_appt.booked_service_id != service.id:
+                    return Response(
+                        {"detail": "That visit does not match this service."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                busy_qs = busy_qs.exclude(pk=exclude_pk)
+            else:
                 return Response(
-                    {"detail": "phone is required when exclude_appointment_id is set."},
+                    {
+                        "detail": "phone is required when exclude_appointment_id is set (unless you are signed in as clinic staff)."
+                    },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-            valid_ex, msg_ex = validate_phone(phone_for_exclude)
-            if not valid_ex:
-                return Response({"detail": msg_ex or "Invalid phone."}, status=status.HTTP_400_BAD_REQUEST)
-            norm_ex = normalize_phone(phone_for_exclude)
-            try:
-                exclude_pk = int(exclude_raw)
-            except ValueError:
-                return Response(
-                    {"detail": "exclude_appointment_id must be a number."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            ex_appt = (
-                Appointment.objects.select_related("patient")
-                .filter(pk=exclude_pk, status=Appointment.Status.BOOKED)
-                .first()
-            )
-            if not ex_appt:
-                return Response(
-                    {"detail": "Could not verify that appointment for rescheduling."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            patient_ex = ex_appt.patient
-            if not patient_matches_phone_normalized(patient_ex, norm_ex):
-                return Response(
-                    {"detail": "Could not verify that appointment for rescheduling."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            if ex_appt.provider_id != provider.pk:
-                return Response(
-                    {"detail": "That visit is with a different provider."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            if ex_appt.booked_service_id != service.id:
-                return Response(
-                    {"detail": "That visit does not match this service."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            busy_qs = busy_qs.exclude(pk=exclude_pk)
 
         taken = set()
         for a in busy_qs.values_list("start_time", "end_time"):
@@ -473,6 +524,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                 taken.add(m)
 
         available = []
+        slot_start_times = []
         cursor = day_start
         while cursor + required_span <= day_end:
             if not any(cursor <= t < cursor + required_span for t in taken):
@@ -488,9 +540,10 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                     display_h = h if 1 <= h <= 12 else (h - 12 if h > 12 else 12)
                     label = f"{display_h}:{m:02d} {suffix}"
                     available.append(label)
+                    slot_start_times.append(slot_start_time.strftime("%H:%M:%S"))
             cursor += SLOT_INTERVAL
 
-        return Response({"available_slots": available})
+        return Response({"available_slots": available, "slot_start_times": slot_start_times})
 
     @action(detail=False, methods=["get"], url_path="patient-lookup")
     def patient_lookup(self, request):
@@ -1298,6 +1351,269 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                 "total_amount": str(service.price),
             },
             status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["post"], url_path="reschedule-by-provider")
+    def reschedule_by_provider(self, request, pk=None):
+        """Move an existing BOOKED/CHECKED_IN visit using the same slot rules as public booking."""
+        import logging
+
+        from .provider_self_schedule import (
+            compute_end_time_for_slot,
+            parse_appointment_date,
+            parse_start_time_value,
+            user_may_manage_appointment,
+            validate_slot_for_online_booking_rules,
+        )
+
+        logger = logging.getLogger(__name__)
+        appt = self.get_object()
+        if not user_may_manage_appointment(request.user, appt):
+            return Response(
+                {"detail": "You do not have access to this appointment."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if appt.status not in (Appointment.Status.BOOKED, Appointment.Status.CHECKED_IN):
+            return Response(
+                {"detail": "Only booked or checked-in appointments can be rescheduled this way."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not appt.booked_service:
+            return Response({"detail": "This appointment has no booked service."}, status=status.HTTP_400_BAD_REQUEST)
+
+        date_raw = (request.data.get("appointment_date") or "").strip()
+        time_raw = request.data.get("start_time")
+        appt_date = parse_appointment_date(date_raw)
+        if not appt_date:
+            return Response(
+                {"detail": "Invalid or missing appointment_date (use YYYY-MM-DD)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        start_t = parse_start_time_value(time_raw if time_raw is not None else "")
+        if not start_t:
+            return Response({"detail": "Invalid or missing start_time."}, status=status.HTTP_400_BAD_REQUEST)
+
+        err, is_conflict = validate_slot_for_online_booking_rules(
+            provider=appt.provider,
+            service=appt.booked_service,
+            appt_date=appt_date,
+            start_time=start_t,
+            exclude_appointment_id=appt.pk,
+        )
+        if err:
+            code = status.HTTP_409_CONFLICT if is_conflict else status.HTTP_400_BAD_REQUEST
+            return Response({"detail": err}, status=code)
+
+        aid = appt.pk
+
+        def queue_notifications():
+            from apps.notifications.tasks import (
+                send_provider_dashboard_reschedule_patient_email_task,
+                send_provider_dashboard_reschedule_patient_sms_task,
+                sync_appointment_google_calendar_task,
+            )
+
+            try:
+                sync_appointment_google_calendar_task.delay(aid)
+            except Exception:
+                logger.exception("Post-commit dispatch failed (calendar) reschedule appt=%s", aid)
+            try:
+                send_provider_dashboard_reschedule_patient_sms_task.delay(aid)
+            except Exception:
+                logger.exception("Post-commit dispatch failed (sms) reschedule appt=%s", aid)
+            try:
+                send_provider_dashboard_reschedule_patient_email_task.delay(aid)
+            except Exception:
+                logger.exception("Post-commit dispatch failed (email) reschedule appt=%s", aid)
+
+        with transaction.atomic():
+            locked = Appointment.objects.select_for_update().select_related("provider", "booked_service").get(pk=aid)
+            if locked.status not in (Appointment.Status.BOOKED, Appointment.Status.CHECKED_IN):
+                return Response(
+                    {"detail": "Appointment status changed; refresh and try again."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            err2, is_conflict2 = validate_slot_for_online_booking_rules(
+                provider=locked.provider,
+                service=locked.booked_service,
+                appt_date=appt_date,
+                start_time=start_t,
+                exclude_appointment_id=locked.pk,
+            )
+            if err2:
+                code = status.HTTP_409_CONFLICT if is_conflict2 else status.HTTP_400_BAD_REQUEST
+                return Response({"detail": err2}, status=code)
+            locked.appointment_date = appt_date
+            locked.start_time = start_t
+            locked.end_time = compute_end_time_for_slot(appt_date, start_t, locked.booked_service)
+            locked.clear_reminder_timestamps()
+            locked.save()
+
+        transaction.on_commit(queue_notifications)
+
+        return Response(
+            {"detail": "Appointment rescheduled.", "appointment_id": aid},
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=["post"], url_path="book-by-provider")
+    def book_by_provider(self, request):
+        """Book a follow-up visit after a COMPLETED appointment (new BOOKED row)."""
+        import logging
+
+        from .chiropractic_booking_policy import chiropractic_booking_must_use_intake
+        from .provider_self_schedule import (
+            compute_end_time_for_slot,
+            parse_appointment_date,
+            parse_start_time_value,
+            user_may_book_as_provider,
+            user_may_manage_appointment,
+            validate_slot_for_online_booking_rules,
+        )
+
+        logger = logging.getLogger(__name__)
+
+        try:
+            source_id = int(request.data.get("source_appointment_id"))
+        except (TypeError, ValueError):
+            return Response({"detail": "source_appointment_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        src = Appointment.objects.select_related("patient", "provider", "booked_service").filter(pk=source_id).first()
+        if not src:
+            return Response({"detail": "Source appointment not found."}, status=status.HTTP_400_BAD_REQUEST)
+        if src.status != Appointment.Status.COMPLETED:
+            return Response(
+                {"detail": "Book next is only available after a completed visit."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not user_may_manage_appointment(request.user, src):
+            return Response(
+                {"detail": "You do not have access to this appointment."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        patient = src.patient
+
+        try:
+            service_id = int(request.data.get("service_id"))
+            provider_id = int(request.data.get("provider_id"))
+        except (TypeError, ValueError):
+            return Response({"detail": "service_id and provider_id are required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        date_raw = (request.data.get("appointment_date") or "").strip()
+        time_raw = request.data.get("start_time")
+        appt_date = parse_appointment_date(date_raw)
+        if not appt_date:
+            return Response(
+                {"detail": "Invalid or missing appointment_date (use YYYY-MM-DD)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        start_t = parse_start_time_value(time_raw if time_raw is not None else "")
+        if not start_t:
+            return Response({"detail": "Invalid or missing start_time."}, status=status.HTTP_400_BAD_REQUEST)
+
+        service = Service.objects.filter(pk=service_id, is_active=True, show_in_public_booking=True).first()
+        provider = Provider.objects.filter(pk=provider_id, active=True).first()
+        if not service or not provider:
+            return Response({"detail": "Invalid service or provider."}, status=status.HTTP_400_BAD_REQUEST)
+        if not provider_can_offer_service_online(provider, service):
+            return Response(
+                {"detail": "This provider does not offer the selected service."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not user_may_book_as_provider(request.user, provider):
+            return Response({"detail": "You cannot book for that provider."}, status=status.HTTP_403_FORBIDDEN)
+
+        lapse_msg = chiropractic_booking_must_use_intake(patient, service)
+        if lapse_msg:
+            return Response({"detail": lapse_msg}, status=status.HTTP_400_BAD_REQUEST)
+
+        err, is_conflict = validate_slot_for_online_booking_rules(
+            provider=provider,
+            service=service,
+            appt_date=appt_date,
+            start_time=start_t,
+            exclude_appointment_id=None,
+        )
+        if err:
+            code = status.HTTP_409_CONFLICT if is_conflict else status.HTTP_400_BAD_REQUEST
+            return Response({"detail": err}, status=code)
+
+        end_t = compute_end_time_for_slot(appt_date, start_t, service)
+
+        with transaction.atomic():
+            err2, is_conflict2 = validate_slot_for_online_booking_rules(
+                provider=provider,
+                service=service,
+                appt_date=appt_date,
+                start_time=start_t,
+                exclude_appointment_id=None,
+            )
+            if err2:
+                code = status.HTTP_409_CONFLICT if is_conflict2 else status.HTTP_400_BAD_REQUEST
+                return Response({"detail": err2}, status=code)
+            new_appt = Appointment.objects.create(
+                patient=patient,
+                provider=provider,
+                booked_service=service,
+                appointment_date=appt_date,
+                start_time=start_t,
+                end_time=end_t,
+                status=Appointment.Status.BOOKED,
+            )
+
+        aid = new_appt.pk
+
+        def queue_calendar():
+            from apps.notifications.tasks import sync_appointment_google_calendar_task
+
+            try:
+                sync_appointment_google_calendar_task.delay(aid)
+            except Exception:
+                logger.exception("Post-commit dispatch failed (calendar) book-next appt=%s", aid)
+
+        def queue_provider_notify():
+            from apps.notifications.tasks import notify_provider_new_booking_task
+
+            try:
+                notify_provider_new_booking_task.delay(aid)
+            except Exception:
+                logger.exception("Post-commit dispatch failed (provider notify) book-next appt=%s", aid)
+
+        def queue_patient_msgs():
+            from apps.notifications.tasks import (
+                send_provider_dashboard_book_next_patient_email_task,
+                send_provider_dashboard_book_next_patient_sms_task,
+            )
+
+            try:
+                send_provider_dashboard_book_next_patient_sms_task.delay(aid)
+            except Exception:
+                logger.exception("Post-commit dispatch failed (sms) book-next appt=%s", aid)
+            try:
+                send_provider_dashboard_book_next_patient_email_task.delay(aid)
+            except Exception:
+                logger.exception("Post-commit dispatch failed (email) book-next appt=%s", aid)
+
+        def queue_in_app():
+            try:
+                from apps.clinic.in_app_notify import create_new_booking_in_app_notification
+
+                create_new_booking_in_app_notification(aid)
+            except Exception:
+                logger.exception("Post-commit in-app notify failed book-next appt=%s", aid)
+
+        transaction.on_commit(queue_calendar)
+        transaction.on_commit(queue_provider_notify)
+        transaction.on_commit(queue_patient_msgs)
+        transaction.on_commit(queue_in_app)
+
+        return Response(
+            {
+                "detail": "Next visit booked.",
+                "appointment_id": aid,
+            },
+            status=status.HTTP_200_OK,
         )
 
     @action(detail=True, methods=["post"])

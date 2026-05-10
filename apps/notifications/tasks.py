@@ -497,3 +497,356 @@ def notify_provider_schedule_change_task(
         out["current_provider"] = _send_provider_alert(provider=appt.provider, body=body)
 
     return out
+
+
+@shared_task
+def send_patient_cancel_confirmation_sms_task(appointment_id: int) -> str:
+    """Patient-facing SMS after public online cancel (requires sms_consent + phone)."""
+    from apps.clinic.models import Appointment
+    from apps.clinic.twilio_sms import patient_cancel_confirmation_sms_body, send_sms, twilio_configured
+
+    if not twilio_configured():
+        return "twilio_disabled"
+
+    appt = (
+        Appointment.objects.select_related("patient", "provider", "booked_service")
+        .filter(pk=appointment_id)
+        .first()
+    )
+    if not appt:
+        return "appointment_missing"
+    if appt.status != Appointment.Status.CANCELLED:
+        return "not_cancelled"
+
+    patient = appt.patient
+    if not patient.sms_consent:
+        return "no_sms_consent"
+
+    to = (patient.phone or "").strip()
+    if not to:
+        return "no_phone"
+
+    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    date_disp = appt.appointment_date.strftime("%a %b %d, %Y")
+    time_disp = format_time_12h(appt.start_time)
+    body = patient_cancel_confirmation_sms_body(
+        service_name=service_name,
+        appt_date_display=date_disp,
+        appt_time_display=time_disp,
+        provider_display=str(appt.provider),
+    )
+    sid = send_sms(to_e164=to, body=body)
+    logger.info("Patient cancel SMS: appt=%s to=%s sid=%s", appointment_id, to, sid)
+    return sid or "send_failed"
+
+
+@shared_task
+def send_patient_cancel_confirmation_email_task(appointment_id: int) -> str:
+    """Patient-facing email after public online cancel."""
+    from django.conf import settings as django_settings
+    from django.core.mail import send_mail
+
+    from apps.clinic.models import Appointment
+
+    if not (getattr(django_settings, "EMAIL_HOST", "") or "").strip():
+        return "email_not_configured"
+
+    appt = (
+        Appointment.objects.select_related("patient", "provider", "booked_service")
+        .filter(pk=appointment_id)
+        .first()
+    )
+    if not appt:
+        return "appointment_missing"
+    if appt.status != Appointment.Status.CANCELLED:
+        return "not_cancelled"
+
+    email = (appt.patient.email or "").strip()
+    if not email:
+        return "no_email"
+
+    first_name = appt.patient.first_name.strip() or "there"
+    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    date_disp = appt.appointment_date.strftime("%A, %B %d, %Y")
+    time_disp = format_time_12h(appt.start_time)
+    provider_name = str(appt.provider)
+
+    subject = "Appointment Cancelled — Relief Chiropractic"
+    body = (
+        f"Hi {first_name},\n\n"
+        f"Your {service_name} appointment on {date_disp} at {time_disp} with {provider_name} has been cancelled.\n\n"
+        f"Questions? Call us at +1 (269) 408-0303.\n\n"
+        f"If you'd like to rebook, visit book.reliefchiropractic.net\n\n"
+        f"— Relief Chiropractic Team"
+    )
+
+    try:
+        send_mail(
+            subject=subject,
+            message=body,
+            from_email=django_settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email],
+            fail_silently=False,
+        )
+        logger.info("Patient cancel email sent: appt=%s to=%s", appointment_id, email)
+        return "sent"
+    except Exception:
+        logger.exception("Patient cancel email failed: appt=%s to=%s", appointment_id, email)
+        return "send_failed"
+
+
+@shared_task
+def send_patient_reschedule_confirmation_sms_task(appointment_id: int) -> str:
+    """Patient-facing SMS after public online reschedule (requires sms_consent + phone)."""
+    from apps.clinic.models import Appointment
+    from apps.clinic.twilio_sms import patient_reschedule_confirmation_sms_body, send_sms, twilio_configured
+
+    if not twilio_configured():
+        return "twilio_disabled"
+
+    appt = (
+        Appointment.objects.select_related("patient", "provider", "booked_service")
+        .filter(pk=appointment_id)
+        .first()
+    )
+    if not appt:
+        return "appointment_missing"
+    if appt.status != Appointment.Status.BOOKED:
+        return "not_booked"
+
+    patient = appt.patient
+    if not patient.sms_consent:
+        return "no_sms_consent"
+
+    to = (patient.phone or "").strip()
+    if not to:
+        return "no_phone"
+
+    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    date_disp = appt.appointment_date.strftime("%a %b %d, %Y")
+    time_disp = format_time_12h(appt.start_time)
+    body = patient_reschedule_confirmation_sms_body(
+        service_name=service_name,
+        appt_date_display=date_disp,
+        appt_time_display=time_disp,
+        provider_display=str(appt.provider),
+    )
+    sid = send_sms(to_e164=to, body=body)
+    logger.info("Patient reschedule SMS: appt=%s to=%s sid=%s", appointment_id, to, sid)
+    return sid or "send_failed"
+
+
+@shared_task
+def send_patient_reschedule_confirmation_email_task(appointment_id: int) -> str:
+    """Patient-facing email after public online reschedule."""
+    from django.conf import settings as django_settings
+    from django.core.mail import send_mail
+
+    from apps.clinic.models import Appointment
+
+    if not (getattr(django_settings, "EMAIL_HOST", "") or "").strip():
+        return "email_not_configured"
+
+    appt = (
+        Appointment.objects.select_related("patient", "provider", "booked_service")
+        .filter(pk=appointment_id)
+        .first()
+    )
+    if not appt:
+        return "appointment_missing"
+    if appt.status != Appointment.Status.BOOKED:
+        return "not_booked"
+
+    email = (appt.patient.email or "").strip()
+    if not email:
+        return "no_email"
+
+    first_name = appt.patient.first_name.strip() or "there"
+    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    date_disp = appt.appointment_date.strftime("%A, %B %d, %Y")
+    time_disp = format_time_12h(appt.start_time)
+    provider_name = str(appt.provider)
+
+    subject = "Appointment Rescheduled — Relief Chiropractic"
+    body = (
+        f"Hi {first_name},\n\n"
+        f"Your {service_name} appointment has been moved to {date_disp} at {time_disp} with {provider_name}.\n\n"
+        f"Questions? Call us at +1 (269) 408-0303.\n\n"
+        f"If you need to make further changes, visit book.reliefchiropractic.net\n\n"
+        f"— Relief Chiropractic Team"
+    )
+
+    try:
+        send_mail(
+            subject=subject,
+            message=body,
+            from_email=django_settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email],
+            fail_silently=False,
+        )
+        logger.info("Patient reschedule email sent: appt=%s to=%s", appointment_id, email)
+        return "sent"
+    except Exception:
+        logger.exception("Patient reschedule email failed: appt=%s to=%s", appointment_id, email)
+        return "send_failed"
+
+
+@shared_task
+def send_provider_dashboard_reschedule_patient_sms_task(appointment_id: int) -> str:
+    """Doctor/staff rescheduled from dashboard — transactional SMS (sms_consent + phone)."""
+    from apps.clinic.models import Appointment
+    from apps.clinic.twilio_sms import provider_dashboard_reschedule_patient_sms_body, send_sms, twilio_configured
+
+    if not twilio_configured():
+        return "twilio_disabled"
+    appt = (
+        Appointment.objects.select_related("patient", "provider", "booked_service")
+        .filter(pk=appointment_id)
+        .first()
+    )
+    if not appt:
+        return "appointment_missing"
+    p = appt.patient
+    if not p.sms_consent:
+        return "no_sms_consent"
+    to = (p.phone or "").strip()
+    if not to:
+        return "no_phone"
+    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    date_disp = appt.appointment_date.strftime("%a %b %d, %Y")
+    time_disp = format_time_12h(appt.start_time)
+    body = provider_dashboard_reschedule_patient_sms_body(
+        service_name=service_name,
+        appt_date_display=date_disp,
+        appt_time_display=time_disp,
+        provider_display=str(appt.provider),
+    )
+    sid = send_sms(to_e164=to, body=body)
+    logger.info("Provider dashboard reschedule SMS: appt=%s to=%s sid=%s", appointment_id, to, sid)
+    return sid or "send_failed"
+
+
+@shared_task
+def send_provider_dashboard_reschedule_patient_email_task(appointment_id: int) -> str:
+    from django.conf import settings as django_settings
+    from django.core.mail import send_mail
+
+    from apps.clinic.models import Appointment
+
+    if not (getattr(django_settings, "EMAIL_HOST", "") or "").strip():
+        return "email_not_configured"
+    appt = (
+        Appointment.objects.select_related("patient", "provider", "booked_service")
+        .filter(pk=appointment_id)
+        .first()
+    )
+    if not appt:
+        return "appointment_missing"
+    email = (appt.patient.email or "").strip()
+    if not email:
+        return "no_email"
+    first = appt.patient.first_name.strip() or "there"
+    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    date_disp = appt.appointment_date.strftime("%A, %B %d, %Y")
+    time_disp = format_time_12h(appt.start_time)
+    prov = str(appt.provider)
+    subject = "Appointment Rescheduled — Relief Chiropractic"
+    body = (
+        f"Hi {first},\n\n"
+        f"Your {service_name} appointment has been moved to {date_disp} at {time_disp} with {prov}.\n\n"
+        f"Questions? Call us at +1 (269) 408-0303.\n\n"
+        f"If you need to make further changes, visit book.reliefchiropractic.net\n\n"
+        f"— Relief Chiropractic Team"
+    )
+    try:
+        send_mail(
+            subject=subject,
+            message=body,
+            from_email=django_settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email],
+            fail_silently=False,
+        )
+        logger.info("Provider dashboard reschedule email: appt=%s to=%s", appointment_id, email)
+        return "sent"
+    except Exception:
+        logger.exception("Provider dashboard reschedule email failed: appt=%s", appointment_id)
+        return "send_failed"
+
+
+@shared_task
+def send_provider_dashboard_book_next_patient_sms_task(appointment_id: int) -> str:
+    """Same as public booking confirmation SMS path: phone on file, no extra consent check."""
+    from apps.clinic.models import Appointment
+    from apps.clinic.twilio_sms import provider_dashboard_book_next_patient_sms_body, send_sms, twilio_configured
+
+    if not twilio_configured():
+        return "twilio_disabled"
+    appt = (
+        Appointment.objects.select_related("patient", "provider", "booked_service")
+        .filter(pk=appointment_id)
+        .first()
+    )
+    if not appt:
+        return "appointment_missing"
+    to = (appt.patient.phone or "").strip()
+    if not to:
+        return "no_phone"
+    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    date_disp = appt.appointment_date.strftime("%a %b %d, %Y")
+    time_disp = format_time_12h(appt.start_time)
+    body = provider_dashboard_book_next_patient_sms_body(
+        service_name=service_name,
+        appt_date_display=date_disp,
+        appt_time_display=time_disp,
+        provider_display=str(appt.provider),
+    )
+    sid = send_sms(to_e164=to, body=body)
+    logger.info("Provider dashboard book-next SMS: appt=%s to=%s sid=%s", appointment_id, to, sid)
+    return sid or "send_failed"
+
+
+@shared_task
+def send_provider_dashboard_book_next_patient_email_task(appointment_id: int) -> str:
+    from django.conf import settings as django_settings
+    from django.core.mail import send_mail
+
+    from apps.clinic.models import Appointment
+
+    if not (getattr(django_settings, "EMAIL_HOST", "") or "").strip():
+        return "email_not_configured"
+    appt = (
+        Appointment.objects.select_related("patient", "provider", "booked_service")
+        .filter(pk=appointment_id)
+        .first()
+    )
+    if not appt:
+        return "appointment_missing"
+    email = (appt.patient.email or "").strip()
+    if not email:
+        return "no_email"
+    first = appt.patient.first_name.strip() or "there"
+    service_name = appt.booked_service.name if appt.booked_service else "appointment"
+    date_disp = appt.appointment_date.strftime("%A, %B %d, %Y")
+    time_disp = format_time_12h(appt.start_time)
+    prov = str(appt.provider)
+    subject = "Appointment Booked — Relief Chiropractic"
+    body = (
+        f"Hi {first},\n\n"
+        f"Your next {service_name} appointment has been booked for {date_disp} at {time_disp} with {prov}.\n\n"
+        f"Questions? Call us at +1 (269) 408-0303.\n\n"
+        f"If you need to make changes, visit book.reliefchiropractic.net\n\n"
+        f"— Relief Chiropractic Team"
+    )
+    try:
+        send_mail(
+            subject=subject,
+            message=body,
+            from_email=django_settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email],
+            fail_silently=False,
+        )
+        logger.info("Provider dashboard book-next email: appt=%s to=%s", appointment_id, email)
+        return "sent"
+    except Exception:
+        logger.exception("Provider dashboard book-next email failed: appt=%s", appointment_id)
+        return "send_failed"

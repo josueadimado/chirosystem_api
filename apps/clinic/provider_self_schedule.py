@@ -1,0 +1,128 @@
+"""Provider dashboard: reschedule and book-next using the same slot rules as public online booking."""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, timedelta
+
+from django.utils import timezone
+
+from apps.clinic.booking_availability import provider_interval_blocked_online
+from apps.clinic.booking_provider_eligibility import provider_can_offer_service_online
+from apps.clinic.models import Appointment, Patient, Provider, Service
+from apps.clinic.online_booking_hours import PUBLIC_BOOKING_HOURS_BLURB, interval_outside_effective_public_window
+from apps.clinic.public_booking_service import public_online_booking_calendar_span_minutes
+
+
+def user_may_manage_appointment(user, appointment: Appointment) -> bool:
+    role = getattr(user, "role", None)
+    if role in ("owner_admin", "staff"):
+        return True
+    if role == "doctor":
+        prov = Provider.objects.filter(user=user).first()
+        return bool(prov and prov.id == appointment.provider_id)
+    return False
+
+
+def user_may_book_as_provider(user, provider: Provider) -> bool:
+    """Doctors may only create bookings on their own calendar; owner/staff may pick any provider."""
+    role = getattr(user, "role", None)
+    if role in ("owner_admin", "staff"):
+        return True
+    if role == "doctor":
+        prov = Provider.objects.filter(user=user).first()
+        return bool(prov and prov.id == provider.id)
+    return False
+
+
+def parse_appointment_date(date_str: str):
+    try:
+        return datetime.strptime(date_str.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def parse_start_time_value(raw: str):
+    """
+    Accept HH:MM, HH:MM:SS, or a public-booking slot label like '9:30 AM'.
+    """
+    if not raw or not str(raw).strip():
+        return None
+    s = str(raw).strip()
+    if re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", s):
+        parts = s.split(":")
+        h = int(parts[0])
+        m = int(parts[1])
+        sec = int(parts[2]) if len(parts) > 2 else 0
+        return datetime(2000, 1, 1, h % 24, min(m, 59), min(sec, 59)).time()
+    m = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)$", s, re.I)
+    if not m:
+        return None
+    h = int(m.group(1))
+    mi = int(m.group(2))
+    ap = m.group(3).upper()
+    if ap == "PM" and h != 12:
+        h += 12
+    if ap == "AM" and h == 12:
+        h = 0
+    return datetime(2000, 1, 1, h, mi, 0).time()
+
+
+def validate_slot_for_online_booking_rules(
+    *,
+    provider: Provider,
+    service: Service,
+    appt_date,
+    start_time,
+    exclude_appointment_id: int | None,
+) -> tuple[str | None, bool]:
+    """
+    Returns (error_message, is_conflict).
+    error_message is None when the slot is valid.
+    """
+    today = timezone.localdate()
+    if appt_date < today:
+        return "Pick today or a future date.", False
+
+    slot_dt = timezone.make_aware(datetime.combine(appt_date, start_time))
+    if appt_date == today and slot_dt <= timezone.now():
+        return "Pick a time later today that has not passed yet.", False
+
+    start_dt = datetime.combine(appt_date, start_time)
+    span = public_online_booking_calendar_span_minutes(service)
+    end_dt = start_dt + timedelta(minutes=span)
+    st_t = start_dt.time()
+    en_t = end_dt.time()
+
+    if interval_outside_effective_public_window(appt_date, st_t, en_t, service):
+        return PUBLIC_BOOKING_HOURS_BLURB, False
+
+    if provider_interval_blocked_online(provider.pk, appt_date, st_t, en_t):
+        return "That time is not open for online booking with this provider. Please pick another slot.", False
+
+    overlapping = Appointment.objects.filter(
+        provider=provider,
+        appointment_date=appt_date,
+        start_time__lt=en_t,
+        end_time__gt=st_t,
+    ).exclude(
+        status__in=[
+            Appointment.Status.CANCELLED,
+            Appointment.Status.NO_SHOW,
+            Appointment.Status.COMPLETED,
+        ]
+    )
+    if exclude_appointment_id:
+        overlapping = overlapping.exclude(pk=exclude_appointment_id)
+
+    if overlapping.exists():
+        return "That time slot is no longer available. Please choose another time.", True
+
+    return None, False
+
+
+def compute_end_time_for_slot(appt_date, start_time, service: Service):
+    start_dt = datetime.combine(appt_date, start_time)
+    span = public_online_booking_calendar_span_minutes(service)
+    end_dt = start_dt + timedelta(minutes=span)
+    return end_dt.time()

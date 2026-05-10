@@ -68,6 +68,64 @@ def sms_footer() -> str:
     return " Reply STOP to opt out."
 
 
+# Patient-facing self-service (public booking): clinic callback number shown in SMS.
+CLINIC_PHONE_SELF_SERVICE_DISPLAY = "+1 (269) 408-0303"
+
+
+def patient_cancel_confirmation_sms_body(
+    *,
+    service_name: str,
+    appt_date_display: str,
+    appt_time_display: str,
+    provider_display: str,
+) -> str:
+    return (
+        f"Relief Chiropractic: Your {service_name} appointment on {appt_date_display} at {appt_time_display} "
+        f"with {provider_display} has been cancelled. Questions? Call us at {CLINIC_PHONE_SELF_SERVICE_DISPLAY}.{sms_footer()}"
+    )
+
+
+def patient_reschedule_confirmation_sms_body(
+    *,
+    service_name: str,
+    appt_date_display: str,
+    appt_time_display: str,
+    provider_display: str,
+) -> str:
+    return (
+        f"Relief Chiropractic: Your {service_name} appointment has been moved to {appt_date_display} at {appt_time_display} "
+        f"with {provider_display}. Questions? Call us at {CLINIC_PHONE_SELF_SERVICE_DISPLAY}.{sms_footer()}"
+    )
+
+
+def provider_dashboard_reschedule_patient_sms_body(
+    *,
+    service_name: str,
+    appt_date_display: str,
+    appt_time_display: str,
+    provider_display: str,
+) -> str:
+    """Patient SMS after provider/staff reschedules from the doctor dashboard."""
+    return (
+        f"Relief Chiropractic: Your {service_name} appointment has been moved to {appt_date_display} at {appt_time_display} "
+        f"with {provider_display}. Questions? Call us at +1 (269) 408-0303.{sms_footer()}"
+    )
+
+
+def provider_dashboard_book_next_patient_sms_body(
+    *,
+    service_name: str,
+    appt_date_display: str,
+    appt_time_display: str,
+    provider_display: str,
+) -> str:
+    """Patient SMS after provider/staff books a follow-up visit from the dashboard."""
+    return (
+        f"Relief Chiropractic: Your next {service_name} appointment has been booked for {appt_date_display} at {appt_time_display} "
+        f"with {provider_display}. Questions? Call us at +1 (269) 408-0303.{sms_footer()}"
+    )
+
+
 def booking_confirmation_body(
     *,
     first_name: str,

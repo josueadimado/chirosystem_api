@@ -6,6 +6,7 @@ Used by the REST `book` action and by the Twilio voice assistant webhook.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -22,6 +23,8 @@ from .online_booking_hours import PUBLIC_BOOKING_HOURS_BLURB, interval_outside_e
 from .models import Appointment, Patient, Provider, Service, Visit
 from .patient_phone import get_or_create_patient_for_public_booking, patient_matches_phone_normalized
 from .utils import format_time_12h, normalize_phone
+
+logger = logging.getLogger(__name__)
 
 # Post-massage turnover reserved on the provider calendar for public online booking (not billed time).
 MASSAGE_PUBLIC_BOOKING_BUFFER_AFTER_MINUTES = 15
@@ -197,6 +200,52 @@ def create_appointment_from_public_booking(validated: dict) -> tuple[Appointment
     return appointment, None
 
 
+def _queue_patient_self_service_notifications(appointment_id: int, kind: str) -> None:
+    """
+    Dispatch patient SMS/email after public cancel or reschedule commits.
+    Same Celery + sync fallback pattern as new-booking confirmations; failures only log.
+    """
+    from apps.notifications.tasks import (
+        send_patient_cancel_confirmation_email_task,
+        send_patient_cancel_confirmation_sms_task,
+        send_patient_reschedule_confirmation_email_task,
+        send_patient_reschedule_confirmation_sms_task,
+    )
+
+    if kind == "cancel":
+        specs: list[tuple[str, object]] = [
+            ("sms", send_patient_cancel_confirmation_sms_task),
+            ("email", send_patient_cancel_confirmation_email_task),
+        ]
+    elif kind == "reschedule":
+        specs = [
+            ("sms", send_patient_reschedule_confirmation_sms_task),
+            ("email", send_patient_reschedule_confirmation_email_task),
+        ]
+    else:
+        return
+
+    for label, task_fn in specs:
+        try:
+            task_fn.delay(appointment_id)
+        except Exception:
+            logger.warning(
+                "Celery dispatch failed for patient %s confirmation %s (appt %s), running synchronously",
+                kind,
+                label,
+                appointment_id,
+            )
+            try:
+                task_fn(appointment_id)
+            except Exception:
+                logger.exception(
+                    "Sync fallback failed for patient %s confirmation %s (appt %s)",
+                    kind,
+                    label,
+                    appointment_id,
+                )
+
+
 def reschedule_appointment_public(
     *,
     phone_normalized: str,
@@ -354,6 +403,11 @@ def reschedule_appointment_public(
     transaction.on_commit(queue_doctor_alerts)
     transaction.on_commit(queue_in_app)
 
+    def queue_patient_confirmations():
+        _queue_patient_self_service_notifications(aid, "reschedule")
+
+    transaction.on_commit(queue_patient_confirmations)
+
     return appt, None
 
 
@@ -390,22 +444,33 @@ def cancel_appointment_public(*, phone_normalized: str, appointment_id: int) -> 
         svc and svc.service_type == Service.ServiceType.MASSAGE and notice < timedelta(hours=24)
     )
 
+    locked: Appointment | None = None
     try:
         with transaction.atomic():
-            locked = (
-                Appointment.objects.select_for_update()
-                .select_related("patient", "booked_service", "provider")
-                .get(pk=appt.id)
-            )
+            try:
+                locked = (
+                    Appointment.objects.select_for_update()
+                    .select_related("patient", "booked_service", "provider")
+                    .get(pk=appt.id)
+                )
+            except Appointment.DoesNotExist:
+                return None, "We could not find that appointment."
+
             if locked.status != Appointment.Status.BOOKED:
                 return None, "This visit can no longer be cancelled online. Please call the clinic."
             svc_locked = locked.booked_service
             if apply_late_massage_fee and svc_locked:
                 fee = svc_locked.price or Decimal("0")
                 if fee > 0:
-                    from .no_show_billing import apply_late_cancel_fee_for_appointment
+                    try:
+                        from .no_show_billing import apply_late_cancel_fee_for_appointment
 
-                    apply_late_cancel_fee_for_appointment(locked, fee)
+                        apply_late_cancel_fee_for_appointment(locked, fee)
+                    except Exception:
+                        logger.exception(
+                            "Late cancel fee could not be applied; continuing with cancellation appointment_id=%s",
+                            locked.id,
+                        )
             locked.status = Appointment.Status.CANCELLED
             locked.checked_in_at = None
             locked.consultation_started_at = None
@@ -428,13 +493,25 @@ def cancel_appointment_public(*, phone_normalized: str, appointment_id: int) -> 
             return None, inner if isinstance(inner, str) else str(inner)
         return None, str(detail)
 
+    assert locked is not None
     aid = locked.id
 
     def queue_calendar():
-        from apps.notifications.tasks import sync_appointment_google_calendar_task
+        try:
+            from apps.notifications.tasks import sync_appointment_google_calendar_task
 
-        sync_appointment_google_calendar_task.delay(aid)
+            sync_appointment_google_calendar_task.delay(aid)
+        except Exception:
+            logger.exception(
+                "Could not queue Google Calendar sync after cancellation appointment_id=%s",
+                aid,
+            )
 
     transaction.on_commit(queue_calendar)
+
+    def queue_patient_confirmations():
+        _queue_patient_self_service_notifications(aid, "cancel")
+
+    transaction.on_commit(queue_patient_confirmations)
 
     return locked, None

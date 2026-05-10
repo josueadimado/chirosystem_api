@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+
 from .models import Patient
 from .utils import normalize_phone
+
+logger = logging.getLogger(__name__)
 
 
 def patient_matches_phone_normalized(patient: Patient, phone_normalized: str) -> bool:
@@ -16,7 +20,15 @@ def patient_matches_phone_normalized(patient: Patient, phone_normalized: str) ->
         return False
     if (patient.phone or "").strip() == phone_normalized:
         return True
-    return normalize_phone(patient.phone) == phone_normalized
+    try:
+        return normalize_phone(patient.phone) == phone_normalized
+    except Exception:
+        logger.warning(
+            "normalize_phone failed for patient_id=%s",
+            getattr(patient, "pk", None),
+            exc_info=True,
+        )
+        return False
 
 
 def patients_matching_phone(phone_normalized: str) -> list[Patient]:
