@@ -1875,11 +1875,17 @@ class AdminViewSet(viewsets.ViewSet):
         ):
             if a.status == Appointment.Status.CHECKED_IN:
                 recent_activity.append(
-                    f"{a.patient.first_name} {a.patient.last_name} completed check-in."
+                    {
+                        "text": f"{a.patient.first_name} {a.patient.last_name} completed check-in.",
+                        "kind": "check_in",
+                    }
                 )
             elif a.status == Appointment.Status.COMPLETED:
                 recent_activity.append(
-                    f"{a.patient.first_name} {a.patient.last_name} completed visit."
+                    {
+                        "text": f"{a.patient.first_name} {a.patient.last_name} completed visit.",
+                        "kind": "completed",
+                    }
                 )
         for p in _defer_patient_card_fields(
             Payment.objects.select_related("invoice__patient")
@@ -1888,8 +1894,13 @@ class AdminViewSet(viewsets.ViewSet):
             patient_prefix="invoice__patient",
         ):
             recent_activity.append(
-                f"Invoice paid by {p.invoice.patient.first_name} {p.invoice.patient.last_name}."
+                {
+                    "text": f"Invoice paid by {p.invoice.patient.first_name} {p.invoice.patient.last_name}.",
+                    "kind": "payment",
+                }
             )
+
+        now_local = timezone.localtime(timezone.now())
 
         return Response({
             "appointments_today": appointments_today,
@@ -1899,6 +1910,8 @@ class AdminViewSet(viewsets.ViewSet):
             "unpaid_invoices": unpaid_invoices,
             "today_schedule": today_schedule,
             "recent_activity": recent_activity[:10],
+            "today_display": today.strftime("%A, %B %d, %Y"),
+            "as_of_display": now_local.strftime("%I:%M %p"),
         })
 
     def _admin_staff_only(self, request):
