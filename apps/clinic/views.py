@@ -441,12 +441,17 @@ class BookingOptionsViewSet(viewsets.ViewSet):
 
         win = effective_public_booking_window_minutes(appt_date, service)
         if win is None:
-            return Response({"available_slots": [], "slot_start_times": []})
+            return Response({"available_slots": [], "slot_start_times": [], "slot_grid": []})
         day_start, day_end = win
 
         required_span = public_online_booking_calendar_span_minutes(service)
         closing_compliance_span = public_booking_treatment_duration_minutes(service)
         SLOT_INTERVAL = CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES
+
+        def _slot_label(h: int, m: int) -> str:
+            suffix = "AM" if h < 12 else "PM"
+            display_h = h if 1 <= h <= 12 else (h - 12 if h > 12 else 12)
+            return f"{display_h}:{m:02d} {suffix}"
 
         busy_qs = Appointment.objects.filter(
             provider=provider,
@@ -560,29 +565,36 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                 taken.add(m)
 
         last_slot_start = public_booking_last_slot_start_minute(appt_date, day_end)
-        available = []
-        slot_start_times = []
+        slot_grid: list[dict[str, object]] = []
+        available: list[str] = []
+        slot_start_times: list[str] = []
         cursor = day_start
         while cursor <= last_slot_start:
-            if cursor + closing_compliance_span <= day_end and not any(
-                cursor <= t < cursor + required_span for t in taken
-            ):
-                h, m = divmod(cursor, 60)
-                slot_start_time = time_cls(hour=h, minute=m)
-                end_total = cursor + required_span
-                end_h, end_m = divmod(end_total, 60)
-                if end_h >= 24:
-                    end_h, end_m = 23, 59
-                slot_end_time = time_cls(hour=end_h, minute=end_m)
-                if not provider_interval_blocked_online(provider.pk, appt_date, slot_start_time, slot_end_time):
-                    suffix = "AM" if h < 12 else "PM"
-                    display_h = h if 1 <= h <= 12 else (h - 12 if h > 12 else 12)
-                    label = f"{display_h}:{m:02d} {suffix}"
-                    available.append(label)
-                    slot_start_times.append(slot_start_time.strftime("%H:%M:%S"))
+            h, m = divmod(cursor, 60)
+            slot_start_time = time_cls(hour=h, minute=m)
+            end_total = cursor + required_span
+            end_h, end_m = divmod(end_total, 60)
+            if end_h >= 24:
+                end_h, end_m = 23, 59
+            slot_end_time = time_cls(hour=end_h, minute=end_m)
+            label = _slot_label(h, m)
+            fits_close = cursor + closing_compliance_span <= day_end
+            free = not any(cursor <= t < cursor + required_span for t in taken)
+            not_blocked = (
+                fits_close
+                and free
+                and not provider_interval_blocked_online(provider.pk, appt_date, slot_start_time, slot_end_time)
+            )
+            bookable = not_blocked
+            slot_grid.append({"label": label, "bookable": bookable})
+            if bookable:
+                available.append(label)
+                slot_start_times.append(slot_start_time.strftime("%H:%M:%S"))
             cursor += SLOT_INTERVAL
 
-        return Response({"available_slots": available, "slot_start_times": slot_start_times})
+        return Response(
+            {"available_slots": available, "slot_start_times": slot_start_times, "slot_grid": slot_grid},
+        )
 
     @action(detail=False, methods=["get"], url_path="patient-lookup")
     def patient_lookup(self, request):

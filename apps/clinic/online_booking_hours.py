@@ -8,7 +8,7 @@ Combines ClinicSettings.business_hours with fixed rules:
 - Friday: both services 7:00 AM–4:00 PM; the same grid runs through **3:45 PM** last start (before 4:00 PM close).
 - Saturday & Sunday: no online booking.
 
-The effective window is the intersection of clinic hours and these rules for close; Friday open follows policy.
+The effective window is the intersection of clinic hours and these rules for **open**; **close** online follows policy.
 """
 
 from __future__ import annotations
@@ -88,8 +88,9 @@ def effective_public_booking_window_minutes(appt_date: date, service: Service) -
     Minutes from midnight [open, close): last *patient visit* may end at ``close`` (exclusive of minute ``close``
     is not required — we use ``start + duration_minutes <= close`` for slot generation and validation).
 
-    Friday uses policy open time (7:00) even if ``business_hours`` still lists a later start, so online booking
-    matches the clinic’s stated Friday schedule; close is still intersected with clinic hours.
+    Friday uses policy open time (7:00) even if ``business_hours`` still lists a later start. **Close** for online
+    booking uses **policy** (6:00 PM Mon–Thu, 4:00 PM Fri) so stale or conservative clinic JSON cannot cut off
+    the public grid early; the clinic must still be marked open that day in ``business_hours``.
     """
     policy = _hard_policy_open_close_minutes(appt_date, service)
     if policy is None:
@@ -104,7 +105,8 @@ def effective_public_booking_window_minutes(appt_date: date, service: Service) -
         a = p_open
     else:
         a = max(c_open, p_open)
-    b = min(c_close, p_close)
+    # Online closing follows policy (not min with clinic) so the 15-min grid can reach 5:45 / 3:45 as intended.
+    b = p_close
     if a >= b:
         return None
     return a, b
