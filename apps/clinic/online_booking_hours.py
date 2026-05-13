@@ -2,10 +2,10 @@
 Public (web/voice) booking time windows.
 
 Combines ClinicSettings.business_hours with fixed rules:
-- Monday–Thursday: chiropractic 8:00 AM–6:00 PM, massage 9:00 AM–6:00 PM (the *visit* must end by closing;
-  massage turnover buffer after the visit does not cut off the last bookable start time).
-- Friday: both services 7:00 AM–4:00 PM (visit end by 4:00 PM). Online window opens at policy time even if
-  legacy clinic JSON still lists a later Friday start — update Settings → business hours to match signage.
+- Monday–Thursday: chiropractic 8:00 AM–6:00 PM, massage 9:00 AM–6:00 PM. Public start times use a fixed 15-minute
+  grid through **5:45 PM** (last offered start tick); a slot is only offered if the *visit* ends by closing
+  (e.g. 60 min cannot start at 5:45). Massage calendar blocking still uses duration + post-visit buffer.
+- Friday: both services 7:00 AM–4:00 PM; the same grid runs through **3:45 PM** last start (before 4:00 PM close).
 - Saturday & Sunday: no online booking.
 
 The effective window is the intersection of clinic hours and these rules for close; Friday open follows policy.
@@ -18,9 +18,12 @@ from datetime import date, time
 
 from .models import ClinicSettings, Service
 
-# Chiropractic: one shared public schedule grid — offered start times every N minutes (e.g. 8:00, 8:15, 8:30).
-# Each visit still occupies its full duration_minutes on the calendar (45 min = three 15-min cells).
+# Public online booking: one shared 15-minute start grid for all services (chiro + massage).
+# Last *start* on the grid: 5:45 PM Mon–Thu, 3:45 PM Fri — capped by clinic/policy close minus one step.
+# Whether a start is *bookable* still requires start + duration_minutes <= close (visit ends by closing).
 CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES = 15
+PUBLIC_BOOKING_LAST_SLOT_START_MON_THU_MIN = 17 * 60 + 45  # 5:45 PM
+PUBLIC_BOOKING_LAST_SLOT_START_FRIDAY_MIN = 15 * 60 + 45  # 3:45 PM (15 min before 4:00 PM close)
 
 
 def _hard_policy_open_close_minutes(appt_date: date, service: Service) -> tuple[int, int] | None:
@@ -116,6 +119,24 @@ def public_booking_treatment_duration_minutes(service: Service) -> int:
     return max(5, n)
 
 
+def public_booking_last_slot_start_minute(appt_date: date, day_close_minute: int) -> int:
+    """
+    Inclusive last 15-minute *start* minute on the public grid for that calendar day.
+
+    Policy caps: 5:45 PM Mon–Thu, 3:45 PM Fri — never past ``day_close_minute - slot_step`` so at least one
+    15-minute cell fits before closing.
+    """
+    step = CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES
+    cap_by_close = day_close_minute - step
+    if appt_date.weekday() >= 5:
+        return cap_by_close
+    if appt_date.weekday() == 4:
+        policy_last = PUBLIC_BOOKING_LAST_SLOT_START_FRIDAY_MIN
+    else:
+        policy_last = PUBLIC_BOOKING_LAST_SLOT_START_MON_THU_MIN
+    return min(policy_last, cap_by_close)
+
+
 def interval_outside_effective_public_window(appt_date: date, start: time, end: time, service: Service) -> bool:
     """True if the visit start is outside the window or the *treatment* (not buffer) ends after closing."""
     _ = end  # closing rule uses duration_minutes only; calendar span may include massage tail
@@ -131,5 +152,6 @@ def interval_outside_effective_public_window(appt_date: date, start: time, end: 
 PUBLIC_BOOKING_HOURS_BLURB = (
     "Online booking: Monday–Friday only (closed weekends). "
     "Chiropractic: 8:00 AM–6:00 PM Mon–Thu; massage: 9:00 AM–6:00 PM Mon–Thu; "
-    "Friday both lines 7:00 AM–4:00 PM. Last bookable time is when your visit can finish by closing."
+    "Friday both lines 7:00 AM–4:00 PM. Start times every 15 minutes through 5:45 PM Mon–Thu "
+    "and 3:45 PM Friday; each visit must end by closing."
 )

@@ -612,6 +612,7 @@ def _find_nearby_slots(
     from apps.clinic.online_booking_hours import (
         CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES,
         effective_public_booking_window_minutes,
+        public_booking_last_slot_start_minute,
         public_booking_treatment_duration_minutes,
     )
     from apps.clinic.public_booking_service import public_online_booking_calendar_span_minutes
@@ -632,6 +633,8 @@ def _find_nearby_slots(
         return []
     day_start, day_end = win
 
+    last_slot_start = public_booking_last_slot_start_minute(appt_date, day_end)
+
     taken = set()
     for s, e in (
         Appointment.objects.filter(provider=provider, appointment_date=appt_date)
@@ -647,8 +650,10 @@ def _find_nearby_slots(
     slots: list[tuple[int, str]] = []
     cursor = day_start
     target_min = rejected_time.hour * 60 + rejected_time.minute if rejected_time else 600
-    while cursor + closing_compliance_span <= day_end:
-        if not any(cursor <= t < cursor + required_span for t in taken):
+    while cursor <= last_slot_start:
+        if cursor + closing_compliance_span <= day_end and not any(
+            cursor <= t < cursor + required_span for t in taken
+        ):
             h, m = divmod(cursor, 60)
             st = time_cls(hour=h, minute=m)
             et_total = cursor + required_span

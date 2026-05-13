@@ -434,6 +434,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         from .online_booking_hours import (
             CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES,
             effective_public_booking_window_minutes,
+            public_booking_last_slot_start_minute,
             public_booking_treatment_duration_minutes,
         )
         from .patient_phone import patient_matches_phone_normalized
@@ -558,11 +559,14 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             for m in range(start_min, end_min):
                 taken.add(m)
 
+        last_slot_start = public_booking_last_slot_start_minute(appt_date, day_end)
         available = []
         slot_start_times = []
         cursor = day_start
-        while cursor + closing_compliance_span <= day_end:
-            if not any(cursor <= t < cursor + required_span for t in taken):
+        while cursor <= last_slot_start:
+            if cursor + closing_compliance_span <= day_end and not any(
+                cursor <= t < cursor + required_span for t in taken
+            ):
                 h, m = divmod(cursor, 60)
                 slot_start_time = time_cls(hour=h, minute=m)
                 end_total = cursor + required_span
