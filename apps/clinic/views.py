@@ -61,6 +61,7 @@ from .serializers import (
     PublicCancelSerializer,
     PublicRescheduleSerializer,
     ProviderSerializer,
+    ProviderUnavailabilityBulkSerializer,
     ProviderUnavailabilitySerializer,
     ServiceSerializer,
     StaffNotificationSerializer,
@@ -1038,6 +1039,41 @@ class ProviderUnavailabilityViewSet(viewsets.ModelViewSet):
     serializer_class = ProviderUnavailabilitySerializer
     permission_classes = [IsStaffOrOwnerAdmin]
     http_method_names = ["get", "post", "delete", "head", "options"]
+
+    @action(detail=False, methods=["post"], url_path="bulk")
+    def bulk(self, request):
+        """
+        Create identical blocks for each day from ``date_from`` through ``date_to`` (inclusive).
+        Use for recurring windows (e.g. same 30-minute lunch block every weekday for a month).
+        """
+        ser = ProviderUnavailabilityBulkSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        provider = data["provider"]
+        all_day = data["all_day"]
+        weekdays_only = data["weekdays_only"]
+        st = data.get("start_time")
+        et = data.get("end_time")
+        rows: list[ProviderUnavailability] = []
+        cur = data["date_from"]
+        end = data["date_to"]
+        while cur <= end:
+            if weekdays_only and cur.weekday() >= 5:
+                cur += timedelta(days=1)
+                continue
+            rows.append(
+                ProviderUnavailability(
+                    provider=provider,
+                    block_date=cur,
+                    all_day=all_day,
+                    start_time=None if all_day else st,
+                    end_time=None if all_day else et,
+                ),
+            )
+            cur += timedelta(days=1)
+        with transaction.atomic():
+            ProviderUnavailability.objects.bulk_create(rows, batch_size=500)
+        return Response({"created": len(rows)}, status=status.HTTP_201_CREATED)
 
     def get_queryset(self):
         qs = super().get_queryset().order_by("-block_date", "start_time")

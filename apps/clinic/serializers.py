@@ -219,6 +219,42 @@ class ProviderUnavailabilitySerializer(serializers.ModelSerializer):
         return attrs
 
 
+class ProviderUnavailabilityBulkSerializer(serializers.Serializer):
+    """Create the same online-booking block on every calendar day in an inclusive date range."""
+
+    provider = serializers.PrimaryKeyRelatedField(queryset=Provider.objects.filter(active=True))
+    date_from = serializers.DateField()
+    date_to = serializers.DateField()
+    all_day = serializers.BooleanField(default=True)
+    start_time = serializers.TimeField(required=False, allow_null=True)
+    end_time = serializers.TimeField(required=False, allow_null=True)
+    weekdays_only = serializers.BooleanField(
+        default=False,
+        help_text="If true, skip Saturday and Sunday when creating rows.",
+    )
+
+    def validate(self, attrs):
+        if attrs["date_from"] > attrs["date_to"]:
+            raise serializers.ValidationError({"date_to": "Must be on or after the start date."})
+        span = (attrs["date_to"] - attrs["date_from"]).days + 1
+        max_days = 400
+        if span > max_days:
+            raise serializers.ValidationError(
+                {"date_to": f"Date range cannot exceed {max_days} days ({span} days requested)."},
+            )
+        all_day = attrs.get("all_day", True)
+        if not all_day:
+            st = attrs.get("start_time")
+            et = attrs.get("end_time")
+            if st is None or et is None:
+                raise serializers.ValidationError(
+                    {"non_field_errors": "When not blocking the whole day, start_time and end_time are required."},
+                )
+            if st >= et:
+                raise serializers.ValidationError({"end_time": "Must be after start_time."})
+        return attrs
+
+
 class AppointmentHandoffNotesSerializer(serializers.Serializer):
     """Update persistent per-appointment chart / handoff notes (doctor on own appts, admin/staff any)."""
 
