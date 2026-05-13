@@ -609,7 +609,11 @@ def _find_nearby_slots(
     """Find the nearest available slots to a rejected time on the same date."""
     from apps.clinic.models import Provider, Service
     from apps.clinic.booking_availability import provider_interval_blocked_online
-    from apps.clinic.online_booking_hours import CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES, effective_public_booking_window_minutes
+    from apps.clinic.online_booking_hours import (
+        CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES,
+        effective_public_booking_window_minutes,
+        public_booking_treatment_duration_minutes,
+    )
     from apps.clinic.public_booking_service import public_online_booking_calendar_span_minutes
     from datetime import time as time_cls
 
@@ -621,6 +625,7 @@ def _find_nearby_slots(
         return []
 
     required_span = public_online_booking_calendar_span_minutes(service)
+    closing_compliance_span = public_booking_treatment_duration_minutes(service)
     slot_step = CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES
     win = effective_public_booking_window_minutes(appt_date, service)
     if not win:
@@ -642,7 +647,7 @@ def _find_nearby_slots(
     slots: list[tuple[int, str]] = []
     cursor = day_start
     target_min = rejected_time.hour * 60 + rejected_time.minute if rejected_time else 600
-    while cursor + required_span <= day_end:
+    while cursor + closing_compliance_span <= day_end:
         if not any(cursor <= t < cursor + required_span for t in taken):
             h, m = divmod(cursor, 60)
             st = time_cls(hour=h, minute=m)

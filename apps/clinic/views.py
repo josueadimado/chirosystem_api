@@ -431,7 +431,11 @@ class BookingOptionsViewSet(viewsets.ViewSet):
 
         from datetime import time as time_cls
 
-        from .online_booking_hours import CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES, effective_public_booking_window_minutes
+        from .online_booking_hours import (
+            CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES,
+            effective_public_booking_window_minutes,
+            public_booking_treatment_duration_minutes,
+        )
         from .patient_phone import patient_matches_phone_normalized
 
         win = effective_public_booking_window_minutes(appt_date, service)
@@ -440,6 +444,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         day_start, day_end = win
 
         required_span = public_online_booking_calendar_span_minutes(service)
+        closing_compliance_span = public_booking_treatment_duration_minutes(service)
         SLOT_INTERVAL = CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES
 
         busy_qs = Appointment.objects.filter(
@@ -556,7 +561,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         available = []
         slot_start_times = []
         cursor = day_start
-        while cursor + required_span <= day_end:
+        while cursor + closing_compliance_span <= day_end:
             if not any(cursor <= t < cursor + required_span for t in taken):
                 h, m = divmod(cursor, 60)
                 slot_start_time = time_cls(hour=h, minute=m)

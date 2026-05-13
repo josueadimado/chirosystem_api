@@ -2,11 +2,13 @@
 Public (web/voice) booking time windows.
 
 Combines ClinicSettings.business_hours with fixed rules:
-- Monday–Thursday: chiropractic 8:00 AM–6:00 PM, massage 9:00 AM–6:00 PM (visits must end by closing).
-- Friday: same open times, close at 4:00 PM.
+- Monday–Thursday: chiropractic 8:00 AM–6:00 PM, massage 9:00 AM–6:00 PM (the *visit* must end by closing;
+  massage turnover buffer after the visit does not cut off the last bookable start time).
+- Friday: both services 7:00 AM–4:00 PM (visit end by 4:00 PM). Online window opens at policy time even if
+  legacy clinic JSON still lists a later Friday start — update Settings → business hours to match signage.
 - Saturday & Sunday: no online booking.
 
-The effective window is the intersection of clinic hours and these rules (narrower wins).
+The effective window is the intersection of clinic hours and these rules for close; Friday open follows policy.
 """
 
 from __future__ import annotations
@@ -27,7 +29,10 @@ def _hard_policy_open_close_minutes(appt_date: date, service: Service) -> tuple[
         return None
     is_friday = appt_date.weekday() == 4
     close_min = 16 * 60 if is_friday else 18 * 60
-    if service.service_type == Service.ServiceType.CHIROPRACTIC:
+    if is_friday:
+        # Both chiropractic and massage: first bookable slot 7:00 AM; last visit must end by 4:00 PM.
+        open_min = 7 * 60
+    elif service.service_type == Service.ServiceType.CHIROPRACTIC:
         open_min = 8 * 60
     elif service.service_type == Service.ServiceType.MASSAGE:
         open_min = 9 * 60
@@ -77,8 +82,11 @@ def _clinic_minutes_for_date(appt_date: date) -> tuple[int, int] | None:
 
 def effective_public_booking_window_minutes(appt_date: date, service: Service) -> tuple[int, int] | None:
     """
-    Minutes [open, close) style: slots must satisfy start >= open and end <= close
-    (same convention as availability: cursor + duration <= day_end).
+    Minutes from midnight [open, close): last *patient visit* may end at ``close`` (exclusive of minute ``close``
+    is not required — we use ``start + duration_minutes <= close`` for slot generation and validation).
+
+    Friday uses policy open time (7:00) even if ``business_hours`` still lists a later start, so online booking
+    matches the clinic’s stated Friday schedule; close is still intersected with clinic hours.
     """
     policy = _hard_policy_open_close_minutes(appt_date, service)
     if policy is None:
@@ -88,25 +96,40 @@ def effective_public_booking_window_minutes(appt_date: date, service: Service) -
         return None
     c_open, c_close = clinic
     p_open, p_close = policy
-    a = max(c_open, p_open)
+    if appt_date.weekday() == 4:
+        # Friday: policy defines first bookable minute (7:00 both lines); do not let stale clinic JSON delay it.
+        a = p_open
+    else:
+        a = max(c_open, p_open)
     b = min(c_close, p_close)
     if a >= b:
         return None
     return a, b
 
 
+def public_booking_treatment_duration_minutes(service: Service) -> int:
+    """Patient-facing visit length (no post-massage buffer) — used for closing-time compliance."""
+    try:
+        n = int(service.duration_minutes)
+    except (TypeError, ValueError):
+        n = 30
+    return max(5, n)
+
+
 def interval_outside_effective_public_window(appt_date: date, start: time, end: time, service: Service) -> bool:
-    """True if [start, end] is not fully inside the effective public booking window."""
+    """True if the visit start is outside the window or the *treatment* (not buffer) ends after closing."""
+    _ = end  # closing rule uses duration_minutes only; calendar span may include massage tail
     w = effective_public_booking_window_minutes(appt_date, service)
     if w is None:
         return True
     w_open, w_close = w
     st = start.hour * 60 + start.minute
-    et = end.hour * 60 + end.minute
-    return st < w_open or et > w_close
+    treatment_end = st + public_booking_treatment_duration_minutes(service)
+    return st < w_open or treatment_end > w_close
 
 
 PUBLIC_BOOKING_HOURS_BLURB = (
     "Online booking: Monday–Friday only (closed weekends). "
-    "Chiropractic: 8:00 AM–6:00 PM; massage: 9:00 AM–6:00 PM; Friday we close at 4:00 PM."
+    "Chiropractic: 8:00 AM–6:00 PM Mon–Thu; massage: 9:00 AM–6:00 PM Mon–Thu; "
+    "Friday both lines 7:00 AM–4:00 PM. Last bookable time is when your visit can finish by closing."
 )
