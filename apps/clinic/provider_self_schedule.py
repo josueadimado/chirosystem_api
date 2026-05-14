@@ -10,7 +10,11 @@ from django.utils import timezone
 from apps.clinic.booking_availability import provider_interval_blocked_online
 from apps.clinic.booking_provider_eligibility import provider_can_offer_service_online
 from apps.clinic.models import Appointment, Patient, Provider, Service
-from apps.clinic.online_booking_hours import PUBLIC_BOOKING_HOURS_BLURB, interval_outside_effective_public_window
+from apps.clinic.online_booking_hours import (
+    PUBLIC_BOOKING_HOURS_BLURB,
+    interval_outside_effective_public_window,
+    public_booking_treatment_duration_minutes,
+)
 from apps.clinic.public_booking_service import public_online_booking_calendar_span_minutes
 
 
@@ -93,11 +97,15 @@ def validate_slot_for_online_booking_rules(
     end_dt = start_dt + timedelta(minutes=span)
     st_t = start_dt.time()
     en_t = end_dt.time()
+    treat_end_dt = start_dt + timedelta(minutes=public_booking_treatment_duration_minutes(service))
+    treatment_end_t = treat_end_dt.time()
 
     if interval_outside_effective_public_window(appt_date, st_t, en_t, service):
         return PUBLIC_BOOKING_HOURS_BLURB, False
 
-    if provider_interval_blocked_online(provider.pk, appt_date, st_t, en_t):
+    if provider_interval_blocked_online(
+        provider.pk, appt_date, st_t, en_t, block_overlap_end=treatment_end_t
+    ):
         return "That time is not open for online booking with this provider. Please pick another slot.", False
 
     overlapping = Appointment.objects.filter(

@@ -19,7 +19,11 @@ from rest_framework.exceptions import ValidationError as RestValidationError
 from .booking_availability import provider_interval_blocked_online
 from .booking_provider_eligibility import provider_can_offer_service_online
 from .chiropractic_booking_policy import chiropractic_booking_must_use_intake
-from .online_booking_hours import PUBLIC_BOOKING_HOURS_BLURB, interval_outside_effective_public_window
+from .online_booking_hours import (
+    PUBLIC_BOOKING_HOURS_BLURB,
+    interval_outside_effective_public_window,
+    public_booking_treatment_duration_minutes,
+)
 from .models import Appointment, Patient, Provider, Service, Visit
 from .patient_phone import get_or_create_patient_for_public_booking, patient_matches_phone_normalized
 from .utils import format_time_12h, normalize_phone
@@ -146,11 +150,19 @@ def create_appointment_from_public_booking(validated: dict) -> tuple[Appointment
     end_dt = start_dt + timezone.timedelta(minutes=span)
     start_time = start_dt.time()
     end_time = end_dt.time()
+    treat_end_dt = start_dt + timezone.timedelta(minutes=public_booking_treatment_duration_minutes(service))
+    treatment_end_time = treat_end_dt.time()
 
     if interval_outside_effective_public_window(validated["appointment_date"], start_time, end_time, service):
         return None, PUBLIC_BOOKING_HOURS_BLURB
 
-    if provider_interval_blocked_online(provider.pk, validated["appointment_date"], start_time, end_time):
+    if provider_interval_blocked_online(
+        provider.pk,
+        validated["appointment_date"],
+        start_time,
+        end_time,
+        block_overlap_end=treatment_end_time,
+    ):
         return None, "That time is not open for online booking with this provider. Please pick another slot."
 
     lapse_msg = chiropractic_booking_must_use_intake(patient, service)
@@ -332,11 +344,15 @@ def reschedule_appointment_public(
     end_dt = start_dt + timedelta(minutes=span)
     start_time = start_dt.time()
     end_time = end_dt.time()
+    treat_end_dt = start_dt + timedelta(minutes=public_booking_treatment_duration_minutes(service))
+    treatment_end_time = treat_end_dt.time()
 
     if interval_outside_effective_public_window(new_date, start_time, end_time, service):
         return None, PUBLIC_BOOKING_HOURS_BLURB
 
-    if provider_interval_blocked_online(provider.pk, new_date, start_time, end_time):
+    if provider_interval_blocked_online(
+        provider.pk, new_date, start_time, end_time, block_overlap_end=treatment_end_time
+    ):
         return None, "That time is not open for online booking with this provider. Please pick another slot."
 
     overlapping = (

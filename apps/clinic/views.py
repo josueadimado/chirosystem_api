@@ -578,13 +578,24 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             if end_h >= 24:
                 end_h, end_m = 23, 59
             slot_end_time = time_cls(hour=end_h, minute=end_m)
+            treat_total = cursor + closing_compliance_span
+            treat_h, treat_m = divmod(treat_total, 60)
+            if treat_h >= 24:
+                treat_h, treat_m = 23, 59
+            slot_treatment_end_time = time_cls(hour=treat_h, minute=treat_m)
             label = _slot_label(h, m)
             fits_close = cursor + closing_compliance_span <= day_end
             free = not any(cursor <= t < cursor + required_span for t in taken)
             not_blocked = (
                 fits_close
                 and free
-                and not provider_interval_blocked_online(provider.pk, appt_date, slot_start_time, slot_end_time)
+                and not provider_interval_blocked_online(
+                    provider.pk,
+                    appt_date,
+                    slot_start_time,
+                    slot_end_time,
+                    block_overlap_end=slot_treatment_end_time,
+                )
             )
             bookable = not_blocked
             slot_grid.append({"label": label, "bookable": bookable})
@@ -1742,6 +1753,134 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                 "appointment_id": aid,
             },
             status=status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=["post"], url_path="book-from-desk")
+    def book_from_desk(self, request):
+        """Owner/staff/doctor: book an existing patient into a slot (same rules as public online booking)."""
+        import logging
+
+        from .chiropractic_booking_policy import chiropractic_booking_must_use_intake
+        from .provider_self_schedule import (
+            compute_end_time_for_slot,
+            parse_appointment_date,
+            parse_start_time_value,
+            user_may_book_as_provider,
+            validate_slot_for_online_booking_rules,
+        )
+
+        logger = logging.getLogger(__name__)
+
+        try:
+            patient_id = int(request.data.get("patient_id"))
+        except (TypeError, ValueError):
+            return Response({"detail": "patient_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            service_id = int(request.data.get("service_id"))
+            provider_id = int(request.data.get("provider_id"))
+        except (TypeError, ValueError):
+            return Response({"detail": "service_id and provider_id are required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        date_raw = (request.data.get("appointment_date") or "").strip()
+        time_raw = request.data.get("start_time")
+        appt_date = parse_appointment_date(date_raw)
+        if not appt_date:
+            return Response(
+                {"detail": "Invalid or missing appointment_date (use YYYY-MM-DD)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        start_t = parse_start_time_value(time_raw if time_raw is not None else "")
+        if not start_t:
+            return Response({"detail": "Invalid or missing start_time."}, status=status.HTTP_400_BAD_REQUEST)
+
+        patient = Patient.objects.filter(pk=patient_id).first()
+        if not patient:
+            return Response({"detail": "Patient not found."}, status=status.HTTP_400_BAD_REQUEST)
+
+        service = Service.objects.filter(pk=service_id, is_active=True, show_in_public_booking=True).first()
+        provider = Provider.objects.filter(pk=provider_id, active=True).first()
+        if not service or not provider:
+            return Response({"detail": "Invalid service or provider."}, status=status.HTTP_400_BAD_REQUEST)
+        if not provider_can_offer_service_online(provider, service):
+            return Response(
+                {"detail": "This provider does not offer the selected service."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not user_may_book_as_provider(request.user, provider):
+            return Response({"detail": "You cannot book for that provider."}, status=status.HTTP_403_FORBIDDEN)
+
+        lapse_msg = chiropractic_booking_must_use_intake(patient, service)
+        if lapse_msg:
+            return Response({"detail": lapse_msg}, status=status.HTTP_400_BAD_REQUEST)
+
+        err, is_conflict = validate_slot_for_online_booking_rules(
+            provider=provider,
+            service=service,
+            appt_date=appt_date,
+            start_time=start_t,
+            exclude_appointment_id=None,
+        )
+        if err:
+            code = status.HTTP_409_CONFLICT if is_conflict else status.HTTP_400_BAD_REQUEST
+            return Response({"detail": err}, status=code)
+
+        end_t = compute_end_time_for_slot(appt_date, start_t, service)
+
+        with transaction.atomic():
+            err2, is_conflict2 = validate_slot_for_online_booking_rules(
+                provider=provider,
+                service=service,
+                appt_date=appt_date,
+                start_time=start_t,
+                exclude_appointment_id=None,
+            )
+            if err2:
+                code = status.HTTP_409_CONFLICT if is_conflict2 else status.HTTP_400_BAD_REQUEST
+                return Response({"detail": err2}, status=code)
+            new_appt = Appointment.objects.create(
+                patient=patient,
+                provider=provider,
+                booked_service=service,
+                appointment_date=appt_date,
+                start_time=start_t,
+                end_time=end_t,
+                status=Appointment.Status.BOOKED,
+            )
+
+        aid = new_appt.pk
+
+        def queue_calendar():
+            from apps.notifications.tasks import sync_appointment_google_calendar_task
+
+            try:
+                sync_appointment_google_calendar_task.delay(aid)
+            except Exception:
+                logger.exception("Post-commit dispatch failed (calendar) desk-book appt=%s", aid)
+
+        def queue_provider_notify():
+            from apps.notifications.tasks import notify_provider_new_booking_task
+
+            try:
+                notify_provider_new_booking_task.delay(aid)
+            except Exception:
+                logger.exception("Post-commit dispatch failed (provider notify) desk-book appt=%s", aid)
+
+        def queue_in_app():
+            try:
+                from apps.clinic.in_app_notify import create_new_booking_in_app_notification
+
+                create_new_booking_in_app_notification(aid)
+            except Exception:
+                logger.exception("Post-commit in-app notify failed desk-book appt=%s", aid)
+
+        transaction.on_commit(queue_calendar)
+        transaction.on_commit(queue_provider_notify)
+        transaction.on_commit(queue_in_app)
+
+        return Response(
+            {"detail": "Appointment booked.", "appointment_id": aid},
+            status=status.HTTP_201_CREATED,
         )
 
     @action(detail=True, methods=["post"])

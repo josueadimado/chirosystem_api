@@ -14,17 +14,23 @@ def provider_interval_blocked_online(
     block_date,
     visit_start: time,
     visit_end: time,
+    *,
+    block_overlap_end: time | None = None,
 ) -> bool:
     """
-    True if [visit_start, visit_end) overlaps any ProviderUnavailability on that date.
-    Used by public availability + book; staff can still create appointments via admin API if needed.
+    True if [visit_start, overlap_end) overlaps any ProviderUnavailability on that date.
+
+    ``visit_end`` is the end of the slot on the calendar (for massage, includes post-visit buffer).
+    For overlap with *booking blocks*, use ``block_overlap_end`` = treatment end only, so a block
+    that starts at posted closing (e.g. 6:00 PM) does not reject a valid massage that *finishes*
+    at closing while the calendar still holds turnover minutes after.
     """
     # Local import avoids circular imports at Django startup.
     from .models import ProviderUnavailability
 
     blocks = ProviderUnavailability.objects.filter(provider_id=provider_id, block_date=block_date)
     sm = _time_to_minutes(visit_start)
-    em = _time_to_minutes(visit_end)
+    em = _time_to_minutes(block_overlap_end if block_overlap_end is not None else visit_end)
     for b in blocks:
         if b.all_day:
             return True

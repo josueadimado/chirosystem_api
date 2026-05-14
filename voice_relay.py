@@ -659,7 +659,12 @@ def _find_nearby_slots(
             et_total = cursor + required_span
             eh, em = divmod(et_total, 60)
             et = time_cls(hour=min(eh, 23), minute=em if eh < 24 else 59)
-            if not provider_interval_blocked_online(provider.pk, appt_date, st, et):
+            treat_total = cursor + closing_compliance_span
+            teh, tem = divmod(treat_total, 60)
+            treat_t = time_cls(hour=min(teh, 23), minute=tem if teh < 24 else 59)
+            if not provider_interval_blocked_online(
+                provider.pk, appt_date, st, et, block_overlap_end=treat_t
+            ):
                 suffix = "AM" if h < 12 else "PM"
                 dh = h if 1 <= h <= 12 else (h - 12 if h > 12 else 12)
                 label = f"{dh}:{m:02d} {suffix}"
