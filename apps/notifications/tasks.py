@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 from zoneinfo import ZoneInfo
 
 from celery import shared_task
@@ -21,12 +21,6 @@ def _smtp_configured() -> bool:
 
 def _clinic_tz() -> ZoneInfo:
     return ZoneInfo(getattr(settings, "CLINIC_TIMEZONE", "America/Detroit"))
-
-
-def _appointment_start_local(appt) -> datetime:
-    """Naive local date+time + clinic timezone (wall clock)."""
-    tz = _clinic_tz()
-    return datetime.combine(appt.appointment_date, appt.start_time).replace(tzinfo=tz)
 
 
 def _send_reminder_email(*, to_email: str, subject: str, body: str) -> bool:
@@ -131,8 +125,8 @@ def send_booking_confirmation_email_task(appointment_id: int) -> str:
         f"  Time: {time_disp}\n"
         f"{est_block}"
         f"If you need to reschedule or cancel, please call us or visit our website.\n\n"
-        f"We'll remind you the day before your appointment and again within a few hours of your visit "
-        f"via text (if you opted in for SMS) and via email when we have your email on file.\n\n"
+        f"We'll remind you the day before your appointment via text (if you opted in for SMS) "
+        f"and via email when we have your email on file.\n\n"
         f"Thank you for choosing Relief Chiropractic!\n"
         f"— Relief Chiropractic Team"
     )
@@ -248,114 +242,6 @@ def send_daily_appointment_reminders() -> dict:
         "for_date": str(tomorrow),
         "sms_sent": sms_sent,
         "email_sent": email_sent,
-        "twilio": twilio_on,
-        "smtp": smtp_on,
-    }
-
-
-@shared_task
-def send_same_day_appointment_reminders() -> dict:
-    """
-    Celery Beat (e.g. every 10 minutes): same-day **SMS and email** when the visit is within
-    REMINDER_SAME_DAY_LEAD_HOURS (default 2) of start time, same calendar day in CLINIC_TIMEZONE.
-    """
-    from apps.clinic.models import Appointment
-    from apps.clinic.twilio_sms import same_day_reminder_body, send_sms, twilio_configured
-
-    lead_h = float(getattr(settings, "REMINDER_SAME_DAY_LEAD_HOURS", 2.0) or 2.0)
-    if lead_h <= 0:
-        lead_h = 2.0
-    lead = timedelta(hours=lead_h)
-
-    tz = _clinic_tz()
-    now_local = timezone.now().astimezone(tz)
-    today_local = now_local.date()
-
-    candidates = (
-        Appointment.objects.filter(appointment_date=today_local, status=Appointment.Status.BOOKED)
-        .select_related("patient", "provider", "booked_service")
-        .order_by("start_time")
-    )
-
-    twilio_on = twilio_configured()
-    smtp_on = _smtp_configured()
-    sms_sent = 0
-    email_sent = 0
-
-    for appt in candidates:
-        start_local = _appointment_start_local(appt)
-        remaining = start_local - now_local
-        if timedelta(0) >= remaining:
-            continue
-        if remaining > lead:
-            continue
-
-        patient = appt.patient
-        service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
-        date_disp = appt.appointment_date.strftime("%a %b %d, %Y")
-        time_disp = format_time_12h(appt.start_time)
-        est_pay = format_usd_plain(appt.booked_service.price) if appt.booked_service else ""
-        provider_display = str(appt.provider)
-        first = patient.first_name.strip() or "there"
-
-        if twilio_on and patient.sms_consent and appt.same_day_reminder_sms_at is None:
-            to_phone = (patient.phone or "").strip()
-            if to_phone:
-                body = same_day_reminder_body(
-                    first_name=first,
-                    service_name=service_name,
-                    appt_date_display=date_disp,
-                    appt_time_display=time_disp,
-                    provider_display=provider_display,
-                    estimated_payment=est_pay,
-                )
-                sid = send_sms(to_e164=to_phone, body=body)
-                if sid:
-                    updated = Appointment.objects.filter(
-                        pk=appt.pk, same_day_reminder_sms_at__isnull=True
-                    ).update(same_day_reminder_sms_at=timezone.now())
-                    if updated:
-                        sms_sent += 1
-
-        if smtp_on and appt.same_day_reminder_email_at is None:
-            em = (patient.email or "").strip()
-            if em:
-                subject = f"Reminder — {service_name} today at {time_disp}"
-                pay_block = (
-                    f"\n  Estimated amount at visit: {est_pay}\n"
-                    if est_pay
-                    else ""
-                )
-                msg = (
-                    f"Hi {first},\n\n"
-                    f"Your Relief Chiropractic appointment is coming up soon.\n\n"
-                    f"  Service: {service_name}\n"
-                    f"  Date: {appt.appointment_date.strftime('%A, %B %d, %Y')}\n"
-                    f"  Time: {time_disp}\n"
-                    f"  Provider: {provider_display}\n"
-                    f"{pay_block}\n"
-                    f"We look forward to seeing you.\n\n"
-                    f"— Relief Chiropractic"
-                )
-                if _send_reminder_email(to_email=em, subject=subject, body=msg):
-                    updated = Appointment.objects.filter(
-                        pk=appt.pk, same_day_reminder_email_at__isnull=True
-                    ).update(same_day_reminder_email_at=timezone.now())
-                    if updated:
-                        email_sent += 1
-
-    logger.info(
-        "Same-day reminders for %s: sms_sent=%s email_sent=%s (lead_hours=%s)",
-        today_local,
-        sms_sent,
-        email_sent,
-        lead_h,
-    )
-    return {
-        "for_date": str(today_local),
-        "sms_sent": sms_sent,
-        "email_sent": email_sent,
-        "lead_hours": lead_h,
         "twilio": twilio_on,
         "smtp": smtp_on,
     }

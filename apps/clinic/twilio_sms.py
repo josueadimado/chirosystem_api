@@ -139,7 +139,7 @@ def booking_confirmation_body(
     return (
         f"Relief Chiropractic: Hi {first_name}, your {service_name} is confirmed for "
         f"{appt_date_display} at {appt_time_display}.{pay} "
-        f"We'll text reminders the day before and shortly before your visit.{sms_footer()}"
+        f"We'll text you a reminder the day before your visit.{sms_footer()}"
     )
 
 
@@ -156,22 +156,6 @@ def appointment_reminder_body(
     return (
         f"Relief Chiropractic: Hi {first_name}, reminder — your {service_name} is "
         f"tomorrow ({appt_date_display}) at {appt_time_display}.{pay}{sms_footer()}"
-    )
-
-
-def same_day_reminder_body(
-    *,
-    first_name: str,
-    service_name: str,
-    appt_date_display: str,
-    appt_time_display: str,
-    provider_display: str,
-    estimated_payment: str = "",
-) -> str:
-    pay = f" Est. {estimated_payment} due at visit." if estimated_payment else ""
-    return (
-        f"Relief Chiropractic: Hi {first_name}, your {service_name} is today at {appt_time_display} "
-        f"({appt_date_display}).{pay} See you soon.{sms_footer()}"
     )
 
 
