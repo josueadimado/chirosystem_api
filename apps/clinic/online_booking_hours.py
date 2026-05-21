@@ -157,3 +157,22 @@ PUBLIC_BOOKING_HOURS_BLURB = (
     "Friday both lines 7:00 AM–4:00 PM. Start times every 15 minutes through 5:45 PM Mon–Thu "
     "and 3:45 PM Friday; each visit must end by closing."
 )
+
+# Owner/staff/doctor desk booking may run later than public online closing (patients unchanged).
+DESK_BOOKING_DAY_END_MIN = 21 * 60  # 9:00 PM
+
+
+def effective_desk_booking_window_minutes(appt_date: date, service: Service) -> tuple[int, int] | None:
+    """Same open rules as public booking; close is extended for front-desk scheduling."""
+    win = effective_public_booking_window_minutes(appt_date, service)
+    if win is None:
+        return None
+    day_open, _policy_close = win
+    return day_open, DESK_BOOKING_DAY_END_MIN
+
+
+def desk_booking_last_slot_start_minute(day_close_minute: int, required_calendar_span: int) -> int:
+    """Inclusive last start minute so the full calendar block fits before desk close."""
+    step = CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES
+    cap = day_close_minute - max(step, required_calendar_span)
+    return max(0, cap)

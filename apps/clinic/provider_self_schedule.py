@@ -12,10 +12,16 @@ from apps.clinic.booking_provider_eligibility import provider_can_offer_service_
 from apps.clinic.models import Appointment, Patient, Provider, Service
 from apps.clinic.online_booking_hours import (
     PUBLIC_BOOKING_HOURS_BLURB,
+    effective_desk_booking_window_minutes,
     interval_outside_effective_public_window,
     public_booking_treatment_duration_minutes,
 )
 from apps.clinic.public_booking_service import public_online_booking_calendar_span_minutes
+
+DESK_BOOKING_HOURS_BLURB = (
+    "Desk booking uses the same open hours as online booking, but visits may extend past "
+    "public closing (through 9:00 PM) when scheduling extra time for a patient."
+)
 
 
 def user_may_manage_appointment(user, appointment: Appointment) -> bool:
@@ -107,6 +113,68 @@ def validate_slot_for_online_booking_rules(
         provider.pk, appt_date, st_t, en_t, block_overlap_end=treatment_end_t
     ):
         return "That time is not open for online booking with this provider. Please pick another slot.", False
+
+    overlapping = Appointment.objects.filter(
+        provider=provider,
+        appointment_date=appt_date,
+        start_time__lt=en_t,
+        end_time__gt=st_t,
+    ).exclude(
+        status__in=[
+            Appointment.Status.CANCELLED,
+            Appointment.Status.NO_SHOW,
+            Appointment.Status.COMPLETED,
+        ]
+    )
+    if exclude_appointment_id:
+        overlapping = overlapping.exclude(pk=exclude_appointment_id)
+
+    if overlapping.exists():
+        return "That time slot is no longer available. Please choose another time.", True
+
+    return None, False
+
+
+def validate_slot_for_desk_booking_rules(
+    *,
+    provider: Provider,
+    service: Service,
+    appt_date,
+    start_time,
+    exclude_appointment_id: int | None,
+) -> tuple[str | None, bool]:
+    """
+    Front desk / provider dashboard: same conflict and block rules as public booking,
+    but allows the calendar block to extend past public online closing (through desk close).
+    """
+    today = timezone.localdate()
+    if appt_date < today:
+        return "Pick today or a future date.", False
+
+    slot_dt = timezone.make_aware(datetime.combine(appt_date, start_time))
+    if appt_date == today and slot_dt <= timezone.now():
+        return "Pick a time later today that has not passed yet.", False
+
+    start_dt = datetime.combine(appt_date, start_time)
+    span = public_online_booking_calendar_span_minutes(service)
+    end_dt = start_dt + timedelta(minutes=span)
+    st_t = start_dt.time()
+    en_t = end_dt.time()
+    treat_end_dt = start_dt + timedelta(minutes=public_booking_treatment_duration_minutes(service))
+    treatment_end_t = treat_end_dt.time()
+
+    desk_win = effective_desk_booking_window_minutes(appt_date, service)
+    if desk_win is None:
+        return DESK_BOOKING_HOURS_BLURB, False
+    desk_open, desk_close = desk_win
+    st_min = start_time.hour * 60 + start_time.minute
+    if st_min < desk_open or st_min + span > desk_close:
+        return DESK_BOOKING_HOURS_BLURB, False
+
+    if provider_interval_blocked_online(
+        provider.pk, appt_date, st_t, en_t, block_overlap_end=treatment_end_t
+    ):
+        return "That time is not open for booking with this provider. Please pick another slot.", False
 
     overlapping = Appointment.objects.filter(
         provider=provider,

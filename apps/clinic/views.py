@@ -434,13 +434,28 @@ class BookingOptionsViewSet(viewsets.ViewSet):
 
         from .online_booking_hours import (
             CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES,
+            desk_booking_last_slot_start_minute,
+            effective_desk_booking_window_minutes,
             effective_public_booking_window_minutes,
             public_booking_last_slot_start_minute,
             public_booking_treatment_duration_minutes,
         )
         from .patient_phone import patient_matches_phone_normalized
 
-        win = effective_public_booking_window_minutes(appt_date, service)
+        desk_mode = (request.query_params.get("desk") or "").strip().lower() in ("1", "true", "yes")
+        if desk_mode:
+            if not request.user.is_authenticated or getattr(request.user, "role", None) not in (
+                "owner_admin",
+                "staff",
+                "doctor",
+            ):
+                return Response(
+                    {"detail": "Desk availability requires staff sign-in."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            win = effective_desk_booking_window_minutes(appt_date, service)
+        else:
+            win = effective_public_booking_window_minutes(appt_date, service)
         if win is None:
             return Response({"available_slots": [], "slot_start_times": [], "slot_grid": []})
         day_start, day_end = win
@@ -565,7 +580,10 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             for m in range(start_min, end_min):
                 taken.add(m)
 
-        last_slot_start = public_booking_last_slot_start_minute(appt_date, day_end)
+        if desk_mode:
+            last_slot_start = desk_booking_last_slot_start_minute(day_end, required_span)
+        else:
+            last_slot_start = public_booking_last_slot_start_minute(appt_date, day_end)
         slot_grid: list[dict[str, object]] = []
         available: list[str] = []
         slot_start_times: list[str] = []
@@ -584,7 +602,10 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                 treat_h, treat_m = 23, 59
             slot_treatment_end_time = time_cls(hour=treat_h, minute=treat_m)
             label = _slot_label(h, m)
-            fits_close = cursor + closing_compliance_span <= day_end
+            if desk_mode:
+                fits_close = cursor + required_span <= day_end
+            else:
+                fits_close = cursor + closing_compliance_span <= day_end
             free = not any(cursor <= t < cursor + required_span for t in taken)
             not_blocked = (
                 fits_close
@@ -1498,7 +1519,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
             parse_appointment_date,
             parse_start_time_value,
             user_may_manage_appointment,
-            validate_slot_for_online_booking_rules,
+            validate_slot_for_desk_booking_rules,
         )
 
         logger = logging.getLogger(__name__)
@@ -1528,7 +1549,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         if not start_t:
             return Response({"detail": "Invalid or missing start_time."}, status=status.HTTP_400_BAD_REQUEST)
 
-        err, is_conflict = validate_slot_for_online_booking_rules(
+        err, is_conflict = validate_slot_for_desk_booking_rules(
             provider=appt.provider,
             service=appt.booked_service,
             appt_date=appt_date,
@@ -1572,7 +1593,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                     {"detail": "Appointment status changed; refresh and try again."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-            err2, is_conflict2 = validate_slot_for_online_booking_rules(
+            err2, is_conflict2 = validate_slot_for_desk_booking_rules(
                 provider=locked.provider,
                 service=locked.booked_service,
                 appt_date=appt_date,
@@ -1607,7 +1628,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
             parse_start_time_value,
             user_may_book_as_provider,
             user_may_manage_appointment,
-            validate_slot_for_online_booking_rules,
+            validate_slot_for_desk_booking_rules,
         )
 
         logger = logging.getLogger(__name__)
@@ -1667,7 +1688,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         if lapse_msg:
             return Response({"detail": lapse_msg}, status=status.HTTP_400_BAD_REQUEST)
 
-        err, is_conflict = validate_slot_for_online_booking_rules(
+        err, is_conflict = validate_slot_for_desk_booking_rules(
             provider=provider,
             service=service,
             appt_date=appt_date,
@@ -1681,7 +1702,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         end_t = compute_end_time_for_slot(appt_date, start_t, service)
 
         with transaction.atomic():
-            err2, is_conflict2 = validate_slot_for_online_booking_rules(
+            err2, is_conflict2 = validate_slot_for_desk_booking_rules(
                 provider=provider,
                 service=service,
                 appt_date=appt_date,
@@ -1766,7 +1787,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
             parse_appointment_date,
             parse_start_time_value,
             user_may_book_as_provider,
-            validate_slot_for_online_booking_rules,
+            validate_slot_for_desk_booking_rules,
         )
 
         logger = logging.getLogger(__name__)
@@ -1814,7 +1835,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         if lapse_msg:
             return Response({"detail": lapse_msg}, status=status.HTTP_400_BAD_REQUEST)
 
-        err, is_conflict = validate_slot_for_online_booking_rules(
+        err, is_conflict = validate_slot_for_desk_booking_rules(
             provider=provider,
             service=service,
             appt_date=appt_date,
@@ -1828,7 +1849,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         end_t = compute_end_time_for_slot(appt_date, start_t, service)
 
         with transaction.atomic():
-            err2, is_conflict2 = validate_slot_for_online_booking_rules(
+            err2, is_conflict2 = validate_slot_for_desk_booking_rules(
                 provider=provider,
                 service=service,
                 appt_date=appt_date,
