@@ -5,8 +5,13 @@ import dj_database_url
 from celery.schedules import crontab
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "django-insecure-dev-change-in-production")
 DEBUG = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes")
+
+if DEBUG:
+    SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "django-insecure-dev-only")
+else:
+    # Production: crash loudly if secret key is missing — no insecure fallback
+    SECRET_KEY = os.environ["DJANGO_SECRET_KEY"]
 
 ALLOWED_HOSTS = [h.strip() for h in os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if h.strip()]
 # Next.js in Docker proxies to this API using hostname `api` or `host.docker.internal` — those must be allowed or Django returns 400.
@@ -44,6 +49,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    "apps.clinic.middleware.hipaa_audit.HIPAAAuditMiddleware",  # HIPAA PHI audit log
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -269,10 +275,72 @@ else:
 # ---------------------------------------------------------
 # CORS
 # ---------------------------------------------------------
-CORS_ALLOW_ALL_ORIGINS = DEBUG
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:8000",
-    "http://127.0.0.1:8000",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-] + ([o for o in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if o] if not DEBUG else [])
+if DEBUG:
+    CORS_ALLOW_ALL_ORIGINS = True
+    CORS_ALLOWED_ORIGINS = []
+else:
+    # Production: never allow all origins
+    CORS_ALLOW_ALL_ORIGINS = False
+    CORS_ALLOWED_ORIGINS = [
+        o.strip()
+        for o in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",")
+        if o.strip()
+    ]
+
+# ---------------------------------------------------------
+# HIPAA Audit Logging
+# ---------------------------------------------------------
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "hipaa": {
+            "format": "%(asctime)s HIPAA_AUDIT %(message)s",
+        },
+    },
+    "handlers": {
+        "hipaa_file": {
+            "class": "logging.handlers.RotatingFileHandler",
+            "filename": str(BASE_DIR / "logs" / "hipaa_audit.log"),
+            "maxBytes": 10 * 1024 * 1024,  # 10MB per file
+            "backupCount": 90,  # Keep 90 files = ~6 months of logs
+            "formatter": "hipaa",
+        },
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "hipaa",
+        },
+    },
+    "loggers": {
+        "hipaa.audit": {
+            "handlers": ["hipaa_file", "console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+    },
+}
+
+# Create logs directory if it doesn't exist
+_logs_dir = BASE_DIR / "logs"
+try:
+    _logs_dir.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
+
+# ---------------------------------------------------------
+# HIPAA Security Hardening (production only)
+# ---------------------------------------------------------
+if not DEBUG:
+    SECURE_SSL_REDIRECT = True
+    SECURE_HSTS_SECONDS = 31536000  # 1 year
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_BROWSER_XSS_FILTER = True
+    SESSION_COOKIE_SECURE = True
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_AGE = 3600  # 1 hour auto logout (HIPAA requirement)
+    CSRF_COOKIE_SECURE = True
+    X_FRAME_OPTIONS = "DENY"
+    # Trust X-Forwarded-Proto from nginx/reverse proxy (avoids redirect loops)
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
