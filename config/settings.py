@@ -205,6 +205,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 # Phone voice (Sarah): gpt-5.4-nano is OpenAI’s fastest/cheapest frontier tier for low latency. If your key
 # returns “model not found”, set OPENAI_VOICE_MODEL=gpt-4o-mini (or gpt-5.4-mini) in .env.
 OPENAI_VOICE_MODEL = os.getenv("OPENAI_VOICE_MODEL", "gpt-5.4-nano").strip() or "gpt-5.4-nano"
+# OpenAI Realtime (gpt-realtime): alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
+OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "coral").strip() or "coral"
 # Voice relay: stream LLM tokens to Twilio (lower perceived delay). Set VOICE_LLM_STREAM=false to disable.
 VOICE_LLM_STREAM = os.getenv("VOICE_LLM_STREAM", "true").strip().lower() in ("1", "true", "yes")
 # Empty transcripts from ConversationRelay (silence / STT hiccup) before we hang up with a goodbye.

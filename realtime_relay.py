@@ -562,7 +562,7 @@ class RealtimeBridge:
                     },
                     "output": {
                         "format": {"type": "audio/pcmu"},
-                        "voice": "nova",
+                        "voice": settings.OPENAI_REALTIME_VOICE,
                         "speed": 1.0,
                     },
                 },
