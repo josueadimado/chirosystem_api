@@ -49,7 +49,7 @@ logger = logging.getLogger("realtime_relay")
 
 app = FastAPI(title="ChiroFlow Realtime Voice Relay")
 
-OPENAI_REALTIME_MODEL = "gpt-4o-realtime-preview-2024-12-17"
+OPENAI_REALTIME_MODEL = "gpt-realtime"
 OPENAI_REALTIME_URL = (
     "wss://api.openai.com/v1/realtime"
     f"?model={OPENAI_REALTIME_MODEL}"
