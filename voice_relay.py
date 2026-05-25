@@ -16,6 +16,7 @@ Run: uvicorn voice_relay:app --host 0.0.0.0 --port 8001
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -69,7 +70,7 @@ def _silence_max_retries() -> int:
         n = int(getattr(settings, "VOICE_SILENCE_MAX_RETRIES", 8))
     except (TypeError, ValueError):
         n = 8
-    return max(3, min(25, n))
+    return max(5, min(25, n))
 
 
 def _step_max_retries() -> int:
@@ -190,41 +191,140 @@ ordinal day like "April 8th", and times like "2:30 P.M.") — not ISO dates or 2
 "get you scheduled," "book that for you," or "another appointment" instead.
 """
 
+# OpenAI chat — model fallback when gpt-5.4-nano (or env) is missing or rate-limited
+KNOWN_WORKING_MODELS = ("gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo")
+_OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+_OPENAI_429_BACKOFF_BASE_SEC = 2.0
+
+
+def _voice_models_to_try() -> list[str]:
+    """Configured model first, then known-good fallbacks (no duplicates)."""
+    configured = (getattr(settings, "OPENAI_VOICE_MODEL", None) or "gpt-4o-mini").strip()
+    models: list[str] = []
+    if configured:
+        models.append(configured)
+    for m in KNOWN_WORKING_MODELS:
+        if m not in models:
+            models.append(m)
+    return models
+
+
+def _openai_chat_headers(api_key: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+
+def _openai_chat_messages(instruction: str) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": RECEPTIONIST_PERSONA},
+        {"role": "user", "content": instruction},
+    ]
+
+
+async def _sleep_openai_rate_limit(attempt: int) -> None:
+    wait = _OPENAI_429_BACKOFF_BASE_SEC * (2**attempt)
+    logger.warning("OpenAI rate limited (429) — waiting %.0fs then retrying", wait)
+    await asyncio.sleep(wait)
+
 
 async def _llm_respond(instruction: str, fallback: str) -> str:
-    """Call GPT-4o-mini to generate a natural response. Falls back to static text."""
+    """Call OpenAI chat; retry 429 with backoff; fall back across models on 404/429."""
     api_key = getattr(settings, "OPENAI_API_KEY", "") or ""
     if not api_key.strip():
         return fallback
 
-    model = getattr(settings, "OPENAI_VOICE_MODEL", None) or "gpt-5.4-nano"
+    client = await _get_http_client()
+    headers = _openai_chat_headers(api_key)
+    payload_base = {
+        "temperature": 0.82,
+        "max_tokens": 120,
+        "messages": _openai_chat_messages(instruction),
+    }
 
-    try:
-        client = await _get_http_client()
-        resp = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "temperature": 0.82,
-                "max_tokens": 120,
-                "messages": [
-                    {"role": "system", "content": RECEPTIONIST_PERSONA},
-                    {"role": "user", "content": instruction},
-                ],
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        text = data["choices"][0]["message"]["content"].strip()
-        text = text.strip('"').strip("'")
-        return text if text else fallback
-    except Exception:
-        logger.exception("LLM response generation failed, using fallback")
-        return fallback
+    for model in _voice_models_to_try():
+        for attempt in range(2):
+            try:
+                resp = await client.post(
+                    _OPENAI_CHAT_URL,
+                    headers=headers,
+                    json={**payload_base, "model": model},
+                )
+                if resp.status_code == 429:
+                    if attempt == 0:
+                        await _sleep_openai_rate_limit(attempt)
+                        continue
+                    logger.error(
+                        "OpenAI still rate limited after retry (model=%s) — trying next model",
+                        model,
+                    )
+                    break
+                if resp.status_code == 404:
+                    logger.warning(
+                        "OpenAI model not found (%s) — trying next model",
+                        model,
+                    )
+                    break
+                resp.raise_for_status()
+                data = resp.json()
+                text = data["choices"][0]["message"]["content"].strip()
+                text = text.strip('"').strip("'")
+                if model != _voice_models_to_try()[0]:
+                    logger.info("OpenAI voice reply using fallback model %s", model)
+                return text if text else fallback
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status == 429 and attempt == 0:
+                    await _sleep_openai_rate_limit(attempt)
+                    continue
+                if status in (404, 429):
+                    logger.warning(
+                        "OpenAI HTTP %s for model %s — trying next model",
+                        status,
+                        model,
+                    )
+                    break
+                logger.exception("LLM response failed for model %s", model)
+                break
+            except Exception:
+                logger.exception("LLM response generation failed for model %s", model)
+                break
+
+    logger.error("All OpenAI models exhausted — using fallback response")
+    return fallback
+
+
+async def _relay_openai_stream_lines(
+    ws: WebSocket,
+    resp: httpx.Response,
+    *,
+    queued: str | None,
+    full_parts: list[str],
+) -> tuple[str | None, list[str]]:
+    """Read SSE lines from an OpenAI streaming response into Twilio tokens."""
+    async for line in resp.aiter_lines():
+        if not line.startswith("data: "):
+            continue
+        data = line[6:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            obj = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        choices = obj.get("choices") or []
+        if not choices:
+            continue
+        delta = (choices[0].get("delta") or {})
+        content = delta.get("content") or ""
+        if not content:
+            continue
+        full_parts.append(content)
+        if queued is not None:
+            await ws.send_json({"type": "text", "token": queued, "last": False})
+        queued = content
+    return queued, full_parts
 
 
 async def _stream_openai_tokens_to_ws(ws: WebSocket, instruction: str, fallback: str) -> str:
@@ -237,66 +337,72 @@ async def _stream_openai_tokens_to_ws(ws: WebSocket, instruction: str, fallback:
         await _send_text(ws, fallback)
         return fallback
 
-    model = getattr(settings, "OPENAI_VOICE_MODEL", None) or "gpt-5.4-nano"
-    queued: str | None = None
-    full_parts: list[str] = []
+    client = await _get_http_client()
+    headers = _openai_chat_headers(api_key)
+    payload_base = {
+        "temperature": 0.82,
+        "max_tokens": 120,
+        "stream": True,
+        "messages": _openai_chat_messages(instruction),
+    }
+    stream_timeout = httpx.Timeout(45.0, connect=10.0)
 
-    try:
-        client = await _get_http_client()
-        async with client.stream(
-            "POST",
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "temperature": 0.82,
-                "max_tokens": 120,
-                "stream": True,
-                "messages": [
-                    {"role": "system", "content": RECEPTIONIST_PERSONA},
-                    {"role": "user", "content": instruction},
-                ],
-            },
-            timeout=httpx.Timeout(45.0, connect=10.0),
-        ) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                data = line[6:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                choices = obj.get("choices") or []
-                if not choices:
-                    continue
-                delta = (choices[0].get("delta") or {})
-                content = delta.get("content") or ""
-                if not content:
-                    continue
-                full_parts.append(content)
+    for model in _voice_models_to_try():
+        for attempt in range(2):
+            queued: str | None = None
+            full_parts: list[str] = []
+            try:
+                async with client.stream(
+                    "POST",
+                    _OPENAI_CHAT_URL,
+                    headers=headers,
+                    json={**payload_base, "model": model},
+                    timeout=stream_timeout,
+                ) as resp:
+                    if resp.status_code == 429:
+                        if attempt == 0:
+                            await _sleep_openai_rate_limit(attempt)
+                            continue
+                        logger.error(
+                            "OpenAI stream still rate limited after retry (model=%s)",
+                            model,
+                        )
+                        break
+                    if resp.status_code == 404:
+                        logger.warning(
+                            "OpenAI stream model not found (%s) — trying next",
+                            model,
+                        )
+                        break
+                    resp.raise_for_status()
+                    queued, full_parts = await _relay_openai_stream_lines(
+                        ws, resp, queued=queued, full_parts=full_parts
+                    )
+
                 if queued is not None:
-                    await ws.send_json({"type": "text", "token": queued, "last": False})
-                queued = content
+                    await ws.send_json({"type": "text", "token": queued, "last": True})
+                full = "".join(full_parts).strip().strip('"').strip("'")
+                if full:
+                    if model != _voice_models_to_try()[0]:
+                        logger.info("OpenAI voice stream using fallback model %s", model)
+                    _last_responses[id(ws)] = full
+                    return full
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status == 429 and attempt == 0:
+                    await _sleep_openai_rate_limit(attempt)
+                    continue
+                if status in (404, 429):
+                    break
+                logger.exception("OpenAI streaming failed for model %s", model)
+                break
+            except Exception:
+                logger.exception("OpenAI streaming failed for model %s", model)
+                break
 
-        if queued is not None:
-            await ws.send_json({"type": "text", "token": queued, "last": True})
-        full = "".join(full_parts).strip().strip('"').strip("'")
-        if not full:
-            await _send_text(ws, fallback)
-            return fallback
-        _last_responses[id(ws)] = full
-        return full
-    except Exception:
-        logger.exception("OpenAI streaming failed, using fallback")
-        await _send_text(ws, fallback)
-        return fallback
+    logger.error("All OpenAI stream models exhausted — using fallback response")
+    await _send_text(ws, fallback)
+    return fallback
 
 
 async def _speak_llm(ws: WebSocket, instruction: str, fallback: str) -> str:
@@ -1854,6 +1960,43 @@ _NUDGE_FALLBACKS = {
     "service_addon": "Which visit type would you like to add?",
 }
 
+SILENCE_NUDGES = [
+    "I'm here — go ahead.",
+    "Take your time, I'm listening.",
+    "Sorry, I missed that — go ahead.",
+    "Still here! What can I help you with?",
+    "Go ahead, I'm listening.",
+]
+
+KNOWN_SHORT_INTENTS = {
+    "yes",
+    "no",
+    "yeah",
+    "nope",
+    "yep",
+    "chiro",
+    "massage",
+    "cancel",
+    "reschedule",
+    "book",
+    "appointment",
+    "both",
+    "change",
+}
+
+
+def _should_count_as_silence(speech: str) -> bool:
+    """True only for empty STT or very short unclear fragments (not yes/no/chiro/etc.)."""
+    if not speech.strip():
+        return True
+    words = speech.split()
+    if len(words) <= 2:
+        word_set = {w.lower().strip(".,!?") for w in words}
+        if word_set & KNOWN_SHORT_INTENTS:
+            return False
+        return True
+    return False
+
 
 # ─── WebSocket endpoint ──────────────────────────────────────────────
 
@@ -1896,6 +2039,25 @@ async def voice_websocket(ws: WebSocket):
                         call_sid[:8], returning["first_name"], returning["last_name"],
                     )
 
+            elif msg_type == "interrupt":
+                if state:
+                    logger.info(
+                        "Voice [%s] interrupted by caller",
+                        state.call_sid[:8],
+                    )
+                    state.retries = 0
+                else:
+                    logger.info("Voice WS caller interrupted (before setup)")
+                continue
+
+            elif msg_type == "info":
+                logger.debug(
+                    "Voice [%s] info: %s",
+                    state.call_sid[:8] if state else "?",
+                    msg.get("description", ""),
+                )
+                continue
+
             elif msg_type == "prompt":
                 speech = msg.get("voicePrompt", "").strip()
 
@@ -1908,13 +2070,14 @@ async def voice_websocket(ws: WebSocket):
                     state.call_sid[:8], state.step, speech[:120] if speech else "",
                 )
 
-                await async_upsert_voice_call_log(
-                    call_sid=state.call_sid,
-                    from_number=state.from_number,
-                    transcript=speech,
-                )
+                if speech:
+                    await async_upsert_voice_call_log(
+                        call_sid=state.call_sid,
+                        from_number=state.from_number,
+                        transcript=speech,
+                    )
 
-                if not speech:
+                if _should_count_as_silence(speech):
                     state.retries += 1
                     if state.retries >= _silence_max_retries():
                         await async_upsert_voice_call_log(
@@ -1933,12 +2096,15 @@ async def voice_websocket(ws: WebSocket):
                         )
                         break
 
-                    context = _NUDGE_CONTEXTS.get(state.step, "The caller is silent. Gently ask if they're still there.")
-                    fallback = _NUDGE_FALLBACKS.get(state.step, "I'm here! Go ahead whenever you're ready.")
+                    nudge = random.choice(SILENCE_NUDGES)
                     if getattr(settings, "VOICE_LLM_FOR_SILENCE_NUDGES", False):
-                        await _speak_llm(ws, context, fallback)
+                        context = _NUDGE_CONTEXTS.get(
+                            state.step,
+                            "The caller is silent. Gently ask if they're still there.",
+                        )
+                        await _speak_llm(ws, context, nudge)
                     else:
-                        await _send_text(ws, fallback)
+                        await _send_text(ws, nudge)
                     continue
 
                 # Check for off-script intents before step handlers
@@ -1948,12 +2114,6 @@ async def voice_websocket(ws: WebSocket):
                 state.retries = 0
                 handler = STEP_HANDLERS.get(state.step, handle_name)
                 await handler(ws, state, speech)
-
-            elif msg_type == "interrupt":
-                logger.info(
-                    "Voice WS [%s] caller interrupted",
-                    state.call_sid[:8] if state else "?",
-                )
 
             elif msg_type == "dtmf":
                 digit = msg.get("digit", "")
