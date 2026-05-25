@@ -35,12 +35,18 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from apps.clinic.chiropractic_booking_policy import chiropractic_booking_must_use_intake
 from apps.clinic.models import Appointment, ClinicSettings, Patient, Service, VoiceCallLog
-from apps.clinic.public_booking_service import create_appointment_from_public_booking
+from apps.clinic.patient_phone import patients_matching_phone
+from apps.clinic.public_booking_service import (
+    cancel_appointment_public,
+    create_appointment_from_public_booking,
+    reschedule_appointment_public,
+)
 from apps.clinic.serializers import PublicBookingSerializer
 from apps.clinic.utils import normalize_phone
 from apps.clinic.voice_ai import (
     _booking_catalog_json,
     _parse_time_12h,
+    _parse_time_from_speech,
     extract_name_from_speech,
     match_services_from_speech,
     openai_parse_datetime,
@@ -217,7 +223,7 @@ def _openai_chat_headers(api_key: str) -> dict[str, str]:
     }
 
 
-def _openai_chat_messages(
+def _build_messages(
     instruction: str,
     state: ConversationState | None = None,
 ) -> list[dict[str, str]]:
@@ -225,7 +231,7 @@ def _openai_chat_messages(
         {"role": "system", "content": RECEPTIONIST_PERSONA},
     ]
     if state and state.history:
-        messages.extend(state.history[-4:])
+        messages.extend(state.history[-6:])
     messages.append({"role": "user", "content": instruction})
     return messages
 
@@ -262,7 +268,7 @@ async def _llm_respond(
     payload_base = {
         "temperature": 0.82,
         "max_tokens": 120,
-        "messages": _openai_chat_messages(instruction, state),
+        "messages": _build_messages(instruction, state),
     }
 
     for model in _voice_models_to_try():
@@ -373,7 +379,7 @@ async def _stream_openai_tokens_to_ws(
         "temperature": 0.82,
         "max_tokens": 120,
         "stream": True,
-        "messages": _openai_chat_messages(instruction, state),
+        "messages": _build_messages(instruction, state),
     }
     stream_timeout = httpx.Timeout(45.0, connect=10.0)
 
@@ -523,6 +529,7 @@ class ServiceEntry:
         self.provider_name: str = provider_name
         self.appointment_date: str = ""
         self.start_time: str = ""
+        self.appointment_date_backup: str = ""
         self.booked_appt = None
 
 
@@ -546,6 +553,13 @@ class ConversationState:
         # After a single-service book, optional cross-sell before hang-up (see do_book_all).
         self.pending_final_booked: list[tuple[str, str]] | None = None
         self.history: list[dict] = []
+        self._setup_done = False
+        self._noise_count = 0
+        self.cancel_appointment_id: int | None = None
+        self.pending_appointments: list[int] = []
+        self.self_service_action: str = ""  # "cancel" | "reschedule"
+        self.reschedule_appointment_id: int | None = None
+        self.offered_slots: list[str] = []
 
     @property
     def current_service(self) -> ServiceEntry | None:
@@ -633,6 +647,30 @@ def _returning_patient_voice_setup(from_number: str) -> dict | None:
 
 
 _returning_setup_async = sync_to_async(_returning_patient_voice_setup, thread_sensitive=True)
+
+
+# ─── Upcoming appointments (cancel / reschedule) ─────────────────────
+
+def _get_upcoming_appointments(phone: str) -> list[Appointment]:
+    norm = normalize_phone(phone)
+    if not norm:
+        return []
+    patients = patients_matching_phone(norm)
+    if not patients:
+        return []
+    now = timezone.now()
+    return list(
+        Appointment.objects.filter(
+            patient__in=patients,
+            status=Appointment.Status.BOOKED,
+            appointment_date__gte=now.date(),
+        )
+        .select_related("patient", "booked_service")
+        .order_by("appointment_date", "start_time")[:5]
+    )
+
+
+_get_upcoming_appointments_async = sync_to_async(_get_upcoming_appointments, thread_sensitive=True)
 
 
 # ─── Off-script intent detection ──────────────────────────────────────
@@ -724,26 +762,65 @@ async def _handle_off_script(ws: WebSocket, state: ConversationState, speech: st
         )
         return True
 
-    # Cancel / reschedule
+    # Cancel / reschedule — look up upcoming visits by phone
     if any(p in lower for p in _CANCEL_PATTERNS):
-        if state.is_returning:
+        wants_reschedule = any(
+            w in lower
+            for w in ("reschedule", "change", "move", "different time", "another time")
+        )
+        wants_cancel = any(w in lower for w in ("cancel", "cancellation")) and not wants_reschedule
+        if not wants_cancel and not wants_reschedule:
+            wants_reschedule = "reschedule" in lower or "change" in lower or "move" in lower
+            wants_cancel = "cancel" in lower
+
+        action = "reschedule" if wants_reschedule else "cancel"
+        state.self_service_action = action
+
+        appts = await _get_upcoming_appointments_async(state.from_number)
+
+        if not appts:
             await _speak_llm(
                 ws,
-                "The caller wants to cancel or reschedule. They are a returning patient. "
-                "Tell them the front desk or website handles changes to existing visits. "
-                "Offer to schedule another visit if they want.",
-                "For cancellations or rescheduling an existing visit, our front desk or website can help with that. "
-                "Would you like to schedule another visit while you're on the line?",
-            state=state,
+                "Caller wants to cancel or reschedule but has no upcoming appointments on file. "
+                "Let them know warmly and offer to book a new appointment instead.",
+                "I don't see any upcoming appointments for your number. "
+                "Would you like to book a new visit?",
+                state=state,
+            )
+            return True
+
+        if len(appts) == 1:
+            appt = appts[0]
+            d = appt.appointment_date.strftime("%A, %B %d")
+            t = appt.start_time.strftime("%I:%M %p").lstrip("0")
+            svc = appt.booked_service.name if appt.booked_service else "appointment"
+            state.cancel_appointment_id = appt.id
+            state.step = f"confirm_{action}"
+            await _speak_llm(
+                ws,
+                f"Caller wants to {action} their appointment. They have one upcoming: "
+                f"{svc} on {d} at {t}. Ask if that's the one they want to {action}.",
+                f"I see your {svc} on {d} at {t}. "
+                f"Is that the appointment you'd like to {action}?",
+                state=state,
             )
         else:
+            lines = []
+            for i, a in enumerate(appts[:3], 1):
+                d = a.appointment_date.strftime("%A %B %d")
+                t = a.start_time.strftime("%I:%M %p").lstrip("0")
+                svc = a.booked_service.name if a.booked_service else "appointment"
+                lines.append(f"{i}. {svc} on {d} at {t}")
+            appt_list = ", ".join(lines)
+            state.pending_appointments = [a.id for a in appts[:3]]
+            state.step = "pick_appointment"
             await _speak_llm(
                 ws,
-                "The caller wants to cancel or reschedule. Let them know they can call the front desk "
-                "or visit the website for that. Offer to set up a visit if they still need an appointment.",
-                "For cancellations or rescheduling, you can call our front desk directly or visit our website. "
-                "Would you like to book an appointment for another time?",
-            state=state,
+                f"Caller has multiple appointments and wants to cancel or reschedule. "
+                f"List them and ask which one: {appt_list}",
+                f"I see a few upcoming appointments. {appt_list}. "
+                f"Which one would you like to change?",
+                state=state,
             )
         return True
 
@@ -758,8 +835,10 @@ def _find_nearby_slots(
     appt_date: date_type,
     rejected_time,
     max_suggestions: int = 3,
+    *,
+    within_minutes: int | None = 120,
 ) -> list[str]:
-    """Find the nearest available slots to a rejected time on the same date."""
+    """Find available slots on the same date, optionally within ±within_minutes of rejected time."""
     from apps.clinic.models import Provider, Service
     from apps.clinic.booking_availability import provider_interval_blocked_online
     from apps.clinic.online_booking_hours import (
@@ -821,14 +900,40 @@ def _find_nearby_slots(
                 suffix = "AM" if h < 12 else "PM"
                 dh = h if 1 <= h <= 12 else (h - 12 if h > 12 else 12)
                 label = f"{dh}:{m:02d} {suffix}"
-                slots.append((abs(cursor - target_min), label))
+                dist = abs(cursor - target_min)
+                if within_minutes is None or dist <= within_minutes:
+                    slots.append((dist, label))
         cursor += slot_step
 
     slots.sort(key=lambda x: x[0])
     return [label for _, label in slots[:max_suggestions]]
 
 
+def _find_next_available_slot(
+    provider_id: int | None,
+    service_id: int,
+    after_date: date_type,
+    *,
+    max_days: int = 21,
+) -> tuple[date_type | None, str | None]:
+    """First open slot on or after after_date (search up to max_days)."""
+    for offset in range(max_days):
+        d = after_date + timedelta(days=offset)
+        labels = _find_nearby_slots(
+            provider_id,
+            service_id,
+            d,
+            None,
+            max_suggestions=1,
+            within_minutes=None,
+        )
+        if labels:
+            return d, labels[0]
+    return None, None
+
+
 _find_nearby_slots_async = sync_to_async(_find_nearby_slots, thread_sensitive=True)
+_find_next_available_slot_async = sync_to_async(_find_next_available_slot, thread_sensitive=True)
 
 
 # ─── Step handlers ────────────────────────────────────────────────────
@@ -1928,41 +2033,381 @@ async def _book_single(
 
 
 async def _offer_alternative_slots(ws, state, svc, rejected_time):
-    """When a slot is rejected, find nearby alternatives and offer them."""
+    """When a slot is rejected, offer up to 3 alternatives same day (±2h) or next open slot."""
     svc.appointment_date_backup = svc.appointment_date
-    svc.appointment_date = ""
-    svc.start_time = ""
-    state.step = "datetime"
+    state.offered_slots = []
     state.retries = 0
 
     try:
         appt_date = date_type.fromisoformat(svc.appointment_date_backup)
-        nearby = await _find_nearby_slots_async(
-            svc.provider_id, svc.service_id, appt_date, rejected_time
+    except ValueError:
+        state.step = "datetime"
+        svc.appointment_date = ""
+        svc.start_time = ""
+        await _send_text(
+            ws,
+            "Sorry about that — could you say the date and time again?",
         )
-    except Exception:
-        nearby = []
+        return
+
+    nearby = await _find_nearby_slots_async(
+        svc.provider_id,
+        svc.service_id,
+        appt_date,
+        rejected_time,
+        max_suggestions=3,
+        within_minutes=120,
+    )
 
     if nearby:
-        slot_list = ", ".join(nearby[:3])
+        state.offered_slots = nearby[:3]
+        state.step = "pick_slot"
+        t1, t2, t3 = (nearby + ["", ""])[:3]
+        if len(nearby) >= 3:
+            spoken = f"{t1}, {t2}, or {t3}"
+        elif len(nearby) == 2:
+            spoken = f"{t1} or {t2}"
+        else:
+            spoken = t1
+        await _send_text(
+            ws,
+            f"That time is taken. I have {spoken} available. Which works for you?",
+        )
+        return
+
+    next_date, next_time = await _find_next_available_slot_async(
+        svc.provider_id,
+        svc.service_id,
+        appt_date,
+    )
+    if next_date and next_time:
+        date_spoken = _date_plain_english(next_date, today=_today_clinic_date())
+        state.offered_slots = [next_time]
+        state.step = "pick_slot"
+        svc.appointment_date_backup = next_date.isoformat()
+        await _send_text(
+            ws,
+            f"We're fully booked at that time. The next available is {date_spoken} at {next_time}. "
+            f"Does that work?",
+        )
+        return
+
+    state.step = "datetime"
+    svc.appointment_date = ""
+    svc.start_time = ""
+    await _send_text(
+        ws,
+        "That time is taken and I don't see other openings soon. "
+        "What other date and time would work for you?",
+    )
+
+
+def _match_offered_slot(speech: str, offered: list[str]) -> str | None:
+    """Return the offered slot label that best matches caller speech."""
+    lower = speech.lower()
+    for label in offered:
+        if label.lower() in lower:
+            return label
+    t = _parse_time_from_speech(speech)
+    if not t:
+        return None
+    spoken = t.strftime("%I:%M %p").lstrip("0")
+    for label in offered:
+        if label.replace(" ", "").lower() == spoken.replace(" ", "").lower():
+            return label
+        if spoken.split()[0] in label:
+            return label
+    return None
+
+
+async def handle_pick_slot(ws: WebSocket, state: ConversationState, speech: str):
+    """Caller picks one of the offered alternative times (or asks for another day)."""
+    lower = speech.lower().strip()
+    svc = state.current_service
+    if not svc:
+        state.step = "datetime"
+        await _send_text(ws, "What date and time would you like?")
+        return
+
+    if any(
+        p in lower
+        for p in ("neither", "none", "no", "different day", "another day", "other day")
+    ):
+        state.offered_slots = []
+        state.step = "datetime"
+        svc.appointment_date = ""
+        svc.start_time = ""
+        await _send_text(
+            ws,
+            "No problem — what other date and time would work for you?",
+        )
+        return
+
+    backup_date = getattr(svc, "appointment_date_backup", "") or svc.appointment_date
+    matched = _match_offered_slot(speech, state.offered_slots)
+    if not matched:
+        ai_date, ai_time = await _openai_parse_datetime_async(speech, backup_date or _today_clinic_date().isoformat())
+        if ai_time:
+            matched = _match_offered_slot(ai_time, state.offered_slots) or ai_time
+        if ai_date and not backup_date:
+            backup_date = ai_date
+
+    if matched:
+        svc.appointment_date = backup_date
+        svc.start_time = matched if matched in state.offered_slots else matched
+        if not _parse_time_12h(svc.start_time):
+            t = _parse_time_from_speech(speech)
+            if t:
+                svc.start_time = t.strftime("%I:%M %p").lstrip("0")
+        state.offered_slots = []
+        state.retries = 0
+        phone = state.from_number
+        if phone.startswith("tel:"):
+            phone = phone[4:]
+        result = await _book_single(ws, state, svc, phone)
+        if result is not None:
+            appt, when_plain = result
+            svc.booked_appt = appt
+            await do_book_all(ws, state)
+            return
+        return
+
+    appt_date, start_time = parse_datetime_from_speech(speech, _today_clinic_date())
+    if appt_date:
+        backup_date = appt_date
+    if start_time:
+        svc.appointment_date = backup_date
+        svc.start_time = start_time
+        state.offered_slots = []
+        phone = state.from_number
+        if phone.startswith("tel:"):
+            phone = phone[4:]
+        result = await _book_single(ws, state, svc, phone)
+        if result is not None:
+            svc.booked_appt = result[0]
+            await do_book_all(ws, state)
+            return
+        return
+
+    state.retries += 1
+    if state.retries >= _step_max_retries():
+        state.step = "datetime"
+        await _send_text(
+            ws,
+            "Let's try a different day — what date and time work for you?",
+        )
+        return
+    opts = ", ".join(state.offered_slots) if state.offered_slots else "another time"
+    await _send_text(
+        ws,
+        f"Sorry, I didn't catch which time. You can say {opts}, or tell me a different day.",
+    )
+
+
+async def handle_pick_appointment(ws: WebSocket, state: ConversationState, speech: str):
+    """Caller chooses which upcoming appointment to cancel or reschedule."""
+    lower = speech.lower().strip()
+    idx = None
+    for i in range(len(state.pending_appointments)):
+        if str(i + 1) in lower.split() or f"number {i + 1}" in lower:
+            idx = i
+            break
+    if idx is None and ("first" in lower or "one" in lower):
+        idx = 0
+    elif idx is None and ("second" in lower or "two" in lower) and len(state.pending_appointments) > 1:
+        idx = 1
+    elif idx is None and ("third" in lower or "three" in lower) and len(state.pending_appointments) > 2:
+        idx = 2
+
+    if idx is None or idx >= len(state.pending_appointments):
+        await _send_text(
+            ws,
+            "Please say which appointment — for example, number 1 or number 2.",
+        )
+        return
+
+    state.cancel_appointment_id = state.pending_appointments[idx]
+    action = state.self_service_action or "cancel"
+    state.step = f"confirm_{action}"
+    state.pending_appointments = []
+    await _send_text(
+        ws,
+        f"Got it. Just say yes to confirm you'd like to {action} that appointment, or no to keep it.",
+    )
+
+
+async def handle_confirm_cancel(ws: WebSocket, state: ConversationState, speech: str):
+    lower = speech.lower()
+    is_yes = any(w in lower for w in ("yes", "yeah", "yep", "correct", "right", "sure", "go ahead"))
+    is_no = any(w in lower for w in ("no", "nope", "wrong", "different", "keep"))
+
+    if is_no:
+        state.cancel_appointment_id = None
+        state.step = "service" if state.catalog else "name"
+        state.retries = 0
         await _speak_llm(
             ws,
-            f"The requested time for {svc.service_name} is not available. "
-            f"But you found these nearby open slots on the same day: {slot_list}. "
-            f"Offer them naturally. The caller can also pick a totally different date. "
-            f"REQUIRED FACTS — available slots: {slot_list}",
-            f"That time's taken, but I have {slot_list} available. "
-            f"Would any of those work, or would you prefer a different day?",
-        state=state,
+            "Caller said no to cancellation. Ask what they need help with.",
+            "No problem! What else can I help you with?",
+            state=state,
+        )
+        return
+
+    if not is_yes:
+        await _send_text(
+            ws,
+            "Just say yes to confirm the cancellation, or no to keep your appointment.",
+        )
+        return
+
+    def _cancel():
+        norm = normalize_phone(state.from_number)
+        return cancel_appointment_public(
+            phone_normalized=norm,
+            appointment_id=state.cancel_appointment_id,
+        )
+
+    appt, err = await sync_to_async(_cancel, thread_sensitive=True)()
+    if appt and not err:
+        await _end_session_speaking_llm(
+            ws,
+            "Appointment cancelled successfully. Thank them warmly and say goodbye. "
+            "Offer to rebook anytime.",
+            "Done! Your appointment has been cancelled. "
+            "Feel free to call back anytime to reschedule. Take care!",
+            state=state,
         )
     else:
+        err_msg = err or "unknown error"
         await _speak_llm(
             ws,
-            f"The time for {svc.service_name} is taken and no other slots are available on that day. "
-            f"Ask the caller to try a different date. Be empathetic.",
-            f"Unfortunately that slot is taken and the rest of the day looks full. "
-            f"Would you like to try a different date?",
-        state=state,
+            f"Could not cancel: {err_msg}. Apologize and suggest calling the front desk at 269-408-0303.",
+            "I'm sorry, I wasn't able to cancel that online. "
+            "Please call our front desk at 269-408-0303 and they can help right away.",
+            state=state,
+        )
+
+
+async def handle_confirm_reschedule(ws: WebSocket, state: ConversationState, speech: str):
+    lower = speech.lower()
+    is_yes = any(w in lower for w in ("yes", "yeah", "yep", "correct", "right", "sure", "go ahead"))
+    is_no = any(w in lower for w in ("no", "nope", "wrong", "different", "keep"))
+
+    if is_no:
+        state.cancel_appointment_id = None
+        state.step = "service" if state.catalog else "name"
+        state.retries = 0
+        await _speak_llm(
+            ws,
+            "Caller does not want to reschedule that visit. Ask what else they need.",
+            "No problem! What else can I help you with?",
+            state=state,
+        )
+        return
+
+    if not is_yes:
+        await _send_text(
+            ws,
+            "Just say yes to reschedule that appointment, or no to keep the current time.",
+        )
+        return
+
+    state.reschedule_appointment_id = state.cancel_appointment_id
+    state.cancel_appointment_id = None
+    state.step = "reschedule_datetime"
+    state.retries = 0
+    await _send_text(
+        ws,
+        "Sure! What new date and time would you like?",
+    )
+
+
+async def handle_reschedule_datetime(ws: WebSocket, state: ConversationState, speech: str):
+    """Collect new date/time and apply reschedule_appointment_public."""
+    tz_name = getattr(settings, "CLINIC_TIMEZONE", "America/Detroit")
+    today = timezone.now().astimezone(ZoneInfo(tz_name)).date()
+
+    ai_date, ai_time = await _openai_parse_datetime_async(speech, today.isoformat())
+    appt_date, start_time = ai_date, ai_time
+    if not appt_date or not start_time:
+        local_date, local_time = parse_datetime_from_speech(speech, today)
+        appt_date = appt_date or local_date
+        start_time = start_time or local_time
+
+    if not appt_date or not start_time:
+        state.retries += 1
+        if state.retries >= _step_max_retries():
+            await _speak_llm(
+                ws,
+                "Could not understand new date/time after several tries. "
+                "Suggest calling the front desk at 269-408-0303.",
+                "I'm having trouble with the new time. "
+                "Please call our front desk at 269-408-0303 for help. Thanks!",
+                state=state,
+            )
+            return
+        await _send_text(
+            ws,
+            "I didn't catch that. Could you say the new date and time? "
+            "For example, tomorrow at 2pm or next Monday at 10am.",
+        )
+        return
+
+    try:
+        new_date = date_type.fromisoformat(appt_date)
+        new_start = _parse_time_12h(start_time)
+    except (ValueError, TypeError):
+        await _send_text(ws, "Sorry — could you say that date and time again?")
+        return
+
+    if not new_start:
+        await _send_text(ws, "Sorry — could you say that time again?")
+        return
+
+    appt_id = state.reschedule_appointment_id
+    if not appt_id:
+        state.step = "service"
+        await _send_text(ws, "Let's start over — what can I help you with?")
+        return
+
+    def _reschedule():
+        norm = normalize_phone(state.from_number)
+        return reschedule_appointment_public(
+            phone_normalized=norm,
+            appointment_id=appt_id,
+            new_date=new_date,
+            new_start=new_start,
+            sms_consent=True,
+        )
+
+    appt, err = await sync_to_async(_reschedule, thread_sensitive=True)()
+    state.reschedule_appointment_id = None
+    state.retries = 0
+
+    if appt and not err:
+        when = _booking_datetime_plain_english(appt.appointment_date, appt.start_time)
+        await _end_session_speaking_llm(
+            ws,
+            f"Appointment rescheduled successfully to {when}. "
+            "Thank them and mention confirmation by text and email.",
+            f"You're all set — your visit is now scheduled for {when}. "
+            "You'll get a confirmation by text and email. Have a great day!",
+            state=state,
+        )
+    else:
+        err_msg = err or "unknown error"
+        if "not available" in (err_msg or "").lower() or "not open" in (err_msg or "").lower():
+            await _send_text(
+                ws,
+                f"That time isn't available. {err_msg} What other date and time would work?",
+            )
+            return
+        await _speak_llm(
+            ws,
+            f"Reschedule failed: {err_msg}. Apologize; suggest front desk 269-408-0303.",
+            "I'm sorry, I couldn't move that appointment online. "
+            "Please call 269-408-0303 and our team can help.",
+            state=state,
         )
 
 
@@ -2011,6 +2456,11 @@ STEP_HANDLERS = {
     "confirm_services": handle_confirm_services,
     "datetime": handle_datetime,
     "confirm": handle_confirm,
+    "pick_slot": handle_pick_slot,
+    "pick_appointment": handle_pick_appointment,
+    "confirm_cancel": handle_confirm_cancel,
+    "confirm_reschedule": handle_confirm_reschedule,
+    "reschedule_datetime": handle_reschedule_datetime,
     "addon_offer": handle_addon_offer,
     "service_addon": handle_service_addon,
 }
@@ -2022,6 +2472,11 @@ _NUDGE_CONTEXTS = {
     "pick_service": "The caller went silent while picking a specific service. Gently re-ask.",
     "confirm_services": "The caller went silent during service confirmation. Gently ask yes or no.",
     "datetime": "The caller went silent. Gently ask what date and time works for them.",
+    "pick_slot": "The caller went silent while picking an alternative time. Gently repeat the offered times.",
+    "pick_appointment": "The caller went silent while choosing which appointment to change. Gently re-ask.",
+    "confirm_cancel": "The caller went silent. Gently ask yes or no about cancelling.",
+    "confirm_reschedule": "The caller went silent. Gently ask yes or no about rescheduling.",
+    "reschedule_datetime": "The caller went silent. Gently ask for the new date and time.",
     "confirm": "The caller went silent during final confirmation. Gently ask if they'd like to book.",
     "addon_offer": "The caller went silent after one visit was booked. Gently ask if that was everything, and mention the other service (chiropractic or massage) is available if they want — or they're all set.",
     "service_addon": "The caller went silent while choosing an add-on visit. Gently list options or ask which visit type.",
@@ -2033,47 +2488,44 @@ _NUDGE_FALLBACKS = {
     "pick_service": "Which specific option would you prefer?",
     "confirm_services": "Just say yes to confirm or no if you'd like to change anything.",
     "datetime": "What date and time work for you?",
+    "pick_slot": "Which of those times works for you?",
+    "pick_appointment": "Which appointment number would you like to change?",
+    "confirm_cancel": "Say yes to cancel or no to keep your appointment.",
+    "confirm_reschedule": "Say yes to reschedule or no to keep your current time.",
+    "reschedule_datetime": "What new date and time would you like?",
     "confirm": "Should I go ahead and book that for you?",
     "addon_offer": "I'm still here — was that all you needed, or would you like to hear about adding the other visit type?",
     "service_addon": "Which visit type would you like to add?",
 }
 
 SILENCE_NUDGES = [
-    "I'm here — go ahead.",
+    "Still here! Go ahead.",
     "Take your time, I'm listening.",
-    "Sorry, I missed that — go ahead.",
-    "Still here! What can I help you with?",
-    "Go ahead, I'm listening.",
+    "Go ahead whenever you're ready.",
+    "I'm here — what can I help you with?",
+    "No rush, go ahead.",
 ]
 
-KNOWN_SHORT_INTENTS = {
-    "yes",
-    "no",
-    "yeah",
-    "nope",
-    "yep",
-    "chiro",
-    "massage",
-    "cancel",
-    "reschedule",
-    "book",
-    "appointment",
-    "both",
-    "change",
+VALID_SHORT = {
+    "yes", "no", "yeah", "nope", "yep", "yea", "sure", "ok", "okay", "correct",
+    "right", "both", "chiro", "massage", "cancel", "reschedule", "book",
+    "morning", "afternoon", "evening",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "one", "two", "three", "first", "second", "third",
 }
 
 
-def _should_count_as_silence(speech: str) -> bool:
-    """True only for empty STT or very short unclear fragments (not yes/no/chiro/etc.)."""
-    if not speech.strip():
-        return True
-    words = speech.split()
-    if len(words) <= 2:
-        word_set = {w.lower().strip(".,!?") for w in words}
-        if word_set & KNOWN_SHORT_INTENTS:
-            return False
-        return True
-    return False
+async def _keepalive_ping(ws: WebSocket, interval: int = 25) -> None:
+    """Send periodic info messages to keep the WebSocket alive during long pauses."""
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await ws.send_json({"type": "info", "message": "keepalive"})
+            except Exception:
+                break
+    except asyncio.CancelledError:
+        pass
 
 
 # ─── WebSocket endpoint ──────────────────────────────────────────────
@@ -2082,6 +2534,7 @@ def _should_count_as_silence(speech: str) -> bool:
 async def voice_websocket(ws: WebSocket):
     await ws.accept()
     state: ConversationState | None = None
+    keepalive = asyncio.create_task(_keepalive_ping(ws))
 
     try:
         while True:
@@ -2090,14 +2543,18 @@ async def voice_websocket(ws: WebSocket):
             msg_type = msg.get("type", "")
 
             if msg_type == "setup":
-                if state is not None and state.first_name:
-                    # Already set up — welcomeGreeting in TwiML handled the greeting
+                if state is not None and getattr(state, "_setup_done", False):
+                    logger.warning(
+                        "Duplicate setup ignored [%s]",
+                        state.call_sid[:8],
+                    )
                     continue
 
                 call_sid = msg.get("callSid", "")
                 from_number = msg.get("from", "")
 
                 state = ConversationState(call_sid, from_number)
+                state._setup_done = True
 
                 await async_upsert_voice_call_log(
                     call_sid=call_sid,
@@ -2159,7 +2616,7 @@ async def voice_websocket(ws: WebSocket):
                         transcript=speech,
                     )
 
-                if _should_count_as_silence(speech):
+                if not speech or len(speech.strip()) == 0:
                     state.retries += 1
                     if state.retries >= _silence_max_retries():
                         await async_upsert_voice_call_log(
@@ -2175,10 +2632,9 @@ async def voice_websocket(ws: WebSocket):
                             "Invite them to call back anytime.",
                             "Looks like we may have lost the connection. "
                             "Feel free to call back anytime. Take care!",
-                        state=state,
+                            state=state,
                         )
                         break
-
                     nudge = random.choice(SILENCE_NUDGES)
                     if getattr(settings, "VOICE_LLM_FOR_SILENCE_NUDGES", False):
                         context = _NUDGE_CONTEXTS.get(
@@ -2190,11 +2646,30 @@ async def voice_websocket(ws: WebSocket):
                         await _send_text(ws, nudge)
                     continue
 
+                if len(speech.split()) <= 2:
+                    words = {w.lower().strip(".,!?") for w in speech.split()}
+                    if not (words & VALID_SHORT):
+                        state._noise_count = getattr(state, "_noise_count", 0) + 1
+                        if state._noise_count < 2:
+                            continue
+                        state._noise_count = 0
+                        await _send_text(
+                            ws,
+                            random.choice([
+                                "Go ahead, I'm listening.",
+                                "Take your time.",
+                                "I'm here, go ahead.",
+                            ]),
+                        )
+                        continue
+
+                state.retries = 0
+                state._noise_count = 0
+
                 # Check for off-script intents before step handlers
                 if await _handle_off_script(ws, state, speech):
                     continue
 
-                state.retries = 0
                 handler = STEP_HANDLERS.get(state.step, handle_name)
                 await handler(ws, state, speech)
 
@@ -2238,23 +2713,42 @@ async def voice_websocket(ws: WebSocket):
     except WebSocketDisconnect:
         _last_responses.pop(id(ws), None)
         if state:
-            logger.info("Voice WS [%s] disconnected", state.call_sid[:8])
-            await async_upsert_voice_call_log(
-                call_sid=state.call_sid,
-                from_number=state.from_number,
-                outcome=VoiceCallLog.Outcome.DISCONNECTED,
-                detail="websocket_closed",
-            )
-    except Exception as exc:
+            logger.info("Caller hung up [%s]", state.call_sid[:8])
+    except Exception as e:
         _last_responses.pop(id(ws), None)
-        logger.exception("Voice WS unexpected error")
-        detail = f"{type(exc).__name__}: {exc}"[:2000]
+        logger.exception(
+            "Unexpected error in voice [%s]: %s",
+            state.call_sid[:8] if state else "?",
+            e,
+        )
+        try:
+            await _send_text(
+                ws,
+                "I'm sorry, something went wrong. "
+                "Please call back and we'll get you scheduled. Goodbye!",
+                last=True,
+            )
+        except Exception:
+            pass
         if state:
             await async_upsert_voice_call_log(
                 call_sid=state.call_sid,
                 from_number=state.from_number,
                 outcome=VoiceCallLog.Outcome.OPENAI_FAILED,
-                detail=detail,
+                detail=f"{type(e).__name__}: {e}"[:2000],
+            )
+    finally:
+        keepalive.cancel()
+        try:
+            await keepalive
+        except asyncio.CancelledError:
+            pass
+        if state:
+            await async_upsert_voice_call_log(
+                call_sid=state.call_sid,
+                from_number=state.from_number,
+                outcome=VoiceCallLog.Outcome.DISCONNECTED,
+                detail="session_ended",
             )
 
 

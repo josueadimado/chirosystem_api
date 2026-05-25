@@ -86,7 +86,7 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/0
     # Single worker: ConversationRelay is one long-lived WebSocket per call; multiple workers
     # can mis-route or confuse load balancers unless sticky sessions are configured.
-    command: uvicorn voice_relay:app --host 0.0.0.0 --port 8001 --workers 1 --timeout-keep-alive 120
+    command: uvicorn voice_relay:app --host 0.0.0.0 --port 8001 --workers 1 --timeout-keep-alive 600
     depends_on:
       db:
         condition: service_healthy

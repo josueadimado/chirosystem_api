@@ -116,18 +116,49 @@ def extract_name_from_speech(speech: str) -> tuple[str, str]:
 
 # ─── Service matching (no AI) ─────────────────────────────────────────
 
-SYMPTOM_TO_TYPE = {
-    "back": "chiropractic",
-    "neck": "chiropractic",
+SYMPTOM_TO_TYPE: dict[str, str] = {
+    # Chiropractic
+    "back pain": "chiropractic",
+    "back hurts": "chiropractic",
+    "back ache": "chiropractic",
+    "backache": "chiropractic",
+    "neck pain": "chiropractic",
+    "neck hurts": "chiropractic",
     "headache": "chiropractic",
+    "headaches": "chiropractic",
+    "migraine": "chiropractic",
     "adjustment": "chiropractic",
+    "adjusted": "chiropractic",
     "spine": "chiropractic",
-    "pain": "chiropractic",
+    "spinal": "chiropractic",
+    "sciatica": "chiropractic",
+    "posture": "chiropractic",
+    "alignment": "chiropractic",
+    "pinched nerve": "chiropractic",
+    "shoulder pain": "chiropractic",
+    "hip pain": "chiropractic",
+    "lower back": "chiropractic",
+    "upper back": "chiropractic",
+    "disc": "chiropractic",
+    "crack my back": "chiropractic",
+    "pop my back": "chiropractic",
+    # Massage
     "massage": "massage",
+    "deep tissue": "massage",
+    "swedish": "massage",
+    "relaxation": "massage",
     "relax": "massage",
     "stress": "massage",
-    "tight": "massage",
-    "sore": "massage",
+    "tight muscles": "massage",
+    "muscle tension": "massage",
+    "sore muscles": "massage",
+    "knots": "massage",
+    "tension": "massage",
+    "sports massage": "massage",
+    "prenatal massage": "massage",
+    "therapeutic": "massage",
+    "unwind": "massage",
+    "loosen up": "massage",
 }
 
 
@@ -163,13 +194,13 @@ def match_service_from_speech(speech: str, services: list[dict]) -> dict | None:
     if best and best_score >= 1:
         return best
 
-    for keyword, stype in SYMPTOM_TO_TYPE.items():
-        if keyword in s_lower:
+    for symptom, stype in SYMPTOM_TO_TYPE.items():
+        if symptom in s_lower:
             typed = [svc for svc in services if svc.get("service_type") == stype]
             if len(typed) == 1:
                 return typed[0]
             if typed:
-                return typed[0]
+                return min(typed, key=lambda x: x["duration_minutes"])
 
     type_map = {"chiropractic": "chiropractic", "chiro": "chiropractic",
                 "massage": "massage", "massages": "massage"}
