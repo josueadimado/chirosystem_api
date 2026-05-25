@@ -55,8 +55,29 @@ class Command(BaseCommand):
             defaults["full_name"] = full_name
 
         user, created = User.objects.update_or_create(username=username, defaults=defaults)
+        user.email = email
+        user.is_active = True
+        user.is_staff = True
+        user.is_superuser = True
+        user.role = User.Roles.OWNER_ADMIN
+        if full_name:
+            user.full_name = full_name
         user.set_password(password)
-        user.save(update_fields=["password"])
+        user.save(
+            update_fields=[
+                "email",
+                "is_active",
+                "is_staff",
+                "is_superuser",
+                "role",
+                "full_name",
+                "password",
+            ]
+        )
 
-        verb = "Created" if created else "Updated password for"
-        self.stdout.write(self.style.SUCCESS(f"{verb} superuser '{username}'."))
+        verb = "Created" if created else "Updated"
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"{verb} owner admin '{username}' (active, password synced from env)."
+            )
+        )
