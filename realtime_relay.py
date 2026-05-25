@@ -50,7 +50,10 @@ logger = logging.getLogger("realtime_relay")
 app = FastAPI(title="ChiroFlow Realtime Voice Relay")
 
 OPENAI_REALTIME_MODEL = "gpt-4o-realtime-preview-2024-12-17"
-OPENAI_REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
+OPENAI_REALTIME_URL = (
+    "wss://api.openai.com/v1/realtime"
+    f"?model={OPENAI_REALTIME_MODEL}"
+)
 
 # ─── Tool schemas (OpenAI Realtime) ───────────────────────────────────
 
@@ -530,12 +533,12 @@ class RealtimeBridge:
             raise RuntimeError("OPENAI_API_KEY is not configured")
 
         instructions = await _build_prompt_async(from_number=self.from_number)
-        # GA Realtime: do not send OpenAI-Beta (beta shape returns beta_api_shape_disabled).
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+        }
         self.openai_ws = await websockets.connect(
             OPENAI_REALTIME_URL,
-            additional_headers={
-                "Authorization": f"Bearer {api_key}",
-            },
+            additional_headers=headers,
             ping_interval=20,
             ping_timeout=20,
         )
