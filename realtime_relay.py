@@ -49,7 +49,7 @@ logger = logging.getLogger("realtime_relay")
 
 app = FastAPI(title="ChiroFlow Realtime Voice Relay")
 
-OPENAI_REALTIME_MODEL = "gpt-4o-realtime-preview"
+OPENAI_REALTIME_MODEL = "gpt-4o-realtime-preview-2024-12-17"
 OPENAI_REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
 
 # ─── Tool schemas (OpenAI Realtime) ───────────────────────────────────
@@ -543,24 +543,17 @@ class RealtimeBridge:
             "type": "session.update",
             "session": {
                 "type": "realtime",
-                "model": OPENAI_REALTIME_MODEL,
                 "instructions": instructions,
-                "output_modalities": ["audio", "text"],
-                "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcmu"},
-                        "transcription": {"model": "whisper-1"},
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "threshold": 0.5,
-                            "prefix_padding_ms": 300,
-                            "silence_duration_ms": 600,
-                        },
-                    },
-                    "output": {
-                        "format": {"type": "audio/pcmu"},
-                        "voice": "shimmer",
-                    },
+                "modalities": ["text", "audio"],
+                "voice": "shimmer",
+                "input_audio_format": "g711_ulaw",
+                "output_audio_format": "g711_ulaw",
+                "input_audio_transcription": {"model": "whisper-1"},
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.5,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 600,
                 },
                 "tools": REALTIME_TOOLS,
                 "tool_choice": "auto",
@@ -578,7 +571,7 @@ class RealtimeBridge:
                 {
                     "type": "response.create",
                     "response": {
-                        "output_modalities": ["audio", "text"],
+                        "modalities": ["audio", "text"],
                         "instructions": (
                             "Say the following to the caller as your very first words, "
                             f"warmly and naturally: {self.greeting}"
