@@ -1,13 +1,12 @@
 """
 Twilio Programmable Voice – AI booking assistant.
 
-Now uses ConversationRelay (streaming STT + TTS via WebSocket) for ~2-3s latency
-instead of the old Gather/Say HTTP loop (~8s).
+Primary path: Twilio Media Streams → FastAPI realtime_relay.py → OpenAI Realtime API
+(STT + reasoning + TTS in one session).
 
-The incoming webhook returns <Connect><ConversationRelay> TwiML that tells Twilio
-to open a WebSocket to our FastAPI voice_relay server.
+Legacy ConversationRelay (voice_relay.py) TwiML helpers remain for reference/fallback env.
 
-The old <Gather> fallback is kept but should never be called in normal operation.
+The old <Gather> HTTP loop is kept if no WebSocket URL is configured.
 """
 
 from __future__ import annotations
@@ -130,6 +129,44 @@ def _normalize_conversation_relay_ws_base(raw: str) -> str:
     return u.rstrip("/")
 
 
+def _normalize_media_stream_ws_base(raw: str) -> str:
+    """
+    Normalize public wss:// origin for Twilio <Stream url="..."> (Media Streams).
+    Returns origin only (no path), or "" if invalid.
+    """
+    u = (raw or "").strip().rstrip("/")
+    if not u:
+        return ""
+    low = u.lower()
+    for suffix in ("/ws/realtime", "/ws/voice"):
+        if low.endswith(suffix):
+            u = u[: -len(suffix)].rstrip("/")
+            low = u.lower()
+    if "://" not in u:
+        u = f"wss://{u.lstrip('/')}"
+        low = u.lower()
+    elif low.startswith("https://"):
+        u = "wss://" + u[8:]
+    elif low.startswith("http://"):
+        u = "wss://" + u[7:]
+    low = u.lower()
+    if not low.startswith("wss://"):
+        logger.error(
+            "Realtime stream URL must start with wss:// (got %r).",
+            (raw or "")[:120],
+        )
+        return ""
+    return u.rstrip("/")
+
+
+def _realtime_stream_ws_base() -> str:
+    """Public wss origin for Media Streams; prefers REALTIME_WS_PUBLIC_URL, else VOICE_WS_PUBLIC_URL."""
+    raw = (getattr(settings, "REALTIME_WS_PUBLIC_URL", "") or "").strip()
+    if not raw:
+        raw = (getattr(settings, "VOICE_WS_PUBLIC_URL", "") or "").strip()
+    return _normalize_media_stream_ws_base(raw)
+
+
 def _elevenlabs_twilio_voice(tts_voice_full: str, voice_id: str) -> str:
     """
     Build the Twilio `voice` attribute for ElevenLabs TTS.
@@ -149,38 +186,22 @@ def _elevenlabs_twilio_voice(tts_voice_full: str, voice_id: str) -> str:
     return base
 
 
-# ─── Incoming call (ConversationRelay) ─────────────────────────────────
+# ─── Incoming call (Media Streams → OpenAI Realtime) ───────────────────
 
-@csrf_exempt
-@require_POST
-def twilio_voice_incoming(request):
-    if not _sig_ok(request, "twilio_voice_incoming"):
-        return HttpResponse("Forbidden", status=403)
-
-    sid = (request.POST.get("CallSid") or "").strip()
-    frm = (request.POST.get("From") or "").strip()
-    upsert_voice_call_log(call_sid=sid, from_number=frm, outcome=VoiceCallLog.Outcome.PROMPTED)
-
-    ws_raw = (getattr(settings, "VOICE_WS_PUBLIC_URL", "") or "").strip()
-    ws_base = _normalize_conversation_relay_ws_base(ws_raw)
-    voice_id = (getattr(settings, "ELEVENLABS_VOICE_ID", "") or "").strip()
-    clinic = ClinicSettings.get_solo()
-
+def _voice_greeting_for_caller(from_number: str, clinic_name: str) -> str:
+    """Build Sarah's opening line; passed to realtime_relay via Stream <Parameter>."""
     import random
-    clinic_name = escape(clinic.clinic_name)
 
-    # Detect returning patients by phone before the WebSocket connects (one number may be shared in a family)
     from apps.clinic.patient_phone import patients_matching_phone
 
     patient = None
-    norm_phone = normalize_phone(frm)
+    norm_phone = normalize_phone(from_number)
     phone_matches = patients_matching_phone(norm_phone) if norm_phone else []
     if len(phone_matches) == 1:
         patient = phone_matches[0]
 
     if patient:
-        pname = escape(f"{patient.first_name} {patient.last_name}".strip())
-        # Check recent appointment history for smart suggestions
+        pname = f"{patient.first_name} {patient.last_name}".strip()
         last_appt = (
             Appointment.objects.filter(patient=patient)
             .exclude(status__in=[Appointment.Status.CANCELLED, Appointment.Status.NO_SHOW])
@@ -188,7 +209,7 @@ def twilio_voice_incoming(request):
             .first()
         )
         if last_appt and last_appt.booked_service:
-            last_svc = escape(last_appt.booked_service.label_for_public_booking())
+            last_svc = last_appt.booked_service.label_for_public_booking()
             returning_greetings = [
                 f"Hey {pname}! Welcome back to {clinic_name}. Last time you had a {last_svc} — would you like to book that again, or try something different?",
                 f"Hi {pname}, great to hear from you again! I see your last visit was for a {last_svc}. Want to go with that again, or a different service?",
@@ -200,64 +221,55 @@ def twilio_voice_incoming(request):
                 f"Hi {pname}, good to hear from you again! What service would you like to schedule?",
                 f"{pname}! Great to have you back at {clinic_name}. What are you looking to book today?",
             ]
-        greeting = random.choice(returning_greetings)
-    else:
-        new_greetings = [
-            f"Hey there! Thanks for calling {clinic_name}. I'm Sarah and I'd love to help you get an appointment set up. Could I get your first and last name?",
-            f"Hi! You've reached {clinic_name}, this is Sarah. I can help you book an appointment real quick. What's your name?",
-            f"Thanks for calling {clinic_name}! I'm Sarah. Let's get you scheduled — can I start with your first and last name?",
-            f"Hey, welcome to {clinic_name}! I'm Sarah and I'll help you book an appointment. What's your name?",
-            f"Hi there! Thanks for calling {clinic_name}. I'm Sarah — I can get you booked in just a minute. What's your first and last name?",
-        ]
-        greeting = random.choice(new_greetings)
+        return random.choice(returning_greetings)
 
+    new_greetings = [
+        f"Hey there! Thanks for calling {clinic_name}. I'm Sarah and I'd love to help you get an appointment set up. Could I get your first and last name?",
+        f"Hi! You've reached {clinic_name}, this is Sarah. I can help you book an appointment real quick. What's your name?",
+        f"Thanks for calling {clinic_name}! I'm Sarah. Let's get you scheduled — can I start with your first and last name?",
+        f"Hey, welcome to {clinic_name}! I'm Sarah and I'll help you book an appointment. What's your name?",
+        f"Hi there! Thanks for calling {clinic_name}. I'm Sarah — I can get you booked in just a minute. What's your first and last name?",
+    ]
+    return random.choice(new_greetings)
+
+
+@csrf_exempt
+@require_POST
+def twilio_voice_incoming(request):
+    if not _sig_ok(request, "twilio_voice_incoming"):
+        return HttpResponse("Forbidden", status=403)
+
+    sid = (request.POST.get("CallSid") or "").strip()
+    frm = (request.POST.get("From") or "").strip()
+    upsert_voice_call_log(call_sid=sid, from_number=frm, outcome=VoiceCallLog.Outcome.PROMPTED)
+
+    clinic = ClinicSettings.get_solo()
+    clinic_name = clinic.clinic_name
+    greeting = _voice_greeting_for_caller(frm, clinic_name)
+
+    ws_base = _realtime_stream_ws_base()
     if ws_base:
-        relay_ws_url = f"{ws_base}/ws/voice"
-        # Twilio disconnects immediately if ttsProvider/voice combo is invalid or ElevenLabs isn't enabled on the account.
-        tts_provider = (getattr(settings, "CONVERSATION_RELAY_TTS_PROVIDER", "") or "ElevenLabs").strip()
-        tts_voice_setting = (getattr(settings, "CONVERSATION_RELAY_TTS_VOICE", "") or "").strip()
-        if tts_provider.lower() == "google":
-            tts_provider = "Google"
-            tts_voice = tts_voice_setting or "en-US-Journey-O"
-        elif tts_provider.lower() == "amazon":
-            tts_provider = "Amazon"
-            tts_voice = tts_voice_setting or "Joanna-Neural"
-        else:
-            tts_provider = "ElevenLabs"
-            tts_voice = _elevenlabs_twilio_voice(tts_voice_setting, voice_id)
-        # Nested <Language> matches Twilio's documented shape; some accounts fail if only parent attributes are set.
-        lang_block = (
-            f'<Language code="en-US" '
-            f'ttsProvider="{escape(tts_provider)}" voice="{escape(tts_voice)}" '
-            f'transcriptionProvider="Deepgram" speechModel="nova-2-general"/>'
-        )
-        el_norm = (getattr(settings, "CONVERSATION_RELAY_ELEVENLABS_TEXT_NORMALIZATION", "") or "").strip().lower()
-        relay_el_attr = ""
-        if tts_provider == "ElevenLabs" and el_norm in ("on", "off", "auto"):
-            relay_el_attr = f' elevenlabsTextNormalization="{escape(el_norm)}"'
+        stream_url = f"{ws_base}/ws/realtime"
         twiml = (
-            f'<Connect>'
-            f'<ConversationRelay '
-            f'url="{escape(relay_ws_url)}" '
-            f'welcomeGreeting="{escape(greeting)}" '
-            f'language="en-US" '
-            f'interruptible="true" '
-            f'dtmfDetection="true"'
-            f'{relay_el_attr}>'
-            f'{lang_block}'
-            f'</ConversationRelay>'
-            f'</Connect>'
+            "<Connect>"
+            f'<Stream url="{escape(stream_url)}">'
+            f'<Parameter name="greeting" value="{escape(greeting)}"/>'
+            f'<Parameter name="call_sid" value="{escape(sid)}"/>'
+            f'<Parameter name="from_number" value="{escape(frm)}"/>'
+            "</Stream>"
+            "</Connect>"
         )
-        logger.info("Voice [%s] ConversationRelay url=%s", sid[:8], relay_ws_url)
+        logger.info("Voice [%s] Media Stream (Realtime) url=%s", sid[:8], stream_url)
         return _xml(twiml)
 
     logger.warning(
-        "VOICE_WS_PUBLIC_URL missing or invalid — falling back to legacy Gather loop. "
-        "Set wss:// origin (e.g. wss://api.example.com) matching your public WebSocket proxy."
+        "REALTIME_WS_PUBLIC_URL / VOICE_WS_PUBLIC_URL missing or invalid — "
+        "falling back to legacy Gather loop. "
+        "Set wss://api.example.com (no path) for Media Streams + OpenAI Realtime."
     )
     return _listen(
         request,
-        f"Hi, thanks for calling {escape(clinic.clinic_name)}! "
+        f"Hi, thanks for calling {escape(clinic_name)}! "
         "I can help you book an appointment. "
         "What's your first and last name?",
     )
