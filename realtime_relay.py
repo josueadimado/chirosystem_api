@@ -547,8 +547,7 @@ class RealtimeBridge:
             "session": {
                 "type": "realtime",
                 "instructions": instructions,
-                "modalities": ["text", "audio"],
-                "voice": "shimmer",
+                "voice": "nova",
                 "input_audio_format": "g711_ulaw",
                 "output_audio_format": "g711_ulaw",
                 "input_audio_transcription": {"model": "whisper-1"},
@@ -574,7 +573,6 @@ class RealtimeBridge:
                 {
                     "type": "response.create",
                     "response": {
-                        "modalities": ["audio", "text"],
                         "instructions": (
                             "Say the following to the caller as your very first words, "
                             f"warmly and naturally: {self.greeting}"
