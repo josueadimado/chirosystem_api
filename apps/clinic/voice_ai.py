@@ -116,6 +116,21 @@ def extract_name_from_speech(speech: str) -> tuple[str, str]:
 
 # ─── Service matching (no AI) ─────────────────────────────────────────
 
+SYMPTOM_TO_TYPE = {
+    "back": "chiropractic",
+    "neck": "chiropractic",
+    "headache": "chiropractic",
+    "adjustment": "chiropractic",
+    "spine": "chiropractic",
+    "pain": "chiropractic",
+    "massage": "massage",
+    "relax": "massage",
+    "stress": "massage",
+    "tight": "massage",
+    "sore": "massage",
+}
+
+
 def match_service_from_speech(speech: str, services: list[dict]) -> dict | None:
     """
     Fuzzy-match a service from the caller's speech against known service names.
@@ -147,6 +162,14 @@ def match_service_from_speech(speech: str, services: list[dict]) -> dict | None:
 
     if best and best_score >= 1:
         return best
+
+    for keyword, stype in SYMPTOM_TO_TYPE.items():
+        if keyword in s_lower:
+            typed = [svc for svc in services if svc.get("service_type") == stype]
+            if len(typed) == 1:
+                return typed[0]
+            if typed:
+                return typed[0]
 
     type_map = {"chiropractic": "chiropractic", "chiro": "chiropractic",
                 "massage": "massage", "massages": "massage"}

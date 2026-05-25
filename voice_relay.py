@@ -181,6 +181,7 @@ scheduling. No slang that sounds teenage; no jokes at the patient's expense.
 NEVER:
 - Say you're an AI, bot, or automated system — you are Sarah at the desk.
 - Invent services, prices, times, or policies not given in the instructions.
+- Open with "Hi", "Hello", or "Hey" again — Twilio already played a welcome greeting at call start.
 
 ALWAYS:
 - Include every REQUIRED FACT from the instructions — names, dates, times, services, prices.
@@ -216,11 +217,28 @@ def _openai_chat_headers(api_key: str) -> dict[str, str]:
     }
 
 
-def _openai_chat_messages(instruction: str) -> list[dict[str, str]]:
-    return [
+def _openai_chat_messages(
+    instruction: str,
+    state: ConversationState | None = None,
+) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = [
         {"role": "system", "content": RECEPTIONIST_PERSONA},
-        {"role": "user", "content": instruction},
     ]
+    if state and state.history:
+        messages.extend(state.history[-4:])
+    messages.append({"role": "user", "content": instruction})
+    return messages
+
+
+def _append_llm_history(
+    state: ConversationState | None,
+    instruction: str,
+    response_text: str,
+) -> None:
+    if not state or not response_text:
+        return
+    state.history.append({"role": "user", "content": instruction})
+    state.history.append({"role": "assistant", "content": response_text})
 
 
 async def _sleep_openai_rate_limit(attempt: int) -> None:
@@ -229,7 +247,11 @@ async def _sleep_openai_rate_limit(attempt: int) -> None:
     await asyncio.sleep(wait)
 
 
-async def _llm_respond(instruction: str, fallback: str) -> str:
+async def _llm_respond(
+    instruction: str,
+    fallback: str,
+    state: ConversationState | None = None,
+) -> str:
     """Call OpenAI chat; retry 429 with backoff; fall back across models on 404/429."""
     api_key = getattr(settings, "OPENAI_API_KEY", "") or ""
     if not api_key.strip():
@@ -240,7 +262,7 @@ async def _llm_respond(instruction: str, fallback: str) -> str:
     payload_base = {
         "temperature": 0.82,
         "max_tokens": 120,
-        "messages": _openai_chat_messages(instruction),
+        "messages": _openai_chat_messages(instruction, state),
     }
 
     for model in _voice_models_to_try():
@@ -272,7 +294,10 @@ async def _llm_respond(instruction: str, fallback: str) -> str:
                 text = text.strip('"').strip("'")
                 if model != _voice_models_to_try()[0]:
                     logger.info("OpenAI voice reply using fallback model %s", model)
-                return text if text else fallback
+                response_text = text if text else fallback
+                if state and text:
+                    _append_llm_history(state, instruction, response_text)
+                return response_text
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
                 if status == 429 and attempt == 0:
@@ -327,7 +352,12 @@ async def _relay_openai_stream_lines(
     return queued, full_parts
 
 
-async def _stream_openai_tokens_to_ws(ws: WebSocket, instruction: str, fallback: str) -> str:
+async def _stream_openai_tokens_to_ws(
+    ws: WebSocket,
+    instruction: str,
+    fallback: str,
+    state: ConversationState | None = None,
+) -> str:
     """
     Stream chat completion deltas to Twilio as they arrive (last=false), then one final last=true.
     Twilio recommends this over a single blob for lower latency to first audio.
@@ -343,7 +373,7 @@ async def _stream_openai_tokens_to_ws(ws: WebSocket, instruction: str, fallback:
         "temperature": 0.82,
         "max_tokens": 120,
         "stream": True,
-        "messages": _openai_chat_messages(instruction),
+        "messages": _openai_chat_messages(instruction, state),
     }
     stream_timeout = httpx.Timeout(45.0, connect=10.0)
 
@@ -386,6 +416,7 @@ async def _stream_openai_tokens_to_ws(ws: WebSocket, instruction: str, fallback:
                     if model != _voice_models_to_try()[0]:
                         logger.info("OpenAI voice stream using fallback model %s", model)
                     _last_responses[id(ws)] = full
+                    _append_llm_history(state, instruction, full)
                     return full
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
@@ -405,17 +436,27 @@ async def _stream_openai_tokens_to_ws(ws: WebSocket, instruction: str, fallback:
     return fallback
 
 
-async def _speak_llm(ws: WebSocket, instruction: str, fallback: str) -> str:
+async def _speak_llm(
+    ws: WebSocket,
+    instruction: str,
+    fallback: str,
+    state: ConversationState | None = None,
+) -> str:
     """Generate Sarah's line: stream to Twilio when VOICE_LLM_STREAM is on, else one round-trip."""
     if getattr(settings, "VOICE_LLM_STREAM", True) and (getattr(settings, "OPENAI_API_KEY", "") or "").strip():
-        return await _stream_openai_tokens_to_ws(ws, instruction, fallback)
-    text = await _llm_respond(instruction, fallback)
+        return await _stream_openai_tokens_to_ws(ws, instruction, fallback, state)
+    text = await _llm_respond(instruction, fallback, state)
     await _send_text(ws, text)
     return text
 
 
-async def _end_session_speaking_llm(ws: WebSocket, instruction: str, fallback: str):
-    await _speak_llm(ws, instruction, fallback)
+async def _end_session_speaking_llm(
+    ws: WebSocket,
+    instruction: str,
+    fallback: str,
+    state: ConversationState | None = None,
+):
+    await _speak_llm(ws, instruction, fallback, state)
     await ws.send_json({"type": "end"})
 
 
@@ -504,6 +545,7 @@ class ConversationState:
         self.last_service_id: int | None = None  # from appointment history
         # After a single-service book, optional cross-sell before hang-up (see do_book_all).
         self.pending_final_booked: list[tuple[str, str]] | None = None
+        self.history: list[dict] = []
 
     @property
     def current_service(self) -> ServiceEntry | None:
@@ -639,6 +681,7 @@ async def _handle_off_script(ws: WebSocket, state: ConversationState, speech: st
             "The caller wants to speak to a real person. Say something warm like "
             "'Absolutely, let me connect you to the front desk.' Then end the session.",
             "Of course! Let me transfer you to our front desk right now. One moment!",
+        state=state,
         )
         return True
 
@@ -663,6 +706,7 @@ async def _handle_off_script(ws: WebSocket, state: ConversationState, speech: st
             f"The caller asked about business hours. Answer them, then bring them back to booking. "
             f"REQUIRED FACTS — hours: {hours_info}. Current step: {state.step}.",
             f"Our hours are {hours_info}. Now, would you like to go ahead and book an appointment?",
+        state=state,
         )
         return True
 
@@ -676,6 +720,7 @@ async def _handle_off_script(ws: WebSocket, state: ConversationState, speech: st
             f"The caller asked about pricing. Tell them the prices, then guide back to booking. "
             f"REQUIRED FACTS — {price_list}.",
             f"Here are our prices: {price_list}. Would you like to book one of these?",
+        state=state,
         )
         return True
 
@@ -689,6 +734,7 @@ async def _handle_off_script(ws: WebSocket, state: ConversationState, speech: st
                 "Offer to schedule another visit if they want.",
                 "For cancellations or rescheduling an existing visit, our front desk or website can help with that. "
                 "Would you like to schedule another visit while you're on the line?",
+            state=state,
             )
         else:
             await _speak_llm(
@@ -697,6 +743,7 @@ async def _handle_off_script(ws: WebSocket, state: ConversationState, speech: st
                 "or visit the website for that. Offer to set up a visit if they still need an appointment.",
                 "For cancellations or rescheduling, you can call our front desk directly or visit our website. "
                 "Would you like to book an appointment for another time?",
+            state=state,
             )
         return True
 
@@ -809,6 +856,7 @@ async def handle_name(ws: WebSocket, state: ConversationState, speech: str):
                 "Politely say goodbye and suggest they book online or call back later. "
                 "Be empathetic, not frustrated.",
                 "I'm having trouble hearing you. Please call back or book online at our website. Goodbye!",
+            state=state,
             )
             return
         await _speak_llm(
@@ -817,6 +865,7 @@ async def handle_name(ws: WebSocket, state: ConversationState, speech: str):
             "Ask them to repeat it naturally — don't sound robotic. "
             "Maybe say something like 'I didn't quite catch that' or 'sorry, could you say that again?'",
             "Sorry, I didn't quite catch your name. Could you say it one more time for me?",
+        state=state,
         )
         return
 
@@ -829,10 +878,12 @@ async def handle_name(ws: WebSocket, state: ConversationState, speech: str):
     services = _svc_list(state.catalog)
     await _speak_llm(
         ws,
-        f"The caller's name is {fn} {ln}. Greet them warmly by name. "
+        f"The caller's name is {fn} {ln}. Thank them by name — do NOT say hi/hello again "
+        f"(they already heard the phone welcome). "
         f"Then ask what service they'd like. Mention they can book more than one. "
         f"REQUIRED FACTS — available services: {services}",
         f"Great to meet you, {fn}! We offer: {services}. Which one would you like? You can also book more than one.",
+    state=state,
     )
 
 
@@ -873,6 +924,7 @@ async def handle_service(ws: WebSocket, state: ConversationState, speech: str):
                             f"REQUIRED FACTS — allowed intake names: {names_plain}",
                             f"I can book that for you soon — first we need to schedule {names_plain} "
                             "per clinic policy when someone's in this situation. Which of those would you like?",
+                        state=state,
                         )
                         return
                 matched = [last_svc]
@@ -904,6 +956,7 @@ async def handle_service(ws: WebSocket, state: ConversationState, speech: str):
                 "The caller keeps requesting something you can't identify as a service. "
                 "Apologize naturally, suggest they book online, and say goodbye warmly.",
                 "I'm sorry, I'm not able to find that service. You can always book on our website. Thanks for calling!",
+            state=state,
             )
             return
         svc_list = _svc_list(catalog)
@@ -913,6 +966,7 @@ async def handle_service(ws: WebSocket, state: ConversationState, speech: str):
             f"They said: \"{speech}\". Apologize naturally and list the available services. "
             f"REQUIRED FACTS — available services: {svc_list}",
             f"Hmm, I didn't quite catch which service. We have: {svc_list}. Which sounds good?",
+        state=state,
         )
         return
 
@@ -951,6 +1005,7 @@ async def handle_service(ws: WebSocket, state: ConversationState, speech: str):
             f"Ask which specific one they'd like. Be conversational about it. "
             f"REQUIRED FACTS — options: {names}",
             f"For {label}, we actually have a few options: {names}. Which one sounds right for you?",
+        state=state,
         )
         return
 
@@ -983,6 +1038,7 @@ async def _finish_service_selection(ws: WebSocket, state: ConversationState):
             f"Confirm with them naturally — like 'so you want both X and Y, right?' "
             f"REQUIRED FACTS — selected services: {names}",
             f"So you'd like both {names} — is that right?",
+        state=state,
         )
     else:
         svc = state.services[0]
@@ -1000,6 +1056,7 @@ async def _finish_service_selection(ws: WebSocket, state: ConversationState):
             f"Acknowledge their choice positively and ask what date and time works for them. "
             f"REQUIRED FACTS — service: {svc.service_name}",
             f"Great choice! {svc.service_name} it is. What date and time work best for you?",
+        state=state,
         )
 
 
@@ -1036,6 +1093,7 @@ async def handle_pick_service(ws: WebSocket, state: ConversationState, speech: s
             f"They said: \"{speech}\". Ask again naturally. "
             f"REQUIRED FACTS — options: {names}",
             f"I didn't quite get which one. We have: {names}. Which would you prefer?",
+        state=state,
         )
         return
 
@@ -1057,6 +1115,7 @@ async def handle_pick_service(ws: WebSocket, state: ConversationState, speech: s
             f"Great, they picked {picked['name']}. Now ask about their {label} preference. "
             f"REQUIRED FACTS — options: {names}",
             f"Got it! And for {label}, we have: {names}. Which one?",
+        state=state,
         )
         return
 
@@ -1071,6 +1130,7 @@ async def handle_pick_service(ws: WebSocket, state: ConversationState, speech: s
                 f"They chose {svc.service_name} to add after a visit was already booked. "
                 f"Ask what date and time work for this second visit.",
                 f"Perfect! For your {svc.service_name}, what date and time work for you?",
+            state=state,
             )
         return
 
@@ -1204,6 +1264,7 @@ async def handle_confirm_services(ws: WebSocket, state: ConversationState, speec
             "The caller changed their mind about the services. "
             "Be understanding and ask what they'd like instead. Keep it casual.",
             "No problem at all! What service would you like instead?",
+        state=state,
         )
         return
 
@@ -1222,6 +1283,7 @@ async def handle_confirm_services(ws: WebSocket, state: ConversationState, speec
             f"The caller's response was unclear. You need a yes or no about booking {names}. "
             f"Ask again in a friendly way. REQUIRED FACTS — services: {names}",
             f"Just checking — did you want both {names}? Just say yes or no.",
+        state=state,
         )
         return
 
@@ -1235,12 +1297,14 @@ async def handle_confirm_services(ws: WebSocket, state: ConversationState, speec
             f"Mention you'll start scheduling with {svc.service_name}. "
             f"REQUIRED FACTS — first service: {svc.service_name}",
             f"Awesome! Let's get those scheduled. Starting with {svc.service_name} — what date and time work for you?",
+        state=state,
         )
     else:
         await _speak_llm(
             ws,
             "The caller confirmed the service. Ask what date and time works for them. Be upbeat.",
             "Perfect! What date and time work best for you?",
+        state=state,
         )
 
 
@@ -1271,6 +1335,7 @@ async def handle_datetime(ws: WebSocket, state: ConversationState, speech: str):
                 "Apologize, suggest booking online, and say goodbye warmly.",
                 "I'm really sorry about this — I'm having trouble with the date. "
                 "You can always book on our website anytime. Thanks for calling!",
+            state=state,
             )
             return
 
@@ -1342,6 +1407,7 @@ async def handle_datetime(ws: WebSocket, state: ConversationState, speech: str):
             f"{svc.service_name} on {when_plain}. "
             f"Ask if that's good. Keep it natural and brief.",
             f"Perfect, {name}! So that's {svc.service_name} on {when_plain}. Shall I lock that in?",
+        state=state,
         )
 
 
@@ -1366,6 +1432,7 @@ async def handle_confirm(ws: WebSocket, state: ConversationState, speech: str):
             "The caller wants to change the date/time. "
             "Be understanding and ask for a new date and time. Keep it light.",
             "No problem! What other date and time would work better for you?",
+        state=state,
         )
         return
 
@@ -1383,6 +1450,7 @@ async def handle_confirm(ws: WebSocket, state: ConversationState, speech: str):
             "The caller's response was unclear — you need a yes or no to book the appointment. "
             "Ask again naturally, not robotically.",
             "Just want to make sure — should I go ahead and book that for you?",
+        state=state,
         )
         return
 
@@ -1408,6 +1476,7 @@ async def _begin_addon_second_service(ws: WebSocket, state: ConversationState, s
         f"They want to add {svc.service_name} after their first visit is already booked. "
         f"Ask what date and time work (same calendar day as the first visit is typical).",
         f"Love it! For your {svc.service_name}, what date and time would you like?",
+    state=state,
     )
 
 
@@ -1460,6 +1529,7 @@ async def handle_addon_offer(ws: WebSocket, state: ConversationState, speech: st
             ws,
             f"They want to add {label} but need a specific visit type. Options: {names}.",
             f"Great! For {label}, we have: {names}. Which one would you like?",
+        state=state,
         )
         return
 
@@ -1489,6 +1559,7 @@ async def handle_addon_offer(ws: WebSocket, state: ConversationState, speech: st
             f"Sound enthusiastic but relaxed. Help them pick a specific visit. "
             f"Options include: {opt_summary}.",
             f"Love it! For {other_label}, we have options like {opt_summary}. Which one sounds best to you?",
+        state=state,
         )
         return
 
@@ -1505,6 +1576,7 @@ async def handle_addon_offer(ws: WebSocket, state: ConversationState, speech: st
         "Their answer wasn't clear. Ask simply: are they all set, or would they like to add "
         f"{other_label}? They can also name a specific visit type.",
         f"Sorry — just to check: was that all you needed, or would you like to add {other_label} too?",
+    state=state,
     )
 
 
@@ -1536,6 +1608,7 @@ async def handle_service_addon(ws: WebSocket, state: ConversationState, speech: 
             ws,
             f"Could not match add-on service from: \"{speech}\". Options include: {names}.",
             f"I didn't quite catch that. We have: {names}. Which would you like?",
+        state=state,
         )
         return
 
@@ -1563,6 +1636,7 @@ async def handle_service_addon(ws: WebSocket, state: ConversationState, speech: 
             ws,
             f"They need a specific {label} option: {names}.",
             f"For {label}, we have: {names}. Which one works for you?",
+        state=state,
         )
         return
 
@@ -1572,6 +1646,7 @@ async def handle_service_addon(ws: WebSocket, state: ConversationState, speech: 
             ws,
             "Ask which add-on visit type they want.",
             "Which visit type would you like to add?",
+        state=state,
         )
         return
 
@@ -1631,6 +1706,7 @@ async def do_book_all(ws: WebSocket, state: ConversationState):
                     f"Good news — your {booked[0][0]} is confirmed for {summary}! "
                     f"But the slot for {svc.service_name} isn't available. "
                     f"What other time would work for that one?",
+                state=state,
                 )
             return
 
@@ -1676,6 +1752,7 @@ async def do_book_all(ws: WebSocket, state: ConversationState):
                 f"Was that everything you needed today? "
                 f"We also offer {other_plain} if you'd like to add {other_phrase} while we're on the line — "
                 f"happy to, or I'm glad to let you go. What works for you?",
+            state=state,
             )
             return
 
@@ -1771,6 +1848,7 @@ async def _handle_chiropractic_intake_block(
         f"REQUIRED FACTS — intake options: {names_plain}",
         f"I wasn't able to book that visit type — you'll need to schedule {names_plain} first. "
         "Which one would you like?",
+    state=state,
     )
 
 
@@ -1787,6 +1865,7 @@ async def _book_single(
             "Something went wrong with the date internally. "
             "Ask the caller to say the date and time again. Sound apologetic but casual.",
             "Sorry about that — could you give me the date and time one more time?",
+        state=state,
         )
         return None
 
@@ -1799,6 +1878,7 @@ async def _book_single(
             "Something went wrong with the time internally. "
             "Ask the caller to repeat the date and time. Sound apologetic.",
             "Sorry, I had a hiccup with the time. Could you say it again for me?",
+        state=state,
         )
         return None
 
@@ -1873,6 +1953,7 @@ async def _offer_alternative_slots(ws, state, svc, rejected_time):
             f"REQUIRED FACTS — available slots: {slot_list}",
             f"That time's taken, but I have {slot_list} available. "
             f"Would any of those work, or would you prefer a different day?",
+        state=state,
         )
     else:
         await _speak_llm(
@@ -1881,6 +1962,7 @@ async def _offer_alternative_slots(ws, state, svc, rejected_time):
             f"Ask the caller to try a different date. Be empathetic.",
             f"Unfortunately that slot is taken and the rest of the day looks full. "
             f"Would you like to try a different date?",
+        state=state,
         )
 
 
@@ -1902,6 +1984,7 @@ async def _build_final_message(ws: WebSocket, state: ConversationState, booked: 
             f"Confirmation sent via text and email.",
             f"You're all set, {name}! Your {svc_name} is booked for {when_plain}. "
             "You'll get a text and email confirmation. Have an awesome day!",
+        state=state,
         )
     else:
         details = " — ".join(f"{n} ({w})" for n, w in booked)
@@ -1915,6 +1998,7 @@ async def _build_final_message(ws: WebSocket, state: ConversationState, booked: 
             + "; ".join(f"{n} — {w}" for n, w in booked)
             + ". "
             "You'll get confirmations for each by text and email. Have a wonderful day!",
+        state=state,
         )
 
 
@@ -2006,8 +2090,13 @@ async def voice_websocket(ws: WebSocket):
             msg_type = msg.get("type", "")
 
             if msg_type == "setup":
+                if state is not None and state.first_name:
+                    # Already set up — welcomeGreeting in TwiML handled the greeting
+                    continue
+
                 call_sid = msg.get("callSid", "")
                 from_number = msg.get("from", "")
+
                 state = ConversationState(call_sid, from_number)
 
                 await async_upsert_voice_call_log(
@@ -2017,8 +2106,7 @@ async def voice_websocket(ws: WebSocket):
                 )
                 logger.info("Voice WS [%s] setup from %s", call_sid[:8], from_number)
 
-                # Returning patient: TwiML greeting already welcomed them
-                # and asked about services — just set up state silently
+                # DO NOT send any text here — welcomeGreeting in TwiML handles the greeting
                 returning = await _returning_setup_async(from_number)
                 if returning:
                     state.first_name = returning["first_name"]
@@ -2087,6 +2175,7 @@ async def voice_websocket(ws: WebSocket):
                             "Invite them to call back anytime.",
                             "Looks like we may have lost the connection. "
                             "Feel free to call back anytime. Take care!",
+                        state=state,
                         )
                         break
 
@@ -2096,7 +2185,7 @@ async def voice_websocket(ws: WebSocket):
                             state.step,
                             "The caller is silent. Gently ask if they're still there.",
                         )
-                        await _speak_llm(ws, context, nudge)
+                        await _speak_llm(ws, context, nudge, state=state)
                     else:
                         await _send_text(ws, nudge)
                     continue
