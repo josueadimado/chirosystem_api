@@ -243,7 +243,7 @@ def match_provider_from_speech(speech: str, providers: list[dict]) -> dict | Non
     return None
 
 
-# ─── Date / time parsing (local first, AI fallback) ───────────────────
+# ─── Date / time parsing (OpenAI primary, local regex fallback) ─────
 
 _WEEKDAYS = {
     "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
@@ -411,15 +411,36 @@ def _parse_time_from_speech(speech: str):
     m = re.search(r"\bat\s+(\d{1,2})\b", s)
     if m:
         h = int(m.group(1))
-        if 7 <= h <= 12:
+        if 1 <= h <= 12:
             return datetime.strptime(f"{h}:00", "%H:%M").time()
+
+    m = re.search(r"\b(\d{1,2})\s+(?:in\s+the\s+)?morning\b", s)
+    if m:
+        h = int(m.group(1))
+        if 1 <= h <= 12:
+            return datetime.strptime(f"{h}:00", "%H:%M").time()
+
+    m = re.search(r"\b(\d{1,2})\s+(?:in\s+the\s+)?afternoon\b", s)
+    if m:
+        h = int(m.group(1))
+        if 1 <= h <= 12:
+            if h != 12:
+                h += 12
+            return datetime.strptime(f"{h}:00", "%H:%M").time()
+
+    if re.search(r"\bmorning\b", s):
+        return datetime.strptime("9:00", "%H:%M").time()
+    if re.search(r"\bafternoon\b", s):
+        return datetime.strptime("14:00", "%H:%M").time()
+    if re.search(r"\bevening\b", s):
+        return datetime.strptime("17:00", "%H:%M").time()
 
     return None
 
 
 def parse_datetime_from_speech(speech: str, today: date) -> tuple[str, str]:
     """
-    Try to parse date and time from speech using local regex.
+    Parse date and time from speech using local regex (fallback when OpenAI fails).
     Returns (date_iso, time_12h) — either or both may be empty if unparseable.
     """
     d = _parse_date_from_speech(speech, today)
@@ -432,26 +453,29 @@ def parse_datetime_from_speech(speech: str, today: date) -> tuple[str, str]:
     return date_str, time_str
 
 
-# ─── OpenAI fallback (only for tricky date/time) ──────────────────────
+# ─── OpenAI primary date/time parser ──────────────────────────────────
 
 def openai_parse_datetime(speech: str, today_iso: str) -> tuple[str, str]:
     """
-    Call OpenAI to parse a date/time that the local parser couldn't handle.
-    Returns (date_iso, time_12h) — either or both may be empty.
+    Call OpenAI to parse natural date/time speech (primary parser).
+    Returns (date_iso, time_12h) — either or both may be empty on failure.
     """
     key = getattr(settings, "OPENAI_API_KEY", "") or ""
     if not key.strip():
         return "", ""
 
-    logger.info("OpenAI datetime fallback: speech=%r", speech[:200])
+    logger.info("OpenAI datetime parse: speech=%r", speech[:200])
 
     instruction = (
-        f"Today is {today_iso}. The caller said a date and/or time for a clinic appointment. "
-        "Parse it and return JSON: "
+        f"Today is {today_iso} (clinic timezone). The caller said when they want an appointment. "
+        "Return ONLY JSON: "
         '{"appointment_date": "YYYY-MM-DD", "start_time": "H:MM AM"}. '
-        "Handle phrases like 'tomorrow', 'next Tuesday', 'the 15th', 'Monday at 9', etc. "
-        "If you can only determine the date or only the time, still return what you can "
-        "and set the other to empty string."
+        "Understand natural phrases in any order, for example: "
+        "'tomorrow at 2pm', 'tomorrow 2pm', '2pm tomorrow', 'next Monday at 10', "
+        "'this Friday morning' (use 9:00 AM if no hour given), "
+        "'Monday 9 in the morning' (9:00 AM). "
+        "Use 12-hour start_time with AM/PM. If only date or only time is clear, "
+        "return that field and set the other to \"\"."
     )
 
     body = json.dumps(
@@ -484,7 +508,7 @@ def openai_parse_datetime(speech: str, today_iso: str) -> tuple[str, str]:
             (parsed.get("start_time") or "").strip(),
         )
     except Exception as e:
-        logger.warning("OpenAI datetime fallback failed: %s", e)
+        logger.warning("OpenAI datetime parse failed: %s", e)
         return "", ""
 
 

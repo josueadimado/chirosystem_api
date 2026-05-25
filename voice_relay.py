@@ -1248,12 +1248,14 @@ async def handle_datetime(ws: WebSocket, state: ConversationState, speech: str):
     tz_name = getattr(settings, "CLINIC_TIMEZONE", "America/Detroit")
     today = timezone.now().astimezone(ZoneInfo(tz_name)).date()
 
-    appt_date, start_time = parse_datetime_from_speech(speech, today)
+    # OpenAI first (natural phrases); local regex fills any gaps OpenAI missed.
+    ai_date, ai_time = await _openai_parse_datetime_async(speech, today.isoformat())
+    appt_date, start_time = ai_date, ai_time
 
     if not appt_date or not start_time:
-        ai_date, ai_time = await _openai_parse_datetime_async(speech, today.isoformat())
-        appt_date = appt_date or ai_date
-        start_time = start_time or ai_time
+        local_date, local_time = parse_datetime_from_speech(speech, today)
+        appt_date = appt_date or local_date
+        start_time = start_time or local_time
 
     if not appt_date or not start_time:
         state.retries += 1
@@ -1272,18 +1274,10 @@ async def handle_datetime(ws: WebSocket, state: ConversationState, speech: str):
             )
             return
 
-        if not appt_date and not start_time:
-            hint = "neither the date nor time"
-        elif not appt_date:
-            hint = "the time but not the date"
-        else:
-            hint = "the date but not the time"
-        await _speak_llm(
+        await _send_text(
             ws,
-            f"The caller said \"{speech}\" for date/time but you only caught {hint}. "
-            f"Ask them to clarify naturally. Give an example like 'next Tuesday at 2 PM'. "
-            f"Don't be robotic about it.",
-            "I didn't quite get that. Could you say something like 'next Tuesday at 2 PM'?",
+            "I didn't catch that. Could you say the date and time? "
+            "For example, tomorrow at 2pm or next Monday at 10am.",
         )
         return
 
