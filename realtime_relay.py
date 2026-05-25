@@ -49,7 +49,7 @@ logger = logging.getLogger("realtime_relay")
 
 app = FastAPI(title="ChiroFlow Realtime Voice Relay")
 
-OPENAI_REALTIME_MODEL = "gpt-4o-realtime-preview-2024-12-17"
+OPENAI_REALTIME_MODEL = "gpt-4o-realtime-preview"
 OPENAI_REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
 
 # ─── Tool schemas (OpenAI Realtime) ───────────────────────────────────
@@ -530,11 +530,11 @@ class RealtimeBridge:
             raise RuntimeError("OPENAI_API_KEY is not configured")
 
         instructions = await _build_prompt_async(from_number=self.from_number)
+        # GA Realtime: do not send OpenAI-Beta (beta shape returns beta_api_shape_disabled).
         self.openai_ws = await websockets.connect(
             OPENAI_REALTIME_URL,
             additional_headers={
                 "Authorization": f"Bearer {api_key}",
-                "OpenAI-Beta": "realtime=v1",
             },
             ping_interval=20,
             ping_timeout=20,
@@ -542,16 +542,25 @@ class RealtimeBridge:
         session_update = {
             "type": "session.update",
             "session": {
-                "modalities": ["text", "audio"],
+                "type": "realtime",
+                "model": OPENAI_REALTIME_MODEL,
                 "instructions": instructions,
-                "voice": "nova",
-                "input_audio_format": "g711_ulaw",
-                "output_audio_format": "g711_ulaw",
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 600,
+                "output_modalities": ["audio", "text"],
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcmu"},
+                        "transcription": {"model": "whisper-1"},
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 600,
+                        },
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcmu"},
+                        "voice": "shimmer",
+                    },
                 },
                 "tools": REALTIME_TOOLS,
                 "tool_choice": "auto",
@@ -569,7 +578,7 @@ class RealtimeBridge:
                 {
                     "type": "response.create",
                     "response": {
-                        "modalities": ["audio", "text"],
+                        "output_modalities": ["audio", "text"],
                         "instructions": (
                             "Say the following to the caller as your very first words, "
                             f"warmly and naturally: {self.greeting}"
@@ -607,12 +616,15 @@ class RealtimeBridge:
     async def handle_openai_event(self, event: dict[str, Any]) -> None:
         etype = event.get("type", "")
 
-        if etype == "response.audio.delta":
+        if etype in ("response.output_audio.delta", "response.audio.delta"):
             delta = event.get("delta") or ""
             await self.forward_openai_audio_to_twilio(delta)
             return
 
-        if etype == "response.audio_transcript.done":
+        if etype in (
+            "response.output_audio_transcript.done",
+            "response.audio_transcript.done",
+        ):
             transcript = (event.get("transcript") or "").strip()
             if transcript:
                 await async_append_voice_conversation_turn(
