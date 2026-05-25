@@ -1,8 +1,7 @@
 """
 FastAPI WebSocket bridge: Twilio Media Streams ↔ OpenAI Realtime API.
 
-Twilio sends g711_ulaw (8 kHz); OpenAI gpt-realtime expects PCM (24 kHz).
-This relay converts audio in both directions via audioop.
+Twilio Media Streams send PCMU (g711_ulaw); gpt-realtime uses audio/pcmu — passthrough, no conversion.
 Booking tools use the same Django services as voice_relay.py.
 
 Run: uvicorn realtime_relay:app --host 0.0.0.0 --port 8002
@@ -11,7 +10,6 @@ Run: uvicorn realtime_relay:app --host 0.0.0.0 --port 8002
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -47,69 +45,7 @@ from apps.clinic.voice_logging import (
 from django.conf import settings
 from django.utils import timezone
 
-try:
-    import audioop
-except ImportError:
-    import audioop_lts as audioop  # type: ignore[no-redef]
-
 logger = logging.getLogger("realtime_relay")
-
-# Twilio Media Streams: 8 kHz μ-law. OpenAI gpt-realtime GA: 24 kHz PCM.
-TWILIO_AUDIO_RATE = 8000
-OPENAI_AUDIO_RATE = 24000
-PCM_SAMPLE_WIDTH = 2
-
-
-def ulaw_to_pcm(ulaw_bytes: bytes) -> bytes:
-    """μ-law 8 kHz → 16-bit linear PCM 8 kHz."""
-    return audioop.ulaw2lin(ulaw_bytes, PCM_SAMPLE_WIDTH)
-
-
-def pcm_to_ulaw(pcm_bytes: bytes) -> bytes:
-    """16-bit linear PCM 8 kHz → μ-law."""
-    return audioop.lin2ulaw(pcm_bytes, PCM_SAMPLE_WIDTH)
-
-
-def ulaw_b64_to_pcm_b64(
-    ulaw_b64: str, rate_state: tuple[Any, ...] | None
-) -> tuple[str, tuple[Any, ...] | None]:
-    """Twilio payload (μ-law b64) → OpenAI payload (PCM b64 @ 24 kHz)."""
-    if not ulaw_b64:
-        return "", rate_state
-    ulaw_bytes = base64.b64decode(ulaw_b64)
-    if not ulaw_bytes:
-        return "", rate_state
-    pcm_8k = ulaw_to_pcm(ulaw_bytes)
-    pcm_24k, new_state = audioop.ratecv(
-        pcm_8k,
-        PCM_SAMPLE_WIDTH,
-        1,
-        TWILIO_AUDIO_RATE,
-        OPENAI_AUDIO_RATE,
-        rate_state,
-    )
-    return base64.b64encode(pcm_24k).decode("ascii"), new_state
-
-
-def pcm_b64_to_ulaw_b64(
-    pcm_b64: str, rate_state: tuple[Any, ...] | None
-) -> tuple[str, tuple[Any, ...] | None]:
-    """OpenAI payload (PCM b64 @ 24 kHz) → Twilio payload (μ-law b64 @ 8 kHz)."""
-    if not pcm_b64:
-        return "", rate_state
-    pcm_bytes = base64.b64decode(pcm_b64)
-    if not pcm_bytes:
-        return "", rate_state
-    pcm_8k, new_state = audioop.ratecv(
-        pcm_bytes,
-        PCM_SAMPLE_WIDTH,
-        1,
-        OPENAI_AUDIO_RATE,
-        TWILIO_AUDIO_RATE,
-        rate_state,
-    )
-    ulaw_bytes = pcm_to_ulaw(pcm_8k)
-    return base64.b64encode(ulaw_bytes).decode("ascii"), new_state
 
 app = FastAPI(title="ChiroFlow Realtime Voice Relay")
 
@@ -590,8 +526,6 @@ class RealtimeBridge:
         self.openai_ws: websockets.WebSocketClientProtocol | None = None
         self._pending_fc: dict[str, dict[str, Any]] = {}
         self._greeting_sent = False
-        self._twilio_to_openai_rate_state: tuple[Any, ...] | None = None
-        self._openai_to_twilio_rate_state: tuple[Any, ...] | None = None
 
     async def connect_openai(self) -> None:
         api_key = (getattr(settings, "OPENAI_API_KEY", "") or "").strip()
@@ -612,15 +546,11 @@ class RealtimeBridge:
             "type": "session.update",
             "session": {
                 "type": "realtime",
-                "instructions": instructions,
-                "tool_choice": "auto",
-                "tools": REALTIME_TOOLS,
+                "model": OPENAI_REALTIME_MODEL,
+                "output_modalities": ["audio"],
                 "audio": {
                     "input": {
-                        "format": {
-                            "type": "audio/pcm",
-                            "rate": OPENAI_AUDIO_RATE,
-                        },
+                        "format": {"type": "audio/pcmu"},
                         "turn_detection": {
                             "type": "server_vad",
                             "threshold": 0.5,
@@ -631,36 +561,40 @@ class RealtimeBridge:
                         },
                     },
                     "output": {
-                        "format": {
-                            "type": "audio/pcm",
-                            "rate": OPENAI_AUDIO_RATE,
-                        },
+                        "format": {"type": "audio/pcmu"},
                         "voice": "nova",
                         "speed": 1.0,
                     },
                 },
+                "instructions": instructions,
+                "tools": REALTIME_TOOLS,
+                "tool_choice": "auto",
             },
         }
         await self.openai_ws.send(json.dumps(session_update))
         logger.info("Realtime [%s] OpenAI session started", self.call_sid[:8])
 
     async def send_greeting(self) -> None:
+        """Official Twilio pattern: user message item + response.create."""
         if self._greeting_sent or not self.openai_ws or not self.greeting.strip():
             return
         self._greeting_sent = True
+        greeting_text = self.greeting
         await self.openai_ws.send(
             json.dumps(
                 {
-                    "type": "response.create",
-                    "response": {
-                        "instructions": (
-                            "Say the following to the caller as your very first words, "
-                            f"warmly and naturally: {self.greeting}"
-                        ),
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": greeting_text},
+                        ],
                     },
                 }
             )
         )
+        await self.openai_ws.send(json.dumps({"type": "response.create"}))
         await async_append_voice_conversation_turn(
             call_sid=self.call_sid,
             role="assistant",
@@ -669,40 +603,34 @@ class RealtimeBridge:
             from_number=self.from_number,
         )
 
-    async def twilio_media_to_openai(self, payload_b64: str) -> None:
-        """Twilio μ-law (8 kHz) → PCM (24 kHz) for OpenAI input_audio_buffer.append."""
+    async def receive_from_twilio(self, payload_b64: str) -> None:
+        """Twilio Media Stream PCMU payload → OpenAI (passthrough)."""
         if not self.openai_ws or not payload_b64:
             return
-        pcm_b64, self._twilio_to_openai_rate_state = ulaw_b64_to_pcm_b64(
-            payload_b64, self._twilio_to_openai_rate_state
-        )
-        if not pcm_b64:
-            return
         await self.openai_ws.send(
-            json.dumps({"type": "input_audio_buffer.append", "audio": pcm_b64})
+            json.dumps({"type": "input_audio_buffer.append", "audio": payload_b64})
         )
 
     async def forward_openai_audio_to_twilio(self, delta_b64: str) -> None:
-        """OpenAI PCM (24 kHz) → Twilio μ-law (8 kHz) media event."""
+        """OpenAI audio delta → Twilio media event (passthrough)."""
         if not delta_b64:
-            return
-        ulaw_b64, self._openai_to_twilio_rate_state = pcm_b64_to_ulaw_b64(
-            delta_b64, self._openai_to_twilio_rate_state
-        )
-        if not ulaw_b64:
             return
         await self.twilio_ws.send_json(
             {
                 "event": "media",
                 "streamSid": self.stream_sid,
-                "media": {"payload": ulaw_b64},
+                "media": {"payload": delta_b64},
             }
         )
 
-    async def handle_openai_event(self, event: dict[str, Any]) -> None:
+    async def receive_from_openai(self, event: dict[str, Any]) -> None:
         etype = event.get("type", "")
 
-        if etype in ("response.output_audio.delta", "response.audio.delta"):
+        if etype in (
+            "response.output_audio.delta",
+            "response.audio.delta",
+            "audio.delta",
+        ):
             delta = event.get("delta") or ""
             await self.forward_openai_audio_to_twilio(delta)
             return
@@ -797,7 +725,7 @@ async def _openai_reader(bridge: RealtimeBridge) -> None:
                 event = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            await bridge.handle_openai_event(event)
+            await bridge.receive_from_openai(event)
     except ConnectionClosed:
         logger.info("Realtime [%s] OpenAI socket closed", bridge.call_sid[:8])
     except Exception:
@@ -851,7 +779,7 @@ async def twilio_realtime_stream(ws: WebSocket):
                 media = msg.get("media") or {}
                 payload = media.get("payload") or ""
                 if payload:
-                    await bridge.twilio_media_to_openai(payload)
+                    await bridge.receive_from_twilio(payload)
                 continue
 
             if event == "stop":
