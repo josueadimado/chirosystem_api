@@ -52,7 +52,12 @@ from apps.clinic.voice_ai import (
     openai_parse_datetime,
     parse_datetime_from_speech,
 )
-from apps.clinic.voice_logging import async_upsert_voice_call_log, upsert_voice_call_log
+from apps.clinic.voice_logging import (
+    async_append_voice_conversation_turn,
+    async_upsert_voice_call_log,
+    append_voice_conversation_turn,
+    upsert_voice_call_log,
+)
 
 from django.conf import settings
 from django.utils import timezone
@@ -423,6 +428,7 @@ async def _stream_openai_tokens_to_ws(
                         logger.info("OpenAI voice stream using fallback model %s", model)
                     _last_responses[id(ws)] = full
                     _append_llm_history(state, instruction, full)
+                    await _log_assistant_turn(ws, full)
                     return full
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
@@ -500,16 +506,6 @@ def _svc_names(services: list[dict]) -> str:
 _last_responses: dict[str, str] = {}
 
 
-async def _send_text(ws: WebSocket, text: str, *, last: bool = True):
-    await ws.send_json({
-        "type": "text",
-        "token": text,
-        "last": last,
-    })
-    # Store for repeat — keyed by ws id
-    _last_responses[id(ws)] = text
-
-
 async def _end_session(ws: WebSocket, text: str = ""):
     if text:
         await _send_text(ws, text, last=True)
@@ -578,6 +574,41 @@ class ConversationState:
     @property
     def caller_name(self) -> str:
         return f"{self.first_name} {self.last_name}".strip()
+
+
+# Active call state per WebSocket (for full conversation logging)
+_ws_call_state: dict[int, ConversationState] = {}
+
+
+def _register_ws_call_state(ws: WebSocket, state: ConversationState | None) -> None:
+    if state is not None:
+        _ws_call_state[id(ws)] = state
+    else:
+        _ws_call_state.pop(id(ws), None)
+
+
+async def _log_assistant_turn(ws: WebSocket, text: str) -> None:
+    state = _ws_call_state.get(id(ws))
+    if not state or not (text or "").strip():
+        return
+    await async_append_voice_conversation_turn(
+        call_sid=state.call_sid,
+        role="assistant",
+        text=text,
+        step=state.step,
+        from_number=state.from_number,
+    )
+
+
+async def _send_text(ws: WebSocket, text: str, *, last: bool = True):
+    await ws.send_json({
+        "type": "text",
+        "token": text,
+        "last": last,
+    })
+    _last_responses[id(ws)] = text
+    if last:
+        await _log_assistant_turn(ws, text)
 
 
 # ─── Patient lookup ──────────────────────────────────────────────────
@@ -2555,7 +2586,14 @@ async def voice_websocket(ws: WebSocket):
 
                 state = ConversationState(call_sid, from_number)
                 state._setup_done = True
+                _register_ws_call_state(ws, state)
 
+                await async_append_voice_conversation_turn(
+                    call_sid=call_sid,
+                    role="system",
+                    text="[Call connected — Twilio welcome greeting played]",
+                    from_number=from_number,
+                )
                 await async_upsert_voice_call_log(
                     call_sid=call_sid,
                     from_number=from_number,
@@ -2610,10 +2648,12 @@ async def voice_websocket(ws: WebSocket):
                 )
 
                 if speech:
-                    await async_upsert_voice_call_log(
+                    await async_append_voice_conversation_turn(
                         call_sid=state.call_sid,
+                        role="caller",
+                        text=speech,
+                        step=state.step,
                         from_number=state.from_number,
-                        transcript=speech,
                     )
 
                 if not speech or len(speech.strip()) == 0:
@@ -2712,10 +2752,12 @@ async def voice_websocket(ws: WebSocket):
 
     except WebSocketDisconnect:
         _last_responses.pop(id(ws), None)
+        _register_ws_call_state(ws, None)
         if state:
             logger.info("Caller hung up [%s]", state.call_sid[:8])
     except Exception as e:
         _last_responses.pop(id(ws), None)
+        _register_ws_call_state(ws, None)
         logger.exception(
             "Unexpected error in voice [%s]: %s",
             state.call_sid[:8] if state else "?",
@@ -2738,6 +2780,7 @@ async def voice_websocket(ws: WebSocket):
                 detail=f"{type(e).__name__}: {e}"[:2000],
             )
     finally:
+        _register_ws_call_state(ws, None)
         keepalive.cancel()
         try:
             await keepalive

@@ -272,6 +272,7 @@ class VoiceCallLogSerializer(serializers.ModelSerializer):
             "call_sid",
             "from_number",
             "transcript",
+            "conversation_log",
             "outcome",
             "outcome_label",
             "detail",

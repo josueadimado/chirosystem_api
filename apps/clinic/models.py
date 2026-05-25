@@ -385,6 +385,8 @@ class VoiceCallLog(TimeStampedModel):
     call_sid = models.CharField(max_length=64, unique=True, db_index=True)
     from_number = models.CharField(max_length=32, blank=True)
     transcript = models.TextField(blank=True)
+    # Full call dialogue: list of {role, text, step?, at} — caller + assistant turns.
+    conversation_log = models.JSONField(default=list, blank=True)
     outcome = models.CharField(
         max_length=32, choices=Outcome.choices, default=Outcome.PROMPTED
     )
