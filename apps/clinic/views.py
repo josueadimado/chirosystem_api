@@ -8,7 +8,7 @@ from typing import Optional
 
 from django.db import transaction
 from django.db.models import Case, Count, IntegerField, OuterRef, Prefetch, Q, Subquery, Sum, Value, When
-from django.db.models.functions import Coalesce, TruncDate
+from django.db.models.functions import TruncDate
 from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -1019,6 +1019,7 @@ class PatientViewSet(viewsets.ModelViewSet):
                 patient_id=OuterRef("pk"),
                 status=Visit.Status.COMPLETED,
                 completed_at__isnull=False,
+                completed_at__lte=timezone.now(),
             )
             .order_by("-completed_at")
             .annotate(visit_day=TruncDate("completed_at"))
@@ -1035,10 +1036,7 @@ class PatientViewSet(viewsets.ModelViewSet):
                 filter=Q(visit__status=Visit.Status.COMPLETED),
                 distinct=True,
             ),
-            last_visit=Coalesce(
-                Subquery(last_completed_visit.values("visit_day")[:1]),
-                Subquery(last_appt.values("appointment_date")[:1]),
-            ),
+            last_visit=Subquery(last_completed_visit.values("visit_day")[:1]),
             last_service=Subquery(last_appt.values("booked_service__name")[:1]),
             next_appointment_date=Subquery(next_appt.values("appointment_date")[:1]),
             next_appointment_time=Subquery(next_appt.values("start_time")[:1]),
@@ -3078,15 +3076,6 @@ class DoctorViewSet(viewsets.ViewSet):
         today = timezone.localdate()
         ex_future = [Appointment.Status.CANCELLED, Appointment.Status.NO_SHOW, Appointment.Status.COMPLETED]
 
-        appts_all = list(
-            Appointment.objects.filter(provider=provider, patient_id__in=patient_ids).order_by(
-                "-appointment_date", "-start_time"
-            )
-        )
-        last_any_by_pid: dict = {}
-        for a in appts_all:
-            last_any_by_pid.setdefault(a.patient_id, a)
-
         future_ordered = list(
             Appointment.objects.filter(
                 provider=provider, patient_id__in=patient_ids, appointment_date__gte=today
@@ -3104,6 +3093,7 @@ class DoctorViewSet(viewsets.ViewSet):
                 patient_id__in=patient_ids,
                 status=Visit.Status.COMPLETED,
                 completed_at__isnull=False,
+                completed_at__lte=timezone.now(),
             ).order_by("-completed_at")
         )
         last_completed_by_pid: dict = {}
@@ -3131,12 +3121,9 @@ class DoctorViewSet(viewsets.ViewSet):
         data = []
         for p in patients_qs:
             na = next_by_pid.get(p.id)
-            la = last_any_by_pid.get(p.id)
             lv = last_completed_by_pid.get(p.id)
             if lv and lv.completed_at:
-                last_visit_iso = lv.completed_at.date().isoformat()
-            elif la:
-                last_visit_iso = str(la.appointment_date)
+                last_visit_iso = timezone.localtime(lv.completed_at).date().isoformat()
             else:
                 last_visit_iso = None
 

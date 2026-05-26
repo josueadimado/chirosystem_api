@@ -27,19 +27,18 @@ def patient_demographics_summary(patient: Patient) -> dict:
     """
     Extra demographics for patient_detail responses.
     date_established = first non-cancelled appointment date.
-    last_seen = last completed visit date, else last appointment date.
+    last_seen = most recent completed visit only (never a future booking).
     """
     appt_qs = Appointment.objects.filter(patient=patient).exclude(status__in=_APPT_EXCLUDED)
     first_date = appt_qs.aggregate(d=Min("appointment_date"))["d"]
-    last_appt_date = (
-        appt_qs.order_by("-appointment_date", "-start_time").values_list("appointment_date", flat=True).first()
-    )
 
+    now = timezone.now()
     last_visit = (
         Visit.objects.filter(
             patient=patient,
             status=Visit.Status.COMPLETED,
             completed_at__isnull=False,
+            completed_at__lte=now,
         )
         .order_by("-completed_at")
         .values_list("completed_at", flat=True)
@@ -49,8 +48,6 @@ def patient_demographics_summary(patient: Patient) -> dict:
     last_seen = None
     if last_visit is not None:
         last_seen = timezone.localtime(last_visit).date().isoformat()
-    elif last_appt_date is not None:
-        last_seen = str(last_appt_date)
 
     return {
         "marital_status": (patient.marital_status or "").strip(),
