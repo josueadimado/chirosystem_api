@@ -7,7 +7,8 @@ from django.core.signing import TimestampSigner
 from typing import Optional
 
 from django.db import transaction
-from django.db.models import Case, IntegerField, Prefetch, Q, Sum, Value, When
+from django.db.models import Case, Count, IntegerField, OuterRef, Prefetch, Q, Subquery, Sum, Value, When
+from django.db.models.functions import Coalesce, TruncDate
 from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -50,6 +51,7 @@ from .serializers import (
     PatientIntakeUpdateSerializer,
     PatientCreditTopUpSerializer,
     PatientCreditTransactionSerializer,
+    PatientListSerializer,
     PatientSerializer,
     SaveSquareCardSerializer,
     TerminalCheckoutSerializer,
@@ -970,28 +972,76 @@ class IsStaffOrOwnerAdmin(permissions.BasePermission):
         )
 
 
+_APPT_EXCLUDED_FROM_VISIT_STATS = (
+    Appointment.Status.CANCELLED,
+    Appointment.Status.NO_SHOW,
+)
+_FUTURE_APPT_EXCLUDED = (
+    Appointment.Status.CANCELLED,
+    Appointment.Status.NO_SHOW,
+    Appointment.Status.COMPLETED,
+)
+
+
 class PatientViewSet(viewsets.ModelViewSet):
     queryset = Patient.objects.all().order_by("-updated_at")
     serializer_class = PatientSerializer
     permission_classes = [IsOwnerOrDoctor]
     pagination_class = StandardPageNumberPagination
 
+    def get_serializer_class(self):
+        if self.action == "list":
+            return PatientListSerializer
+        return PatientSerializer
+
     def get_queryset(self):
         qs = super().get_queryset()
         raw = (self.request.query_params.get("search") or "").strip()
-        if not raw:
+        if raw:
+            terms = [t for t in raw.split() if t]
+            for term in terms:
+                qs = qs.filter(
+                    Q(first_name__icontains=term)
+                    | Q(last_name__icontains=term)
+                    | Q(email__icontains=term)
+                    | Q(phone__icontains=term)
+                )
+        if self.action != "list":
             return qs
-        terms = [t for t in raw.split() if t]
-        if not terms:
-            return qs
-        for term in terms:
-            qs = qs.filter(
-                Q(first_name__icontains=term)
-                | Q(last_name__icontains=term)
-                | Q(email__icontains=term)
-                | Q(phone__icontains=term)
+
+        appt_base = Appointment.objects.filter(patient_id=OuterRef("pk")).exclude(
+            status__in=_APPT_EXCLUDED_FROM_VISIT_STATS
+        )
+        last_appt = appt_base.order_by("-appointment_date", "-start_time")
+        last_completed_visit = (
+            Visit.objects.filter(
+                patient_id=OuterRef("pk"),
+                status=Visit.Status.COMPLETED,
+                completed_at__isnull=False,
             )
-        return qs
+            .order_by("-completed_at")
+            .annotate(visit_day=TruncDate("completed_at"))
+        )
+        today = timezone.localdate()
+        next_appt = (
+            Appointment.objects.filter(patient_id=OuterRef("pk"), appointment_date__gte=today)
+            .exclude(status__in=_FUTURE_APPT_EXCLUDED)
+            .order_by("appointment_date", "start_time")
+        )
+        return qs.annotate(
+            visit_count=Count(
+                "visit",
+                filter=Q(visit__status=Visit.Status.COMPLETED),
+                distinct=True,
+            ),
+            last_visit=Coalesce(
+                Subquery(last_completed_visit.values("visit_day")[:1]),
+                Subquery(last_appt.values("appointment_date")[:1]),
+            ),
+            last_service=Subquery(last_appt.values("booked_service__name")[:1]),
+            next_appointment_date=Subquery(next_appt.values("appointment_date")[:1]),
+            next_appointment_time=Subquery(next_appt.values("start_time")[:1]),
+        ).order_by("-last_visit", "last_name", "first_name")
 
     def create(self, request, *args, **kwargs):
         if getattr(request.user, "role", None) not in ("owner_admin", "staff"):

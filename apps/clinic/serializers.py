@@ -69,6 +69,32 @@ class PatientSerializer(serializers.ModelSerializer):
         return attrs
 
 
+class PatientListSerializer(serializers.ModelSerializer):
+    """Lightweight patient row for paginated directory lists (doctors, desk search)."""
+
+    visit_count = serializers.IntegerField(read_only=True, default=0)
+    last_visit = serializers.DateField(read_only=True, allow_null=True)
+    last_service = serializers.CharField(read_only=True, allow_null=True)
+    next_appointment_date = serializers.DateField(read_only=True, allow_null=True)
+    next_appointment_time = serializers.TimeField(read_only=True, allow_null=True)
+
+    class Meta:
+        model = Patient
+        fields = (
+            "id",
+            "first_name",
+            "last_name",
+            "phone",
+            "email",
+            "date_of_birth",
+            "visit_count",
+            "last_visit",
+            "last_service",
+            "next_appointment_date",
+            "next_appointment_time",
+        )
+
+
 class ProviderSerializer(serializers.ModelSerializer):
     provider_name = serializers.CharField(source="user.full_name", read_only=True)
     username = serializers.CharField(source="user.username", read_only=True)
