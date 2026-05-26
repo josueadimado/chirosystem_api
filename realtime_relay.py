@@ -27,7 +27,7 @@ from asgiref.sync import sync_to_async
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
 
-from apps.clinic.models import Appointment, ClinicSettings, Provider, Service, VoiceCallLog
+from apps.clinic.models import Appointment, ClinicSettings, Patient, Provider, Service, VoiceCallLog
 from apps.clinic.patient_phone import patients_matching_phone
 from apps.clinic.public_booking_service import (
     cancel_appointment_public,
@@ -56,6 +56,17 @@ OPENAI_REALTIME_URL = (
 )
 
 # ─── Tool schemas (OpenAI Realtime) ───────────────────────────────────
+
+# Service id for RE-EXAMINATION (returning patients after 1+ year gap).
+RE_EXAMINATION_SERVICE_ID = 31
+
+_REALTIME_ACTIVE_APPOINTMENT_STATUSES = (
+    Appointment.Status.BOOKED,
+    Appointment.Status.CHECKED_IN,
+    Appointment.Status.IN_CONSULTATION,
+    Appointment.Status.AWAITING_PAYMENT,
+    Appointment.Status.COMPLETED,
+)
 
 REALTIME_TOOLS: list[dict[str, Any]] = [
     {
@@ -173,6 +184,50 @@ def _services_prompt_block(catalog: dict[str, Any]) -> str:
     return "\n".join(lines) if lines else "(no services loaded)"
 
 
+def _returning_patient_prompt_note(patient: Patient) -> str:
+    """Caller matched one patient on file — recent vs re-intake (1+ year since last visit)."""
+    today = timezone.localdate()
+    last_appt = (
+        Appointment.objects.filter(
+            patient=patient,
+            status__in=_REALTIME_ACTIVE_APPOINTMENT_STATUSES,
+        )
+        .order_by("-appointment_date", "-start_time")
+        .first()
+    )
+    if last_appt:
+        days_since = (today - last_appt.appointment_date).days
+        years_since = days_since / 365
+    else:
+        days_since = None
+        years_since = 999
+
+    if years_since >= 1:
+        gap_detail = (
+            f"their last visit was over a year ago ({int(years_since)} year(s) ago)"
+            if last_appt
+            else "they are on file but have no prior visit date in the system"
+        )
+        return (
+            f"\nRETURNING PATIENT (RE-INTAKE NEEDED): "
+            f"{patient.first_name} {patient.last_name} is on file but {gap_detail}. "
+            f"They must be treated like a new patient for paperwork and chiropractic intake. "
+            f"After booking remind them to arrive 25 minutes early for paperwork OR "
+            f"download it at reliefchiropractic.net (New Patient Paperwork 2025). "
+            f"If they want chiropractic suggest RE-EXAMINATION or New Office Visit first."
+        )
+
+    days_label = str(days_since) if days_since is not None else "unknown"
+    return (
+        f"\nRETURNING PATIENT (recent visit): "
+        f"{patient.first_name} {patient.last_name} is on file. "
+        f"Last visit was {days_label} days ago. "
+        f"Do NOT treat as new patient. "
+        f"No paperwork reminder needed. "
+        f"They can book regular follow-up visits."
+    )
+
+
 def _build_system_prompt(*, from_number: str) -> str:
     clinic = ClinicSettings.get_solo()
     catalog = _booking_catalog_json()
@@ -182,13 +237,7 @@ def _build_system_prompt(*, from_number: str) -> str:
     if norm:
         matches = patients_matching_phone(norm)
         if len(matches) == 1:
-            p = matches[0]
-            returning_note = (
-                f"\nRETURNING PATIENT: {p.first_name} {p.last_name} (phone on file). "
-                "Do not treat them as a brand-new patient. "
-                "They do NOT need new patient paperwork instructions. "
-                "Skip the 25 minutes early and download paperwork reminder."
-            )
+            returning_note = _returning_patient_prompt_note(matches[0])
         elif len(matches) > 1:
             returning_note = "\nMultiple patients share this phone — confirm full name before booking."
 
@@ -245,6 +294,13 @@ When a caller books any of these services:
 
 After confirming the booking say:
 "Since it's your first visit, please plan to arrive 25 minutes early to fill out paperwork at the clinic. Or download it ahead of time at reliefchiropractic.net — look for New Patient Paperwork 2025. You'll get a confirmation text too!"
+
+RE-INTAKE PATIENTS (last visit over 1 year ago):
+- Treat like new patient for paperwork
+- Remind them to arrive 25 minutes early
+- OR download paperwork at reliefchiropractic.net
+- For chiropractic suggest RE-EXAMINATION (service_id: 31) instead of New Office Visit since they are already in the system
+  Say: "Since it has been over a year since your last visit, we will need you to do a RE-EXAMINATION first. It is [duration] minutes and [price]. Would that work for you?"
 
 CHIROPRACTIC NEW PATIENT RULES:
 If a caller says they have never been to the clinic before AND wants chiropractic:
@@ -389,21 +445,60 @@ def _get_upcoming_appointments(phone: str) -> list[dict[str, Any]]:
     return out
 
 
+def _is_new_patient_service(service: Service | None) -> bool:
+    """True when Sarah should give first-visit paperwork / 25-minute-early instructions."""
+    if service is None:
+        return False
+    if service.pk == RE_EXAMINATION_SERVICE_ID:
+        return True
+    if getattr(service, "is_new_client_intake", False):
+        return True
+    name = (service.name or "").lower()
+    return (
+        "new" in name
+        or "intake" in name
+        or "office visit" in name
+        or "re-examination" in name
+        or "reexamination" in name
+    )
+
+
 def _book_appointment_sync(payload: dict[str, Any]) -> dict[str, Any]:
     ser = PublicBookingSerializer(data=payload)
     if not ser.is_valid():
         logger.info("realtime book_appointment serializer errors: %s", ser.errors)
-        return {"ok": False, "error": str(ser.errors)}
+        return {"ok": False, "success": False, "error": str(ser.errors)}
     vd = ser.validated_data
     appt, err = create_appointment_from_public_booking(vd)
     if err:
-        return {"ok": False, "error": err}
+        return {"ok": False, "success": False, "error": err}
+    svc = appt.booked_service
+    svc_name = svc.name if svc else ""
+    date_s = appt.appointment_date.isoformat()
+    time_s = appt.start_time.strftime("%I:%M %p").lstrip("0")
+    is_new = _is_new_patient_service(svc)
+    if is_new:
+        message = (
+            f"Booked {svc_name} on {date_s} at {time_s}. "
+            "FIRST VISIT: tell the caller to arrive about 25 minutes early for paperwork at the clinic, "
+            "or download ahead of time at reliefchiropractic.net (New Patient Paperwork 2025). "
+            "Mention they will get a confirmation text."
+        )
+    else:
+        message = (
+            f"Booked {svc_name} on {date_s} at {time_s}. "
+            "Returning visit: short confirmation and confirmation text only — "
+            "do not mention 25 minutes early or paperwork download."
+        )
     return {
         "ok": True,
+        "success": True,
         "appointment_id": appt.id,
-        "date": appt.appointment_date.isoformat(),
-        "time": appt.start_time.strftime("%I:%M %p").lstrip("0"),
-        "service": appt.booked_service.name if appt.booked_service else "",
+        "date": date_s,
+        "time": time_s,
+        "service": svc_name,
+        "is_new_patient_service": is_new,
+        "message": message,
     }
 
 
