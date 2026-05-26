@@ -5,6 +5,7 @@ from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers
 
+from .patient_phone import duplicate_patient_message, find_duplicate_patient
 from .utils import validate_phone
 from .models import (
     Appointment,
@@ -34,6 +35,38 @@ class PatientSerializer(serializers.ModelSerializer):
         if not valid:
             raise serializers.ValidationError(result)
         return result
+
+    def validate(self, attrs):
+        inst = getattr(self, "instance", None)
+        if inst is None and not attrs.get("date_of_birth"):
+            raise serializers.ValidationError(
+                {
+                    "date_of_birth": (
+                        "Date of birth is required when adding a patient so we can detect duplicates."
+                    )
+                }
+            )
+
+        first_name = attrs.get("first_name", inst.first_name if inst else "")
+        last_name = attrs.get("last_name", inst.last_name if inst else "")
+        phone = attrs.get("phone", inst.phone if inst else "")
+        if "date_of_birth" in attrs:
+            date_of_birth = attrs["date_of_birth"]
+        else:
+            date_of_birth = inst.date_of_birth if inst else None
+
+        if date_of_birth is not None:
+            dup = find_duplicate_patient(
+                first_name=first_name,
+                last_name=last_name,
+                phone=phone,
+                date_of_birth=date_of_birth,
+                exclude_pk=inst.pk if inst else None,
+            )
+            if dup is not None:
+                raise serializers.ValidationError({"detail": duplicate_patient_message(dup)})
+
+        return attrs
 
 
 class ProviderSerializer(serializers.ModelSerializer):

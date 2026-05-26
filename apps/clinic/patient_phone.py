@@ -57,21 +57,81 @@ def names_equal_casefold(p: Patient, first_name: str, last_name: str) -> bool:
     return p.first_name.strip().casefold() == fn and p.last_name.strip().casefold() == ln
 
 
+def find_duplicate_patient(
+    *,
+    first_name: str,
+    last_name: str,
+    phone: str,
+    date_of_birth,
+    exclude_pk: int | None = None,
+) -> Patient | None:
+    """
+    Same person when first name, last name, date of birth, and phone all match
+    (names case-insensitive; phone compared after normalization).
+    """
+    if date_of_birth is None:
+        return None
+    fn = (first_name or "").strip()
+    ln = (last_name or "").strip()
+    if not fn or not ln:
+        return None
+    try:
+        phone_n = normalize_phone(phone or "")
+    except Exception:
+        logger.warning("normalize_phone failed during duplicate patient check", exc_info=True)
+        return None
+    if not phone_n:
+        return None
+
+    qs = Patient.objects.filter(date_of_birth=date_of_birth)
+    if exclude_pk is not None:
+        qs = qs.exclude(pk=exclude_pk)
+
+    for p in qs.iterator(chunk_size=200):
+        if names_equal_casefold(p, fn, ln) and patient_matches_phone_normalized(p, phone_n):
+            return p
+    return None
+
+
+def duplicate_patient_message(existing: Patient) -> str:
+    return (
+        "A patient with the same first name, last name, date of birth, and phone number "
+        f"already exists (profile #{existing.pk}: {existing.first_name} {existing.last_name}). "
+        "Open that record instead of creating a duplicate."
+    )
+
+
 def get_or_create_patient_for_public_booking(
     *,
     phone_normalized: str,
     first_name: str,
     last_name: str,
     email: str = "",
+    date_of_birth=None,
 ) -> Patient:
     """
     Find or create the patient row for this booking. Same number may exist for a parent
     and a child; we key by normalized phone + first + last name (case-insensitive).
+    When date_of_birth is provided, also blocks duplicate profiles (name + DOB + phone).
     """
     fn = (first_name or "").strip()
     ln = (last_name or "").strip()
     if not fn or not ln:
         raise ValueError("first and last name are required for booking.")
+
+    if date_of_birth is not None:
+        dup = find_duplicate_patient(
+            first_name=fn,
+            last_name=ln,
+            phone=phone_normalized,
+            date_of_birth=date_of_birth,
+        )
+        if dup is not None:
+            em = (email or "").strip()
+            if em and em != (dup.email or "").strip():
+                dup.email = em
+                dup.save(update_fields=["email", "updated_at"])
+            return dup
 
     candidates = patients_matching_phone(phone_normalized)
     em = (email or "").strip()
@@ -87,4 +147,5 @@ def get_or_create_patient_for_public_booking(
         first_name=fn,
         last_name=ln,
         email=em,
+        date_of_birth=date_of_birth,
     )

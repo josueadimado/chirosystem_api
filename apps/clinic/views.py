@@ -2875,7 +2875,21 @@ class AdminViewSet(viewsets.ViewSet):
             if field in data:
                 setattr(patient, field, data[field] or "")
         if "date_of_birth" in data:
+            from .patient_phone import duplicate_patient_message, find_duplicate_patient
+
             patient.date_of_birth = data["date_of_birth"]
+            dup = find_duplicate_patient(
+                first_name=patient.first_name,
+                last_name=patient.last_name,
+                phone=patient.phone,
+                date_of_birth=patient.date_of_birth,
+                exclude_pk=patient.pk,
+            )
+            if dup is not None:
+                return Response(
+                    {"detail": duplicate_patient_message(dup)},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
         if "online_chiro_intake_waived" in data:
             if getattr(request.user, "role", None) not in ("owner_admin", "staff"):
                 return Response(
@@ -3169,7 +3183,21 @@ class DoctorViewSet(viewsets.ViewSet):
             if field in data:
                 setattr(patient, field, data[field] or "")
         if "date_of_birth" in data:
+            from .patient_phone import duplicate_patient_message, find_duplicate_patient
+
             patient.date_of_birth = data["date_of_birth"]
+            dup = find_duplicate_patient(
+                first_name=patient.first_name,
+                last_name=patient.last_name,
+                phone=patient.phone,
+                date_of_birth=patient.date_of_birth,
+                exclude_pk=patient.pk,
+            )
+            if dup is not None:
+                return Response(
+                    {"detail": duplicate_patient_message(dup)},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
         patient.save()
         return Response({"detail": "Saved."})
 
