@@ -59,6 +59,8 @@ OPENAI_REALTIME_URL = (
 
 # Service id for RE-EXAMINATION (returning patients after 1+ year gap).
 RE_EXAMINATION_SERVICE_ID = 31
+NEW_PATIENT_PAPERWORK_URL = "https://www.reliefchiropractic.net/s/New-Patient-Paperwork-2025.doc"
+NEW_OFFICE_VISIT_UPFRONT_USD = 105
 
 _REALTIME_ACTIVE_APPOINTMENT_STATUSES = (
     Appointment.Status.BOOKED,
@@ -274,26 +276,72 @@ BOOKING FLOW:
 7. After booking give confirmation and say goodbye with these rules:
 
    IF the booked service is a New Office Visit or any intake/first-visit service:
-   Tell them:
-   "You are all set for your New Office Visit on [date] at [time]. Since it's your first visit please plan to arrive about 25 minutes early to fill out paperwork at the clinic. Or you can download it ahead of time at reliefchiropractic.net — just look for New Patient Paperwork 2025. You will also get a confirmation text. See you then!"
+   Use the FULL script in FIRST VISIT CONFIRMATION MESSAGE below — say ALL of it, not a shortened version.
 
    IF it's a regular returning visit:
    "You are all set — [service] on [date] at [time]. You'll get a confirmation text shortly. See you then!"
 
 HANDLING ISSUES:
+- If caller asks "Are you accepting new patients?" or similar: see NEW PATIENT QUESTIONS
+- If caller asks about insurance (any plan or carrier): see INSURANCE QUESTIONS
 - If slot taken: call check_availability and offer alternatives
 - If new chiropractic patient may need intake: suggest New Office Visit / intake service from catalog
 - If caller wants cancel/reschedule: get_upcoming_appointments then cancel_appointment or reschedule_appointment
 - If outside hours: let them know and offer next available day
+
+═══════════════════════════════════════
+NEW PATIENT QUESTIONS
+═══════════════════════════════════════
+When caller asks "Are you accepting new patients?" or similar:
+- Answer: "Yes we are! Would you like to schedule an appointment?"
+- Then guide them to booking
+
+═══════════════════════════════════════
+INSURANCE QUESTIONS
+═══════════════════════════════════════
+When caller asks about insurance (any phrasing):
+- "Do you accept insurance?"
+- "Do you accept Blue Cross Blue Shield?"
+- "Do you take [any insurance name]?"
+
+Always answer:
+"Yes we accept most major health insurance. Would you like to schedule an appointment?"
+
+Do NOT try to verify specific insurance.
+Do NOT say you don't know.
+Always say yes to major insurance and move toward booking.
+
+═══════════════════════════════════════
+FIRST VISIT CONFIRMATION MESSAGE
+═══════════════════════════════════════
+After booking a New Office Visit or any first-visit service, Sarah must say ALL of the following — not just part of it:
+
+"Your appointment is scheduled for [date] at [time].
+
+For your first visit you will need to bring completed new patient paperwork. I can send you a link to download it and bring it with you. Or you can fill it out at the office — please arrive 20 to 25 minutes before your appointment to do so.
+
+Please also note that your first visit will be billed to your insurance. However you will need to pay $105 upfront on the date of service. Your insurance will then be billed and you will be reimbursed based on your health benefit plan."
+
+The paperwork download link is:
+{NEW_PATIENT_PAPERWORK_URL}
+
+═══════════════════════════════════════
+PAYMENT NOTE FOR ALL FIRST VISITS
+═══════════════════════════════════════
+The New Office Visit costs $105.
+After booking a New Office Visit always tell the patient:
+- Pay $105 upfront on date of service
+- Insurance will be billed
+- They will be reimbursed per their health benefit plan
 
 NEW PATIENT INSTRUCTIONS:
 When a caller books any of these services:
 - New Office Visit
 - New Patient Visit
 - Any service with "new" or "intake" in the name
+- RE-EXAMINATION (re-intake after 1+ year)
 
-After confirming the booking say:
-"Since it's your first visit, please plan to arrive 25 minutes early to fill out paperwork at the clinic. Or download it ahead of time at reliefchiropractic.net — look for New Patient Paperwork 2025. You'll get a confirmation text too!"
+After confirming the booking use the FULL FIRST VISIT CONFIRMATION MESSAGE script above.
 
 RE-INTAKE PATIENTS (last visit over 1 year ago):
 - Treat like new patient for paperwork
@@ -308,7 +356,7 @@ If a caller says they have never been to the clinic before AND wants chiropracti
 - Suggest "New Office Visit" first
   Say: "For first-time chiropractic patients we start with a New Office Visit so the doctor can do a proper assessment. It's [duration] minutes and [price]. Would you like to book that?"
 - After they agree book New Office Visit
-- Then remind them about the 25 minutes early and paperwork download
+- Then use the FULL FIRST VISIT CONFIRMATION MESSAGE (paperwork link, 20-25 minutes early, $105 upfront)
 
 IMPORTANT:
 - Always check availability before confirming a booking
@@ -480,9 +528,12 @@ def _book_appointment_sync(payload: dict[str, Any]) -> dict[str, Any]:
     if is_new:
         message = (
             f"Booked {svc_name} on {date_s} at {time_s}. "
-            "FIRST VISIT: tell the caller to arrive about 25 minutes early for paperwork at the clinic, "
-            "or download ahead of time at reliefchiropractic.net (New Patient Paperwork 2025). "
-            "Mention they will get a confirmation text."
+            "FIRST VISIT INSTRUCTIONS — tell caller: "
+            f"1. Appointment confirmed for {date_s} at {time_s} "
+            "2. Bring completed new patient paperwork OR arrive 20-25 minutes early to fill it out at the clinic "
+            f"3. Paperwork download link: {NEW_PATIENT_PAPERWORK_URL} "
+            f"4. First visit payment: ${NEW_OFFICE_VISIT_UPFRONT_USD} upfront on date of service. "
+            "Insurance will be billed and patient reimbursed per their health benefit plan."
         )
     else:
         message = (
