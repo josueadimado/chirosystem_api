@@ -24,6 +24,12 @@ class Patient(TimeStampedModel):
     city_state_zip = models.CharField(max_length=200, blank=True, help_text="e.g. St Joseph, MI 49085")
     emergency_contact_name = models.CharField(max_length=200, blank=True)
     emergency_contact_phone = models.CharField(max_length=30, blank=True)
+    marital_status = models.CharField(
+        max_length=1,
+        blank=True,
+        choices=[("", "—"), ("Y", "Married"), ("N", "Not married")],
+        help_text="Y = married, N = not married (matrimonial situation).",
+    )
     # Square — full card data never stored; only customer + card on file id and display hints
     square_customer_id = models.CharField(max_length=255, blank=True)
     square_card_id = models.CharField(max_length=255, blank=True)

@@ -619,6 +619,13 @@ class PatientIntakeUpdateSerializer(serializers.Serializer):
     emergency_contact_name = serializers.CharField(required=False, allow_blank=True, max_length=200)
     emergency_contact_phone = serializers.CharField(required=False, allow_blank=True, max_length=30)
     date_of_birth = serializers.DateField(required=False, allow_null=True)
+    marital_status = serializers.CharField(required=False, allow_blank=True, max_length=1)
+
+    def validate_marital_status(self, value):
+        v = (value or "").strip().upper()
+        if v in ("", "Y", "N"):
+            return v
+        raise serializers.ValidationError("Use Y (married), N (not married), or leave blank.")
     # Only owner_admin/staff may persist this (see AdminViewSet.patient_intake); doctors’ PATCH ignores it.
     online_chiro_intake_waived = serializers.BooleanField(required=False)
 

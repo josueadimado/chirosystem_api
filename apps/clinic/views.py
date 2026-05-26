@@ -86,6 +86,7 @@ from .google_calendar_sync import (
     exchange_oauth_code,
     google_oauth_configured,
 )
+from .patient_demographics import patient_demographics_summary
 from .square_pos import (
     build_android_square_pos_intent,
     build_ios_square_pos_url,
@@ -2880,24 +2881,27 @@ class AdminViewSet(viewsets.ViewSet):
             .select_related("booked_service", "provider")
             .order_by("-appointment_date", "-start_time")[:100]
         )
-        return Response({
-            "id": patient.id,
-            "first_name": patient.first_name,
-            "last_name": patient.last_name,
-            "phone": patient.phone,
-            "email": patient.email or "",
-            "date_of_birth": str(patient.date_of_birth) if patient.date_of_birth else None,
-            "address_line1": patient.address_line1 or "",
-            "address_line2": patient.address_line2 or "",
-            "city_state_zip": patient.city_state_zip or "",
-            "emergency_contact_name": patient.emergency_contact_name or "",
-            "emergency_contact_phone": patient.emergency_contact_phone or "",
-            "card_brand": patient.card_brand or "",
-            "card_last4": patient.card_last4 or "",
-            "has_saved_card": bool(patient.card_last4),
-            "online_chiro_intake_waived": patient.online_chiro_intake_waived,
-            "appointments": _serialize_patient_appointment_history(request, appointments),
-        })
+        return Response(
+            {
+                "id": patient.id,
+                "first_name": patient.first_name,
+                "last_name": patient.last_name,
+                "phone": patient.phone,
+                "email": patient.email or "",
+                "date_of_birth": str(patient.date_of_birth) if patient.date_of_birth else None,
+                "address_line1": patient.address_line1 or "",
+                "address_line2": patient.address_line2 or "",
+                "city_state_zip": patient.city_state_zip or "",
+                "emergency_contact_name": patient.emergency_contact_name or "",
+                "emergency_contact_phone": patient.emergency_contact_phone or "",
+                "card_brand": patient.card_brand or "",
+                "card_last4": patient.card_last4 or "",
+                "has_saved_card": bool(patient.card_last4),
+                "online_chiro_intake_waived": patient.online_chiro_intake_waived,
+                "appointments": _serialize_patient_appointment_history(request, appointments),
+                **patient_demographics_summary(patient),
+            }
+        )
 
     @action(detail=False, methods=["patch"], url_path="patient_intake")
     def patient_intake(self, request):
@@ -2921,6 +2925,7 @@ class AdminViewSet(viewsets.ViewSet):
             "city_state_zip",
             "emergency_contact_name",
             "emergency_contact_phone",
+            "marital_status",
         ):
             if field in data:
                 setattr(patient, field, data[field] or "")
@@ -3196,6 +3201,7 @@ class DoctorViewSet(viewsets.ViewSet):
                 "has_saved_card": bool(patient.card_last4),
                 "online_chiro_intake_waived": patient.online_chiro_intake_waived,
                 "appointments": _serialize_patient_appointment_history(request, appointments),
+                **patient_demographics_summary(patient),
             }
         )
 
@@ -3224,6 +3230,7 @@ class DoctorViewSet(viewsets.ViewSet):
             "city_state_zip",
             "emergency_contact_name",
             "emergency_contact_phone",
+            "marital_status",
         ):
             if field in data:
                 setattr(patient, field, data[field] or "")
