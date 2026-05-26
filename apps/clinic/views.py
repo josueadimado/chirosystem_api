@@ -3159,9 +3159,8 @@ class DoctorViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["get"], url_path="patient_detail")
     def patient_detail(self, request):
-        """Get a patient's details (only patients the doctor has seen or has appointments with)."""
-        provider = self._get_provider(request)
-        if not provider:
+        """Full chart and visit history for any clinic patient (matches doctor directory search)."""
+        if not self._get_provider(request):
             return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
         patient_id = request.query_params.get("patient_id")
         if not patient_id:
@@ -3170,9 +3169,6 @@ class DoctorViewSet(viewsets.ViewSet):
             patient_id = int(patient_id)
         except (ValueError, TypeError):
             return Response({"detail": "Invalid patient_id."}, status=status.HTTP_400_BAD_REQUEST)
-        has_access = Appointment.objects.filter(provider=provider, patient_id=patient_id).exists()
-        if not has_access:
-            return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
         patient = Patient.objects.filter(pk=patient_id).select_related().first()
         if not patient:
             return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
@@ -3205,9 +3201,8 @@ class DoctorViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["patch"], url_path="patient_intake")
     def patient_intake(self, request):
-        """Update intake / address fields for a patient the doctor has seen."""
-        provider = self._get_provider(request)
-        if not provider:
+        """Update intake / address fields for any clinic patient."""
+        if not self._get_provider(request):
             return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
         patient_id = request.data.get("patient_id")
         if not patient_id:
@@ -3216,9 +3211,9 @@ class DoctorViewSet(viewsets.ViewSet):
             patient_id = int(patient_id)
         except (ValueError, TypeError):
             return Response({"detail": "Invalid patient_id."}, status=status.HTTP_400_BAD_REQUEST)
-        if not Appointment.objects.filter(provider=provider, patient_id=patient_id).exists():
-            return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
         patient = Patient.objects.filter(pk=patient_id).first()
+        if not patient:
+            return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
         ser = PatientIntakeUpdateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         data = {**ser.validated_data}
@@ -3268,16 +3263,13 @@ class DoctorViewSet(viewsets.ViewSet):
         inv = Invoice.objects.filter(pk=invoice_id).select_related("appointment").first()
         if not inv:
             return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
-        if inv.appointment.provider_id != provider.id:
-            return Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
         paid = inv.status == Invoice.Status.PAID
         return Response({"paid": paid, "status": inv.status})
 
     @action(detail=False, methods=["get"], url_path="invoice_bill")
     def invoice_bill(self, request):
-        """Print-ready patient bill for doctor's own invoice. Add ?preview=1 before payment (issued/overdue)."""
-        provider = self._get_provider(request)
-        if not provider:
+        """Print-ready patient bill for any clinic invoice. Add ?preview=1 before payment (issued/overdue)."""
+        if not self._get_provider(request):
             return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
         invoice_id = request.query_params.get("invoice_id")
         if not invoice_id:
@@ -3290,8 +3282,6 @@ class DoctorViewSet(viewsets.ViewSet):
         )
         if not inv:
             return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
-        if inv.appointment.provider_id != provider.id:
-            return Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
         preview = _invoice_bill_preview_requested(request)
         if preview:
             if not _invoice_bill_access_ok_for_preview(inv):
