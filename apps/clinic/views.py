@@ -133,8 +133,20 @@ def _clinic_settings_bill_header():
         "phone": s.phone,
         "email": s.email or "",
         "employer_tax_id": (s.employer_tax_id or "").strip(),
+        "provider_billing_id": (s.provider_billing_id or "").strip(),
         "pos_default": s.pos_default,
     }
+
+
+def _bill_provider_id_display(inv: Invoice, header: dict) -> str:
+    """Provider ID on patient bills: per-doctor override, else clinic setting, else legacy employer ID."""
+    prov = inv.appointment.provider if inv.appointment_id else None
+    if prov is not None:
+        per = (getattr(prov, "billing_provider_id", None) or "").strip()
+        if per:
+            return per
+    clinic_id = (header.get("provider_billing_id") or header.get("employer_tax_id") or "").strip()
+    return clinic_id
 
 
 def _format_bill_display_date(d) -> str:
@@ -190,6 +202,7 @@ def _invoice_bill_dict(inv: Invoice, *, preview: bool) -> dict:
             if inv.appointment and inv.appointment.provider
             else ""
         ),
+        "provider_billing_id": _bill_provider_id_display(inv, header),
         "lines": lines,
         # Bill "Subtotal" = sum of all documented line amounts (including insurance-only rows).
         "subtotal": str(documented_subtotal),
@@ -318,6 +331,7 @@ def _serialize_patient_appointment_history(request, appointments):
         inv_payload = None
         if inv:
             inv_payload = {
+                "id": inv.id,
                 "invoice_number": inv.invoice_number,
                 "subtotal": str(inv.subtotal),
                 "discount": str(inv.discount),
@@ -1304,7 +1318,26 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         merged_end = data.get("end_time", inst.end_time)
         prov_obj = data.get("provider", inst.provider)
         overlap_pid = prov_obj.pk if hasattr(prov_obj, "pk") else inst.provider_id
-        if any(k in data for k in ("appointment_date", "start_time", "end_time", "provider")):
+        span_fields_in_request = any(
+            k in data for k in ("appointment_date", "start_time", "end_time", "provider")
+        )
+        if span_fields_in_request:
+            from .provider_self_schedule import validate_appointment_duration_span_for_desk
+
+            svc_span = data.get("booked_service", inst.booked_service)
+            prov_for_span = prov_obj if hasattr(prov_obj, "pk") else inst.provider
+            err_span, _is_conflict = validate_appointment_duration_span_for_desk(
+                provider=prov_for_span,
+                service=svc_span,
+                appt_date=merged_date,
+                start_time=merged_start,
+                end_time=merged_end,
+                exclude_appointment_id=inst.pk,
+            )
+            if err_span:
+                raise ValidationError({"detail": err_span})
+
+        if span_fields_in_request:
             overlapping = (
                 Appointment.objects.filter(
                     provider_id=overlap_pid,
@@ -1404,7 +1437,9 @@ class AppointmentViewSet(viewsets.ModelViewSet):
             "booked_service_id": inst.booked_service_id,
         }
         date_changed = "appointment_date" in data and data["appointment_date"] != inst.appointment_date
-        time_changed = "start_time" in data and data["start_time"] != inst.start_time
+        time_changed = ("start_time" in data and data["start_time"] != inst.start_time) or (
+            "end_time" in data and data["end_time"] != inst.end_time
+        )
         if date_changed or time_changed:
             serializer.save(
                 day_before_reminder_sms_at=None,
@@ -1421,9 +1456,16 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         if old["appointment_date"] != new.appointment_date:
             change_lines.append(f"Date: {old['appointment_date']} → {new.appointment_date}.")
         if old["start_time"] != new.start_time or old["end_time"] != new.end_time:
-            change_lines.append(
-                f"Time: {format_time_12h(old['start_time'])} → {format_time_12h(new.start_time)}."
-            )
+            time_parts: list[str] = []
+            if old["start_time"] != new.start_time:
+                time_parts.append(
+                    f"Start: {format_time_12h(old['start_time'])} → {format_time_12h(new.start_time)}"
+                )
+            if old["end_time"] != new.end_time:
+                time_parts.append(
+                    f"End: {format_time_12h(old['end_time'])} → {format_time_12h(new.end_time)}"
+                )
+            change_lines.append(f"{' · '.join(time_parts)}.")
         if old["status"] != new.status:
             change_lines.append(f"Status: {old['status']} → {new.status}.")
         if old["booked_service_id"] != new.booked_service_id:
@@ -2208,11 +2250,16 @@ class AdminViewSet(viewsets.ViewSet):
             "phone",
             "email",
             "employer_tax_id",
+            "provider_billing_id",
             "pos_default",
         ):
             if field in data:
                 val = data[field]
-                setattr(solo, field, (val or "") if field in ("email", "employer_tax_id") else val)
+                setattr(
+                    solo,
+                    field,
+                    (val or "") if field in ("email", "employer_tax_id", "provider_billing_id") else val,
+                )
         if "no_show_fee" in data:
             solo.no_show_fee = data["no_show_fee"]
         if "business_hours" in data:
@@ -2709,7 +2756,7 @@ class AdminViewSet(viewsets.ViewSet):
         if not invoice_id:
             return Response({"detail": "invoice_id is required."}, status=status.HTTP_400_BAD_REQUEST)
         inv = (
-            Invoice.objects.select_related("patient", "appointment", "visit")
+            Invoice.objects.select_related("patient", "appointment__provider", "visit")
             .prefetch_related("visit__rendered_services__service")
             .filter(pk=invoice_id)
             .first()
@@ -3157,7 +3204,7 @@ class DoctorViewSet(viewsets.ViewSet):
         if not invoice_id:
             return Response({"detail": "invoice_id is required."}, status=status.HTTP_400_BAD_REQUEST)
         inv = (
-            Invoice.objects.select_related("patient", "appointment", "visit")
+            Invoice.objects.select_related("patient", "appointment__provider", "visit")
             .prefetch_related("visit__rendered_services__service")
             .filter(pk=invoice_id)
             .first()

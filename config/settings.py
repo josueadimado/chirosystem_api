@@ -122,7 +122,9 @@ SIMPLE_JWT = {
 }
 
 LANGUAGE_CODE = "en-us"
-TIME_ZONE = "UTC"
+# Clinic wall clock for scheduling, "today", and Django localdate() — not the server's or developer's TZ.
+CLINIC_TIMEZONE = os.getenv("CLINIC_TIMEZONE", "America/Detroit")
+TIME_ZONE = CLINIC_TIMEZONE
 USE_I18N = True
 USE_TZ = True
 
@@ -159,8 +161,7 @@ else:
             "LOCATION": "chiroflow",
         }
     }
-# Used for “tomorrow” appointment SMS reminders and Celery Beat crontab
-CLINIC_TIMEZONE = os.getenv("CLINIC_TIMEZONE", "America/Detroit")
+# Used for “tomorrow” appointment SMS reminders and Celery Beat crontab (see CLINIC_TIMEZONE above).
 CELERY_TIMEZONE = CLINIC_TIMEZONE
 # Kiosk: earliest self-service check-in is this many minutes before the scheduled start (staff can complete check-in earlier in admin).
 KIOSK_EARLY_CHECKIN_MINUTES_BEFORE = int(os.getenv("KIOSK_EARLY_CHECKIN_MINUTES_BEFORE", "15"))

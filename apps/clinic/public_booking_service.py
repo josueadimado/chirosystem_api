@@ -36,21 +36,13 @@ MASSAGE_PUBLIC_BOOKING_BUFFER_AFTER_MINUTES = 15
 
 def _appointment_start_aware_in_clinic_tz(appt: Appointment) -> datetime:
     """
-    Appointment start as an aware datetime in the clinic TIME_ZONE.
+    Appointment start as an aware datetime in CLINIC_TIMEZONE (e.g. America/Detroit).
 
-    Used instead of ``make_aware(combine(...))`` without tzinfo, which can raise on DST gaps
-    and surface as HTTP 500 during patient cancel / listing checks.
+    Used instead of ``make_aware(combine(...))`` without tzinfo, which treated slots as UTC.
     """
-    from zoneinfo import ZoneInfo
+    from apps.clinic.clinic_time import aware_appointment_start
 
-    from django.conf import settings
-
-    tz_name = getattr(settings, "TIME_ZONE", "UTC") or "UTC"
-    try:
-        clinic_tz = ZoneInfo(str(tz_name))
-    except Exception:
-        clinic_tz = ZoneInfo("UTC")
-    return datetime.combine(appt.appointment_date, appt.start_time, tzinfo=clinic_tz)
+    return aware_appointment_start(appt.appointment_date, appt.start_time)
 
 
 def _local_now_passed_appointment_start(appt: Appointment) -> bool:
@@ -59,12 +51,9 @@ def _local_now_passed_appointment_start(appt: Appointment) -> bool:
 
     Cheap guard when we only need a wall-clock comparison (e.g. my-appointments list).
     """
-    local_now = timezone.localtime(timezone.now())
-    if appt.appointment_date > local_now.date():
-        return False
-    if appt.appointment_date < local_now.date():
-        return True
-    return local_now.time() >= appt.start_time
+    from apps.clinic.clinic_time import slot_start_is_in_past
+
+    return slot_start_is_in_past(appt.appointment_date, appt.start_time)
 
 
 def public_online_booking_calendar_span_minutes(service: Service) -> int:
@@ -322,22 +311,15 @@ def reschedule_appointment_public(
     if not service or not service.is_active or not service.show_in_public_booking:
         return None, "This visit type cannot be rescheduled online. Please call the clinic."
 
+    from apps.clinic.clinic_time import clinic_localdate, slot_start_is_in_past
+
     provider = appt.provider
-    today = timezone.localdate()
+    today = clinic_localdate()
     if new_date < today:
         return None, "Pick today or a future date."
 
-    if new_date == today:
-        from types import SimpleNamespace
-
-        try:
-            slot_dt = _appointment_start_aware_in_clinic_tz(
-                SimpleNamespace(appointment_date=new_date, start_time=new_start),
-            )
-        except Exception:
-            return None, "Pick a valid time for today."
-        if slot_dt <= timezone.now():
-            return None, "Pick a time later today that has not passed yet."
+    if slot_start_is_in_past(new_date, new_start):
+        return None, "Pick a time later today that has not passed yet."
 
     start_dt = datetime.combine(new_date, new_start)
     span = public_online_booking_calendar_span_minutes(service)

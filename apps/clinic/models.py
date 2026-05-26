@@ -92,6 +92,13 @@ class Provider(TimeStampedModel):
         default="",
         help_text="Doctor/staff mobile for alerts (E.164 e.g. +15551234567). Leave blank to skip.",
     )
+    billing_provider_id = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        help_text="Optional. Billing provider ID (e.g. NPI) printed on this doctor's patient bills. "
+        "When blank, the clinic-wide Provider ID from Settings is used.",
+    )
 
     class Meta:
         verbose_name = "Doctor"
@@ -454,6 +461,13 @@ class ClinicSettings(TimeStampedModel):
         blank=True,
         default="",
         help_text="Employer / office tax ID printed on patient bills (e.g. EIN). Optional.",
+    )
+    provider_billing_id = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        help_text="Clinic-wide billing provider ID printed on all patient bills (e.g. NPI). "
+        "Used when a doctor has no per-provider ID set.",
     )
     pos_default = models.CharField(
         max_length=10,
