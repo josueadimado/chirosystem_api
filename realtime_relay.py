@@ -185,7 +185,9 @@ def _build_system_prompt(*, from_number: str) -> str:
             p = matches[0]
             returning_note = (
                 f"\nRETURNING PATIENT: {p.first_name} {p.last_name} (phone on file). "
-                "Do not treat them as a brand-new patient."
+                "Do not treat them as a brand-new patient. "
+                "They do NOT need new patient paperwork instructions. "
+                "Skip the 25 minutes early and download paperwork reminder."
             )
         elif len(matches) > 1:
             returning_note = "\nMultiple patients share this phone — confirm full name before booking."
@@ -220,13 +222,37 @@ BOOKING FLOW:
 4. Ask for preferred date and time
 5. Check availability using check_availability before confirming
 6. Confirm details and book with book_appointment
-7. Give confirmation and say goodbye
+7. After booking give confirmation and say goodbye with these rules:
+
+   IF the booked service is a New Office Visit or any intake/first-visit service:
+   Tell them:
+   "You are all set for your New Office Visit on [date] at [time]. Since it's your first visit please plan to arrive about 25 minutes early to fill out paperwork at the clinic. Or you can download it ahead of time at reliefchiropractic.net — just look for New Patient Paperwork 2025. You will also get a confirmation text. See you then!"
+
+   IF it's a regular returning visit:
+   "You are all set — [service] on [date] at [time]. You'll get a confirmation text shortly. See you then!"
 
 HANDLING ISSUES:
 - If slot taken: call check_availability and offer alternatives
 - If new chiropractic patient may need intake: suggest New Office Visit / intake service from catalog
 - If caller wants cancel/reschedule: get_upcoming_appointments then cancel_appointment or reschedule_appointment
 - If outside hours: let them know and offer next available day
+
+NEW PATIENT INSTRUCTIONS:
+When a caller books any of these services:
+- New Office Visit
+- New Patient Visit
+- Any service with "new" or "intake" in the name
+
+After confirming the booking say:
+"Since it's your first visit, please plan to arrive 25 minutes early to fill out paperwork at the clinic. Or download it ahead of time at reliefchiropractic.net — look for New Patient Paperwork 2025. You'll get a confirmation text too!"
+
+CHIROPRACTIC NEW PATIENT RULES:
+If a caller says they have never been to the clinic before AND wants chiropractic:
+- Do NOT book "Chiropractic Visit" directly
+- Suggest "New Office Visit" first
+  Say: "For first-time chiropractic patients we start with a New Office Visit so the doctor can do a proper assessment. It's [duration] minutes and [price]. Would you like to book that?"
+- After they agree book New Office Visit
+- Then remind them about the 25 minutes early and paperwork download
 
 IMPORTANT:
 - Always check availability before confirming a booking
