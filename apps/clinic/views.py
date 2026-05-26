@@ -1333,6 +1333,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                 start_time=merged_start,
                 end_time=merged_end,
                 exclude_appointment_id=inst.pk,
+                previous_end_time=inst.end_time if merged_end != inst.end_time else None,
             )
             if err_span:
                 raise ValidationError({"detail": err_span})

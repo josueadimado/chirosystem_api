@@ -203,11 +203,41 @@ def validate_appointment_duration_span_for_desk(
     start_time,
     end_time,
     exclude_appointment_id: int | None = None,
+    previous_end_time=None,
 ) -> tuple[str | None, bool]:
     """
     Front desk: extend or shorten a visit on the calendar (start/end span).
-    Uses desk closing hours, provider blocks, and double-booking rules.
+    Double-booking on the extended slice is checked before hours, blocks, and other rules.
     """
+    extending = (
+        previous_end_time is not None
+        and end_time > previous_end_time
+    )
+
+    overlap_qs = Appointment.objects.filter(
+        provider=provider,
+        appointment_date=appt_date,
+        start_time__lt=end_time,
+        end_time__gt=(previous_end_time if extending else start_time),
+    ).exclude(
+        status__in=[
+            Appointment.Status.CANCELLED,
+            Appointment.Status.NO_SHOW,
+            Appointment.Status.COMPLETED,
+        ]
+    )
+    if exclude_appointment_id:
+        overlap_qs = overlap_qs.exclude(pk=exclude_appointment_id)
+
+    if overlap_qs.exists():
+        if extending:
+            return (
+                "The extended time is already booked for this provider. "
+                "Choose a shorter extension or another slot.",
+                True,
+            )
+        return "That time slot is no longer available. Please choose another time.", True
+
     start_m = start_time.hour * 60 + start_time.minute
     end_m = end_time.hour * 60 + end_time.minute
     if end_m <= start_m:
@@ -231,24 +261,6 @@ def validate_appointment_duration_span_for_desk(
         provider.pk, appt_date, start_time, end_time, block_overlap_end=end_time
     ):
         return "That time overlaps a blocked period on the provider schedule.", False
-
-    overlapping = Appointment.objects.filter(
-        provider=provider,
-        appointment_date=appt_date,
-        start_time__lt=end_time,
-        end_time__gt=start_time,
-    ).exclude(
-        status__in=[
-            Appointment.Status.CANCELLED,
-            Appointment.Status.NO_SHOW,
-            Appointment.Status.COMPLETED,
-        ]
-    )
-    if exclude_appointment_id:
-        overlapping = overlapping.exclude(pk=exclude_appointment_id)
-
-    if overlapping.exists():
-        return "That time slot is no longer available. Please choose another time.", True
 
     return None, False
 
