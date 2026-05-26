@@ -87,6 +87,13 @@ from .google_calendar_sync import (
     google_oauth_configured,
 )
 from .patient_demographics import apply_patient_directory_list_filter, patient_demographics_summary
+from .provider_patient_access import (
+    appointment_matches_provider_discipline,
+    clinical_access_level,
+    clinical_access_message,
+    filter_patient_queryset_for_provider_discipline,
+    provider_for_doctor_user,
+)
 from .square_pos import (
     build_android_square_pos_intent,
     build_ios_square_pos_url,
@@ -279,17 +286,23 @@ def _printable_invoice_line(rs, pos_default):
     }
 
 
-def _can_edit_handoff_notes(request, appointment: Appointment) -> bool:
+def _can_edit_handoff_notes(request, appointment: Appointment, *, force_read_only: bool = False) -> bool:
+    if force_read_only:
+        return False
     role = getattr(request.user, "role", None)
     if role in ("owner_admin", "staff"):
         return True
     if role == "doctor":
-        prov = Provider.objects.filter(user=request.user).first()
-        return bool(prov and appointment.provider_id == prov.id)
+        prov = provider_for_doctor_user(request.user)
+        if not prov or appointment.provider_id != prov.id:
+            return False
+        if not appointment_matches_provider_discipline(appointment, prov):
+            return False
+        return clinical_access_level(prov, appointment.patient) == "full"
     return False
 
 
-def _serialize_patient_appointment_history(request, appointments):
+def _serialize_patient_appointment_history(request, appointments, *, force_read_only: bool = False):
     """Build chart rows for patient_detail (visits, billing lines, handoff notes)."""
     appt_list = list(appointments)
     if not appt_list:
@@ -354,7 +367,7 @@ def _serialize_patient_appointment_history(request, appointments):
                 "provider_id": a.provider_id,
                 "status": a.status,
                 "clinical_handoff_notes": a.clinical_handoff_notes or "",
-                "can_edit_handoff_notes": _can_edit_handoff_notes(request, a),
+                "can_edit_handoff_notes": _can_edit_handoff_notes(request, a, force_read_only=force_read_only),
                 "visit": visit_payload,
                 "invoice": inv_payload,
             }
@@ -367,9 +380,18 @@ def _save_appointment_handoff_notes(request):
     ser.is_valid(raise_exception=True)
     aid = ser.validated_data["appointment_id"]
     notes = ser.validated_data["clinical_handoff_notes"]
-    appt = Appointment.objects.filter(pk=aid).select_related("provider", "patient").first()
+    appt = Appointment.objects.filter(pk=aid).select_related("provider", "patient", "booked_service").first()
     if not appt:
         return Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
+    prov = provider_for_doctor_user(request.user)
+    if prov and clinical_access_level(prov, appt.patient) != "full":
+        return Response(
+            {
+                "detail": "This patient is outside your care type (chiropractic vs massage). "
+                "You can view their chart but cannot edit notes or demographics."
+            },
+            status=status.HTTP_403_FORBIDDEN,
+        )
     if not _can_edit_handoff_notes(request, appt):
         return Response(
             {"detail": "You cannot edit chart notes on this appointment."},
@@ -1042,7 +1064,11 @@ class PatientViewSet(viewsets.ModelViewSet):
             next_appointment_time=Subquery(next_appt.values("start_time")[:1]),
         )
         directory = (self.request.query_params.get("directory") or "").strip()
-        return apply_patient_directory_list_filter(qs, directory)
+        qs = apply_patient_directory_list_filter(qs, directory)
+        prov = provider_for_doctor_user(self.request.user)
+        if prov is not None:
+            qs = filter_patient_queryset_for_provider_discipline(qs, prov)
+        return qs
 
     def create(self, request, *args, **kwargs):
         if getattr(request.user, "role", None) not in ("owner_admin", "staff"):
@@ -3166,10 +3192,11 @@ class DoctorViewSet(viewsets.ViewSet):
         patient = Patient.objects.filter(pk=patient_id).select_related().first()
         if not patient:
             return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
-        # Full clinic timeline so any treating doctor can see colleagues' visits and chart notes.
+        provider = self._get_provider(request)
+        access = clinical_access_level(provider, patient)
         appointments = (
             Appointment.objects.filter(patient=patient)
-            .select_related("booked_service", "provider")
+            .select_related("booked_service", "provider", "patient")
             .order_by("-appointment_date", "-start_time")[:100]
         )
         return Response(
@@ -3189,7 +3216,11 @@ class DoctorViewSet(viewsets.ViewSet):
                 "card_last4": patient.card_last4 or "",
                 "has_saved_card": bool(patient.card_last4),
                 "online_chiro_intake_waived": patient.online_chiro_intake_waived,
-                "appointments": _serialize_patient_appointment_history(request, appointments),
+                "clinical_access": access,
+                "clinical_access_message": clinical_access_message(provider, access),
+                "appointments": _serialize_patient_appointment_history(
+                    request, appointments, force_read_only=(access == "read_only")
+                ),
                 **patient_demographics_summary(patient),
             }
         )
@@ -3197,7 +3228,8 @@ class DoctorViewSet(viewsets.ViewSet):
     @action(detail=False, methods=["patch"], url_path="patient_intake")
     def patient_intake(self, request):
         """Update intake / address fields for any clinic patient."""
-        if not self._get_provider(request):
+        provider = self._get_provider(request)
+        if not provider:
             return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
         patient_id = request.data.get("patient_id")
         if not patient_id:
@@ -3209,6 +3241,14 @@ class DoctorViewSet(viewsets.ViewSet):
         patient = Patient.objects.filter(pk=patient_id).first()
         if not patient:
             return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
+        if clinical_access_level(provider, patient) != "full":
+            return Response(
+                {
+                    "detail": "This patient is outside your care type (chiropractic vs massage). "
+                    "Ask the front desk or the other provider to update demographics."
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
         ser = PatientIntakeUpdateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         data = {**ser.validated_data}
