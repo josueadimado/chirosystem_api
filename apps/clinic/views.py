@@ -86,7 +86,7 @@ from .google_calendar_sync import (
     exchange_oauth_code,
     google_oauth_configured,
 )
-from .patient_demographics import patient_demographics_summary
+from .patient_demographics import apply_patient_directory_list_filter, patient_demographics_summary
 from .square_pos import (
     build_android_square_pos_intent,
     build_ios_square_pos_url,
@@ -1030,7 +1030,7 @@ class PatientViewSet(viewsets.ModelViewSet):
             .exclude(status__in=_FUTURE_APPT_EXCLUDED)
             .order_by("appointment_date", "start_time")
         )
-        return qs.annotate(
+        qs = qs.annotate(
             visit_count=Count(
                 "visit",
                 filter=Q(visit__status=Visit.Status.COMPLETED),
@@ -1040,7 +1040,9 @@ class PatientViewSet(viewsets.ModelViewSet):
             last_service=Subquery(last_appt.values("booked_service__name")[:1]),
             next_appointment_date=Subquery(next_appt.values("appointment_date")[:1]),
             next_appointment_time=Subquery(next_appt.values("start_time")[:1]),
-        ).order_by("-last_visit", "last_name", "first_name")
+        )
+        directory = (self.request.query_params.get("directory") or "").strip()
+        return apply_patient_directory_list_filter(qs, directory)
 
     def create(self, request, *args, **kwargs):
         if getattr(request.user, "role", None) not in ("owner_admin", "staff"):
