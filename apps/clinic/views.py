@@ -73,8 +73,8 @@ from .serializers import (
     complete_visit_with_services,
     revise_unpaid_visit_billing,
 )
-from .analytics import build_admin_analytics_payload
-from .doctor_analytics import build_doctor_my_analytics_payload
+from .analytics import build_admin_analytics_payload, parse_analytics_months
+from .doctor_analytics import build_doctor_my_analytics_payload, parse_analytics_weeks
 from .pagination import StandardPageNumberPagination
 from .square_helpers import (
     get_application_id,
@@ -2271,7 +2271,8 @@ class AdminViewSet(viewsets.ViewSet):
         denied = self._admin_staff_only(request)
         if denied:
             return denied
-        return Response(build_admin_analytics_payload())
+        months = parse_analytics_months(request.query_params.get("months"))
+        return Response(build_admin_analytics_payload(months=months))
 
     @action(detail=False, methods=["get"], url_path="voice_calls")
     def voice_calls(self, request):
@@ -3018,7 +3019,8 @@ class DoctorViewSet(viewsets.ViewSet):
         provider = self._get_provider(request)
         if not provider:
             return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
-        return Response(build_doctor_my_analytics_payload(provider))
+        weeks = parse_analytics_weeks(request.query_params.get("weeks"))
+        return Response(build_doctor_my_analytics_payload(provider, weeks=weeks))
 
     @action(detail=False, methods=["get"])
     def appointments(self, request):

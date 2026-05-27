@@ -186,7 +186,49 @@ def _client_health_counts(today: date) -> dict:
     }
 
 
-def build_admin_analytics_payload() -> dict:
+def _build_revenue_chart(months: int) -> list[dict]:
+    """Monthly collected vs outstanding added for the last N calendar months."""
+    tz = _clinic_tz()
+    now = timezone.now().astimezone(tz)
+    months = max(3, min(int(months), 12))
+    revenue_chart = []
+    y, m = now.year, now.month
+    for _ in range(months):
+        m_start, m_end = _month_bounds(y, m)
+        collected = _payments_collected_between(m_start, m_end)
+        outstanding_added = _quantize_money(
+            Invoice.objects.filter(
+                issued_at__gte=m_start,
+                issued_at__lt=m_end,
+            )
+            .filter(status__in=(Invoice.Status.ISSUED, Invoice.Status.OVERDUE))
+            .aggregate(s=Sum("total_amount"))["s"]
+        )
+        label = datetime(y, m, 1, tzinfo=tz).strftime("%b %y")
+        revenue_chart.append(
+            {
+                "month": label,
+                "collected": float(collected),
+                "outstanding": float(outstanding_added),
+            }
+        )
+        m -= 1
+        if m < 1:
+            m = 12
+            y -= 1
+    revenue_chart.reverse()
+    return revenue_chart
+
+
+def parse_analytics_months(raw: str | None, *, default: int = 6) -> int:
+    try:
+        n = int((raw or "").strip() or default)
+    except ValueError:
+        n = default
+    return n if n in (3, 6, 12) else default
+
+
+def build_admin_analytics_payload(*, months: int = 6) -> dict:
     tz = _clinic_tz()
     now = timezone.now().astimezone(tz)
     today = now.date()
@@ -218,33 +260,8 @@ def build_admin_analytics_payload() -> dict:
         "new_clients_change": _pct_change(new_cur, new_prev),
     }
 
-    # --- Revenue chart (last 6 months including current) ---
-    revenue_chart = []
-    y, m = now.year, now.month
-    for _ in range(6):
-        m_start, m_end = _month_bounds(y, m)
-        collected = _payments_collected_between(m_start, m_end)
-        outstanding_added = _quantize_money(
-            Invoice.objects.filter(
-                issued_at__gte=m_start,
-                issued_at__lt=m_end,
-            )
-            .filter(status__in=(Invoice.Status.ISSUED, Invoice.Status.OVERDUE))
-            .aggregate(s=Sum("total_amount"))["s"]
-        )
-        label = datetime(y, m, 1, tzinfo=tz).strftime("%b")
-        revenue_chart.append(
-            {
-                "month": label,
-                "collected": float(collected),
-                "outstanding": float(outstanding_added),
-            }
-        )
-        m -= 1
-        if m < 1:
-            m = 12
-            y -= 1
-    revenue_chart.reverse()
+    chart_months = parse_analytics_months(str(months), default=6)
+    revenue_chart = _build_revenue_chart(chart_months)
 
     # --- Appointments this week (Mon–Sun) ---
     week_start = today - timedelta(days=today.weekday())
@@ -318,6 +335,7 @@ def build_admin_analytics_payload() -> dict:
     return {
         "kpis": kpis,
         "revenue_chart": revenue_chart,
+        "revenue_chart_months": chart_months,
         "appointments_this_week": appointments_this_week,
         "billing_summary": billing_summary,
         "revenue_by_service": revenue_by_service,

@@ -341,13 +341,23 @@ def _build_weekly_sessions(provider: Provider, weeks: int = 8) -> list[dict]:
     return rows
 
 
-def build_doctor_my_analytics_payload(provider: Provider) -> dict:
+def parse_analytics_weeks(raw: str | None, *, default: int = 8) -> int:
+    try:
+        n = int((raw or "").strip() or default)
+    except ValueError:
+        n = default
+    return n if n in (4, 8, 12, 16, 24) else default
+
+
+def build_doctor_my_analytics_payload(provider: Provider, *, weeks: int = 8) -> dict:
     today = timezone.localdate()
+    chart_weeks = parse_analytics_weeks(str(weeks), default=8)
     return {
         "today": _build_today(provider),
         "monthly_kpis": _build_monthly_kpis(provider),
         "needs_attention": _build_needs_attention(provider, today),
         "completions_this_month": _build_completions_this_month(provider),
-        "weekly_sessions": _build_weekly_sessions(provider),
+        "weekly_sessions": _build_weekly_sessions(provider, weeks=chart_weeks),
+        "weekly_sessions_weeks": chart_weeks,
         "care_plan_sessions": DEFAULT_CARE_PLAN_SESSIONS,
     }
