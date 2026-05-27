@@ -90,6 +90,7 @@ from .google_calendar_sync import (
 )
 from .patient_demographics import (
     annotate_patient_list_stats,
+    annotate_patient_unpaid_balances,
     apply_patient_directory_list_filter,
     patient_demographics_summary,
 )
@@ -2844,18 +2845,15 @@ class AdminViewSet(viewsets.ViewSet):
     @action(detail=False, methods=["get"])
     def patients(self, request):
         """List all patients with directory stats and open invoice balance for admin."""
-        from django.db.models import Sum
-
-        patients_qs = annotate_patient_list_stats(
-            _defer_patient_card_fields(Patient.objects.all())
+        patients_qs = annotate_patient_unpaid_balances(
+            annotate_patient_list_stats(_defer_patient_card_fields(Patient.objects.all()))
         ).order_by("last_name", "first_name")
         data = []
         for p in patients_qs:
-            balance_result = (
-                Invoice.objects.filter(patient=p, status=Invoice.Status.ISSUED)
-                .aggregate(total=Sum("total_amount"))["total"]
-                or 0
-            )
+            bal_visit = getattr(p, "balance_visit", None) or Decimal("0")
+            bal_no_show = getattr(p, "balance_no_show_fee", None) or Decimal("0")
+            bal_late_cancel = getattr(p, "balance_late_cancel_fee", None) or Decimal("0")
+            balance_total = (bal_visit + bal_no_show + bal_late_cancel).quantize(Decimal("0.01"))
             next_time = p.next_appointment_time
             data.append({
                 "id": p.id,
@@ -2876,7 +2874,11 @@ class AdminViewSet(viewsets.ViewSet):
                 "date_established": str(p.effective_date_established)
                 if getattr(p, "effective_date_established", None)
                 else None,
-                "balance": str(balance_result),
+                "balance": str(balance_total),
+                "balance_visit": str(bal_visit.quantize(Decimal("0.01"))),
+                "balance_no_show_fee": str(bal_no_show.quantize(Decimal("0.01"))),
+                "balance_late_cancel_fee": str(bal_late_cancel.quantize(Decimal("0.01"))),
+                "has_overdue": bool(getattr(p, "has_overdue_invoice", False)),
             })
         return Response(data)
 

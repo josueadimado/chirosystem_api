@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from django.db.models import Count, F, Min, OuterRef, Q, Subquery
+from decimal import Decimal
+
+from django.db.models import Count, Exists, F, Min, OuterRef, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce, TruncDate
 from django.utils import timezone
 
-from .models import Appointment, Patient, Visit
+from .models import Appointment, Invoice, Patient, Visit
+
+_UNPAID_INVOICE_STATUSES = (Invoice.Status.ISSUED, Invoice.Status.OVERDUE)
 
 _APPT_EXCLUDED = (
     Appointment.Status.CANCELLED,
@@ -63,6 +67,29 @@ def annotate_patient_list_stats(qs):
     ).annotate(
         # Alias must differ from Patient.date_established (staff override column).
         effective_date_established=Coalesce(F("date_established"), F("_first_appointment_date")),
+    )
+
+
+def annotate_patient_unpaid_balances(qs):
+    """Unpaid invoice totals by kind (issued + overdue) for admin patient directory filters."""
+    unpaid = Q(invoice__status__in=_UNPAID_INVOICE_STATUSES)
+    zero = Value(Decimal("0.00"))
+    return qs.annotate(
+        balance_visit=Coalesce(
+            Sum("invoice__total_amount", filter=unpaid & Q(invoice__kind=Invoice.Kind.VISIT)),
+            zero,
+        ),
+        balance_no_show_fee=Coalesce(
+            Sum("invoice__total_amount", filter=unpaid & Q(invoice__kind=Invoice.Kind.NO_SHOW_FEE)),
+            zero,
+        ),
+        balance_late_cancel_fee=Coalesce(
+            Sum("invoice__total_amount", filter=unpaid & Q(invoice__kind=Invoice.Kind.LATE_CANCEL_FEE)),
+            zero,
+        ),
+        has_overdue_invoice=Exists(
+            Invoice.objects.filter(patient_id=OuterRef("pk"), status=Invoice.Status.OVERDUE),
+        ),
     )
 
 
