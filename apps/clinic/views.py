@@ -265,17 +265,13 @@ def _invoice_bill_preview_requested(request) -> bool:
 
 
 def _printable_invoice_line(rs, pos_default):
-    """Bill table row: fees and line_total are documented amounts.
+    """Bill table row: fees and line_total are documented amounts for every rendered service.
 
-    patient_due is the amount that counts toward the patient's balance (0 when insurance/documentation only).
-    Invoice subtotal/total_amount still exclude lines where charges_patient is False.
+    patient_due is the amount that counts toward the patient's balance (0 when charges_patient is False).
+    Invoice subtotal/total_amount exclude insurance-only lines; printed description stays the service text only.
     """
     svc = rs.service
-    base_desc = (svc.description or svc.name)[:120]
-    if rs.charges_patient:
-        desc = base_desc
-    else:
-        desc = f"{base_desc} — not added to patient total below (insurance / documentation)".strip()[:220]
+    desc = (svc.description or svc.name)[:220]
     patient_due = str(rs.total_price) if rs.charges_patient else "0.00"
     return {
         "service_offered": svc.name,
