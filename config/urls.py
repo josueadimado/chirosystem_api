@@ -1,5 +1,7 @@
 from django.contrib import admin
 from django.urls import include, path
+
+from config.health_views import health
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import TokenRefreshView
@@ -46,6 +48,7 @@ router.register("notifications", StaffNotificationViewSet, basename="notificatio
 router.register("admin", AdminViewSet, basename="admin")
 
 urlpatterns = [
+    path("health/", health, name="health"),
     path("admin/", admin.site.urls),
     path("api/v1/square/webhook/", square_webhook, name="square-webhook"),
     path("api/v1/square/pos-callback/", square_pos_callback, name="square-pos-callback"),

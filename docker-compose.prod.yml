@@ -46,11 +46,7 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-chiroflow_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-chiroflow}
       CELERY_BROKER_URL: redis://redis:6379/0
     # Optional: set DJANGO_ADMIN_USERNAME + DJANGO_ADMIN_PASSWORD in .env to bootstrap / refresh admin on each deploy.
-    command: >
-      sh -c "python manage.py migrate --noinput &&
-             python manage.py collectstatic --noinput &&
-             if [ -n \"$$DJANGO_ADMIN_USERNAME\" ] && [ -n \"$$DJANGO_ADMIN_PASSWORD\" ]; then python manage.py create_admin_from_env; fi &&
-             gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 120"
+    command: ["./scripts/docker-api-entrypoint.sh"]
     depends_on:
       db:
         condition: service_healthy
@@ -59,7 +55,13 @@ services:
     ports:
       - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1',8000)); s.close()"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/', timeout=3)",
+        ]
       interval: 15s
       timeout: 5s
       retries: 12

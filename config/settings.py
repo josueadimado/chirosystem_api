@@ -335,6 +335,8 @@ except OSError:
 # ---------------------------------------------------------
 if not DEBUG:
     SECURE_SSL_REDIRECT = True
+    # Docker / load balancer health probes hit Gunicorn over plain HTTP inside the container.
+    SECURE_REDIRECT_EXEMPT = [r"^health/"]
     SECURE_HSTS_SECONDS = 31536000  # 1 year
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     SECURE_HSTS_PRELOAD = True
