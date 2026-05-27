@@ -10,7 +10,7 @@ from django.db.models import Count, Exists, F, Min, OuterRef, Q, Subquery, Sum, 
 from django.db.models.functions import Coalesce, TruncDate
 from django.utils import timezone
 
-from .models import Appointment, Patient, Visit
+from .models import Appointment, Invoice, Patient, Visit
 from .patient_phone import duplicate_patient_message, resolve_patient_profile_duplicate
 
 _UNPAID_INVOICE_STATUSES = (Invoice.Status.ISSUED, Invoice.Status.OVERDUE)
