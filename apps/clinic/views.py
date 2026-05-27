@@ -180,6 +180,33 @@ def _format_bill_display_date(d) -> str:
     return f"{d.strftime('%b')} {d.day}, {d.year}"
 
 
+def _visit_invoice_bill_totals(visit: Visit, inv: Invoice) -> dict:
+    """
+    Split documented visit charges into patient (Relief Chiropractic) vs insurance-only lines.
+    patient_charge_total = invoice total the client pays at the clinic (after discount).
+    insurance_remaining_total = services documented for insurance, not charged to the patient.
+    """
+    documented_agg = visit.rendered_services.aggregate(s=Sum("total_price"))
+    documented = documented_agg["s"] if documented_agg["s"] is not None else inv.subtotal
+    documented = documented.quantize(Decimal("0.01"))
+
+    insurance_agg = visit.rendered_services.filter(charges_patient=False).aggregate(s=Sum("total_price"))
+    insurance = insurance_agg["s"] if insurance_agg["s"] is not None else Decimal("0")
+    insurance = insurance.quantize(Decimal("0.01"))
+
+    pay_sum = inv.payments.filter(status=Payment.Status.SUCCESSFUL).aggregate(s=Sum("amount"))["s"]
+    pay_sum = pay_sum if pay_sum is not None else Decimal("0")
+    payments_received = (pay_sum + inv.credit_applied_total).quantize(Decimal("0.01"))
+
+    return {
+        "bill_charges_total": str(documented),
+        "patient_charge_total": str(inv.total_amount.quantize(Decimal("0.01"))),
+        "insurance_remaining_total": str(insurance),
+        "payments_received_total": str(payments_received),
+        "payments_card_cash_total": str(pay_sum.quantize(Decimal("0.01"))),
+    }
+
+
 def _invoice_bill_dict(inv: Invoice, *, preview: bool) -> dict:
     """Shared JSON for printable / preview patient bill — always reads live visit lines and invoice totals from the DB."""
     visit = inv.visit
@@ -192,13 +219,7 @@ def _invoice_bill_dict(inv: Invoice, *, preview: bool) -> dict:
     addr_display = pat.city_state_zip or "St Joseph, MI 49085"
     if pat.address_line1:
         addr_display = ", ".join(filter(None, [pat.address_line1, pat.city_state_zip])) or addr_display
-    documented_agg = visit.rendered_services.aggregate(s=Sum("total_price"))
-    documented_subtotal = documented_agg["s"] if documented_agg["s"] is not None else Decimal("0")
-    documented_subtotal = documented_subtotal.quantize(Decimal("0.01"))
-
-    pay_sum = inv.payments.filter(status=Payment.Status.SUCCESSFUL).aggregate(s=Sum("amount"))["s"]
-    pay_sum = pay_sum if pay_sum is not None else Decimal("0")
-    patient_pay_and_credits = (pay_sum + inv.credit_applied_total).quantize(Decimal("0.01"))
+    totals = _visit_invoice_bill_totals(visit, inv)
 
     billing_anchor = inv.paid_at.date() if inv.paid_at else inv.appointment.appointment_date
 
@@ -222,15 +243,15 @@ def _invoice_bill_dict(inv: Invoice, *, preview: bool) -> dict:
         ),
         "provider_billing_id": _bill_provider_id_display(inv, header),
         "lines": lines,
-        # Bill "Subtotal" = sum of all documented line amounts (including insurance-only rows).
-        "subtotal": str(documented_subtotal),
-        # Patient-chargeable portion before tax (matches Invoice.subtotal; used for optional UI).
+        # Bill Charges row = all documented line amounts (patient + insurance-only).
+        "subtotal": totals["bill_charges_total"],
         "patient_subtotal": str(inv.subtotal),
         "discount": str(inv.discount),
         "credit_applied_total": str(inv.credit_applied_total),
-        "insurance_payments_total": "0.00",
-        "patient_payments_total": str(patient_pay_and_credits),
-        "payments_card_cash_total": str(pay_sum.quantize(Decimal("0.01"))),
+        **totals,
+        # Back-compat: patient_payments_total on printed bill = clinic charge (not card/cash received).
+        "patient_payments_total": totals["patient_charge_total"],
+        "insurance_payments_total": totals["insurance_remaining_total"],
         "tax": str(inv.tax),
         "total_amount": str(inv.total_amount),
         "status": inv.status,
@@ -360,6 +381,8 @@ def _serialize_patient_appointment_history(request, appointments, *, force_read_
                 "total_amount": str(inv.total_amount),
                 "status": inv.status,
             }
+            if v:
+                inv_payload.update(_visit_invoice_bill_totals(v, inv))
         out.append(
             {
                 "id": a.id,
@@ -2505,38 +2528,49 @@ class AdminViewSet(viewsets.ViewSet):
     def billing_invoices(self, request):
         """Invoices for admin billing UI (patient name + totals)."""
         qs = _defer_patient_card_fields(
-            Invoice.objects.select_related("patient", "appointment", "appointment__booked_service")
+            Invoice.objects.select_related("patient", "appointment", "appointment__booked_service", "visit")
+            .prefetch_related("visit__rendered_services")
             .order_by("-issued_at"),
             patient_prefix="patient",
         )[:250]
-        return Response(
-            [
-                {
-                    "id": inv.id,
-                    "invoice_number": inv.invoice_number,
-                    "patient_id": inv.patient_id,
-                    "patient_name": f"{inv.patient.first_name} {inv.patient.last_name}",
-                    "patient_credit_balance": str(inv.patient.credit_balance),
-                    "status": inv.status,
-                    "kind": inv.kind,
-                    "appointment_id": inv.appointment_id,
-                    "appointment_status": inv.appointment.status if inv.appointment_id else None,
-                    "appointment_date": str(inv.appointment.appointment_date)
-                    if inv.appointment_id
-                    else None,
-                    "booked_service_id": inv.appointment.booked_service_id if inv.appointment_id else None,
-                    "total_amount": str(inv.total_amount),
-                    "subtotal": str(inv.subtotal),
-                    "discount": str(inv.discount),
-                    "credit_applied_total": str(inv.credit_applied_total),
-                    "professional_discount_reason": inv.professional_discount_reason or "",
-                    "tax": str(inv.tax),
-                    "issued_at": inv.issued_at.isoformat() if inv.issued_at else None,
-                    "paid_at": inv.paid_at.isoformat() if inv.paid_at else None,
-                }
-                for inv in qs
-            ]
-        )
+        rows = []
+        for inv in qs:
+            row = {
+                "id": inv.id,
+                "invoice_number": inv.invoice_number,
+                "patient_id": inv.patient_id,
+                "patient_name": f"{inv.patient.first_name} {inv.patient.last_name}",
+                "patient_credit_balance": str(inv.patient.credit_balance),
+                "status": inv.status,
+                "kind": inv.kind,
+                "appointment_id": inv.appointment_id,
+                "appointment_status": inv.appointment.status if inv.appointment_id else None,
+                "appointment_date": str(inv.appointment.appointment_date)
+                if inv.appointment_id
+                else None,
+                "booked_service_id": inv.appointment.booked_service_id if inv.appointment_id else None,
+                "total_amount": str(inv.total_amount),
+                "subtotal": str(inv.subtotal),
+                "discount": str(inv.discount),
+                "credit_applied_total": str(inv.credit_applied_total),
+                "professional_discount_reason": inv.professional_discount_reason or "",
+                "tax": str(inv.tax),
+                "issued_at": inv.issued_at.isoformat() if inv.issued_at else None,
+                "paid_at": inv.paid_at.isoformat() if inv.paid_at else None,
+            }
+            if inv.visit_id:
+                row.update(_visit_invoice_bill_totals(inv.visit, inv))
+            else:
+                row.update(
+                    {
+                        "bill_charges_total": str(inv.subtotal),
+                        "patient_charge_total": str(inv.total_amount),
+                        "insurance_remaining_total": "0.00",
+                        "payments_received_total": "0.00",
+                    }
+                )
+            rows.append(row)
+        return Response(rows)
 
     @action(detail=False, methods=["post"], url_path="patient_credit_topup")
     def patient_credit_topup(self, request):
