@@ -64,7 +64,9 @@ class PatientSerializer(serializers.ModelSerializer):
                 exclude_pk=inst.pk if inst else None,
             )
             if dup is not None:
-                raise serializers.ValidationError({"detail": duplicate_patient_message(dup)})
+                raise serializers.ValidationError(
+                    {"detail": duplicate_patient_message(dup, updating=inst is not None)}
+                )
 
         return attrs
 
@@ -639,6 +641,10 @@ class TerminalCheckoutTestSerializer(serializers.Serializer):
 
 
 class PatientIntakeUpdateSerializer(serializers.Serializer):
+    first_name = serializers.CharField(required=False, allow_blank=False, max_length=100, trim_whitespace=True)
+    last_name = serializers.CharField(required=False, allow_blank=False, max_length=100, trim_whitespace=True)
+    phone = serializers.CharField(required=False, allow_blank=False, max_length=30)
+    email = serializers.EmailField(required=False, allow_blank=True, max_length=254)
     address_line1 = serializers.CharField(required=False, allow_blank=True, max_length=200)
     address_line2 = serializers.CharField(required=False, allow_blank=True, max_length=200)
     city_state_zip = serializers.CharField(required=False, allow_blank=True, max_length=200)
@@ -648,6 +654,14 @@ class PatientIntakeUpdateSerializer(serializers.Serializer):
     date_established = serializers.DateField(required=False, allow_null=True)
     marital_status = serializers.CharField(required=False, allow_blank=True, max_length=1)
 
+    def validate_phone(self, value):
+        if value is None:
+            return value
+        valid, result = validate_phone(value or "")
+        if not valid:
+            raise serializers.ValidationError(result)
+        return result
+
     def validate_marital_status(self, value):
         v = (value or "").strip().upper()
         if v in ("", "Y", "N"):
@@ -655,6 +669,7 @@ class PatientIntakeUpdateSerializer(serializers.Serializer):
         raise serializers.ValidationError("Use Y (married), N (not married), or leave blank.")
     # Only owner_admin/staff may persist this (see AdminViewSet.patient_intake); doctors’ PATCH ignores it.
     online_chiro_intake_waived = serializers.BooleanField(required=False)
+    sms_consent = serializers.BooleanField(required=False)
 
 
 class ClinicProfileUpdateSerializer(serializers.Serializer):

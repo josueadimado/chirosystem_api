@@ -10,7 +10,8 @@ from django.db.models import Count, Exists, F, Min, OuterRef, Q, Subquery, Sum, 
 from django.db.models.functions import Coalesce, TruncDate
 from django.utils import timezone
 
-from .models import Appointment, Invoice, Patient, Visit
+from .models import Appointment, Patient, Visit
+from .patient_phone import duplicate_patient_message, resolve_patient_profile_duplicate
 
 _UNPAID_INVOICE_STATUSES = (Invoice.Status.ISSUED, Invoice.Status.OVERDUE)
 
@@ -154,6 +155,69 @@ def patient_demographics_summary(patient: Patient) -> dict:
         "first_appointment_date": str(first_date) if first_date else None,
         "last_seen": last_seen,
     }
+
+
+def apply_patient_intake_validated_data(
+    patient: Patient,
+    data: dict,
+    *,
+    allow_identity_fields: bool = False,
+    allow_date_established: bool = False,
+    allow_online_waived: bool = False,
+    allow_sms_consent: bool = False,
+) -> str | None:
+    """
+    Apply PATCH intake fields to patient. Returns an error message when duplicate
+    rules block the save; otherwise None (caller should patient.save()).
+    """
+    if allow_identity_fields:
+        if "first_name" in data:
+            patient.first_name = (data["first_name"] or "").strip()
+        if "last_name" in data:
+            patient.last_name = (data["last_name"] or "").strip()
+        if "phone" in data:
+            patient.phone = data["phone"]
+        if "email" in data:
+            patient.email = (data["email"] or "").strip()
+
+    for field in (
+        "address_line1",
+        "address_line2",
+        "city_state_zip",
+        "emergency_contact_name",
+        "emergency_contact_phone",
+        "marital_status",
+    ):
+        if field in data:
+            setattr(patient, field, data[field] or "")
+
+    if "date_of_birth" in data:
+        patient.date_of_birth = data["date_of_birth"]
+
+    dup = resolve_patient_profile_duplicate(
+        first_name=patient.first_name,
+        last_name=patient.last_name,
+        phone=patient.phone,
+        date_of_birth=patient.date_of_birth,
+        exclude_pk=patient.pk,
+    )
+    if dup is not None:
+        return duplicate_patient_message(dup, updating=True)
+
+    if allow_date_established and "date_established" in data:
+        patient.date_established = data["date_established"]
+    if allow_online_waived and "online_chiro_intake_waived" in data:
+        patient.online_chiro_intake_waived = bool(data["online_chiro_intake_waived"])
+
+    if allow_sms_consent and "sms_consent" in data:
+        new_consent = bool(data["sms_consent"])
+        if new_consent and not patient.sms_consent:
+            patient.sms_consent_at = timezone.now()
+        elif not new_consent:
+            patient.sms_consent_at = None
+        patient.sms_consent = new_consent
+
+    return None
 
 
 def apply_patient_directory_list_filter(qs, directory: str):

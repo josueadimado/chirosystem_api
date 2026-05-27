@@ -93,11 +93,31 @@ def find_duplicate_patient(
     return None
 
 
-def duplicate_patient_message(existing: Patient) -> str:
-    return (
+def duplicate_patient_message(existing: Patient, *, updating: bool = False) -> str:
+    base = (
         "A patient with the same first name, last name, date of birth, and phone number "
-        f"already exists (profile #{existing.pk}: {existing.first_name} {existing.last_name}). "
-        "Open that record instead of creating a duplicate."
+        f"already exists (profile #{existing.pk}: {existing.first_name} {existing.last_name})."
+    )
+    if updating:
+        return f"{base} Change the phone, name, or date of birth so they don't match that record, or open profile #{existing.pk} instead."
+    return f"{base} Open that record instead of creating a duplicate."
+
+
+def resolve_patient_profile_duplicate(
+    *,
+    first_name: str,
+    last_name: str,
+    phone: str,
+    date_of_birth,
+    exclude_pk: int | None,
+) -> Patient | None:
+    """Return conflicting patient if this profile would duplicate another."""
+    return find_duplicate_patient(
+        first_name=first_name,
+        last_name=last_name,
+        phone=phone,
+        date_of_birth=date_of_birth,
+        exclude_pk=exclude_pk,
     )
 
 

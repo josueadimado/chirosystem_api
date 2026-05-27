@@ -91,6 +91,7 @@ from .google_calendar_sync import (
 from .patient_demographics import (
     annotate_patient_list_stats,
     annotate_patient_unpaid_balances,
+    apply_patient_intake_validated_data,
     apply_patient_directory_list_filter,
     patient_demographics_summary,
 )
@@ -2917,6 +2918,8 @@ class AdminViewSet(viewsets.ViewSet):
                 "card_last4": patient.card_last4 or "",
                 "has_saved_card": bool(patient.card_last4),
                 "online_chiro_intake_waived": patient.online_chiro_intake_waived,
+                "sms_consent": patient.sms_consent,
+                "sms_consent_at": patient.sms_consent_at.isoformat() if patient.sms_consent_at else None,
                 "appointments": _serialize_patient_appointment_history(request, appointments),
                 **patient_demographics_summary(patient),
             }
@@ -2924,7 +2927,7 @@ class AdminViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["patch"], url_path="patient_intake")
     def patient_intake(self, request):
-        """Update intake / demographics for any patient (owner/staff/doctor with admin access)."""
+        """Update any patient profile / intake field (owner/staff). Doctors: demographics only."""
         patient_id = request.data.get("patient_id")
         if not patient_id:
             return Response({"detail": "patient_id is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -2937,47 +2940,26 @@ class AdminViewSet(viewsets.ViewSet):
             return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
         ser = PatientIntakeUpdateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
-        data = ser.validated_data
-        for field in (
-            "address_line1",
-            "address_line2",
-            "city_state_zip",
-            "emergency_contact_name",
-            "emergency_contact_phone",
-            "marital_status",
-        ):
-            if field in data:
-                setattr(patient, field, data[field] or "")
-        if "date_of_birth" in data:
-            from .patient_phone import duplicate_patient_message, find_duplicate_patient
-
-            patient.date_of_birth = data["date_of_birth"]
-            dup = find_duplicate_patient(
-                first_name=patient.first_name,
-                last_name=patient.last_name,
-                phone=patient.phone,
-                date_of_birth=patient.date_of_birth,
-                exclude_pk=patient.pk,
-            )
-            if dup is not None:
-                return Response(
-                    {"detail": duplicate_patient_message(dup)},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-        if "date_established" in data:
-            if getattr(request.user, "role", None) not in ("owner_admin", "staff"):
-                return Response(
-                    {"detail": "Only owner or staff can change date established."},
-                    status=status.HTTP_403_FORBIDDEN,
-                )
-            patient.date_established = data["date_established"]
-        if "online_chiro_intake_waived" in data:
-            if getattr(request.user, "role", None) not in ("owner_admin", "staff"):
-                return Response(
-                    {"detail": "Only owner or staff can change the online chiropractic intake waiver."},
-                    status=status.HTTP_403_FORBIDDEN,
-                )
-            patient.online_chiro_intake_waived = bool(data["online_chiro_intake_waived"])
+        data = dict(ser.validated_data)
+        role = getattr(request.user, "role", None)
+        allow_identity = role in ("owner_admin", "staff")
+        if not allow_identity:
+            for key in ("first_name", "last_name", "phone", "email"):
+                data.pop(key, None)
+        if role not in ("owner_admin", "staff"):
+            data.pop("date_established", None)
+            data.pop("online_chiro_intake_waived", None)
+            data.pop("sms_consent", None)
+        err = apply_patient_intake_validated_data(
+            patient,
+            data,
+            allow_identity_fields=allow_identity,
+            allow_date_established=role in ("owner_admin", "staff"),
+            allow_online_waived=role in ("owner_admin", "staff"),
+            allow_sms_consent=role in ("owner_admin", "staff"),
+        )
+        if err:
+            return Response({"detail": err}, status=status.HTTP_400_BAD_REQUEST)
         patient.save()
         return Response({"detail": "Saved."})
 
@@ -3260,35 +3242,15 @@ class DoctorViewSet(viewsets.ViewSet):
             )
         ser = PatientIntakeUpdateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
-        data = {**ser.validated_data}
+        data = dict(ser.validated_data)
         data.pop("online_chiro_intake_waived", None)
         data.pop("date_established", None)
-        for field in (
-            "address_line1",
-            "address_line2",
-            "city_state_zip",
-            "emergency_contact_name",
-            "emergency_contact_phone",
-            "marital_status",
-        ):
-            if field in data:
-                setattr(patient, field, data[field] or "")
-        if "date_of_birth" in data:
-            from .patient_phone import duplicate_patient_message, find_duplicate_patient
-
-            patient.date_of_birth = data["date_of_birth"]
-            dup = find_duplicate_patient(
-                first_name=patient.first_name,
-                last_name=patient.last_name,
-                phone=patient.phone,
-                date_of_birth=patient.date_of_birth,
-                exclude_pk=patient.pk,
-            )
-            if dup is not None:
-                return Response(
-                    {"detail": duplicate_patient_message(dup)},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+        data.pop("sms_consent", None)
+        for key in ("first_name", "last_name", "phone", "email"):
+            data.pop(key, None)
+        err = apply_patient_intake_validated_data(patient, data, allow_identity_fields=False)
+        if err:
+            return Response({"detail": err}, status=status.HTTP_400_BAD_REQUEST)
         patient.save()
         return Response({"detail": "Saved."})
 
