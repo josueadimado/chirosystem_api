@@ -61,7 +61,8 @@ def annotate_patient_list_stats(qs):
             filter=~Q(appointment__status__in=_APPT_EXCLUDED),
         ),
     ).annotate(
-        date_established=Coalesce(F("date_established"), F("_first_appointment_date")),
+        # Alias must differ from Patient.date_established (staff override column).
+        effective_date_established=Coalesce(F("date_established"), F("_first_appointment_date")),
     )
 
 

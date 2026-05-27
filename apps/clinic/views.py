@@ -2873,8 +2873,8 @@ class AdminViewSet(viewsets.ViewSet):
                 "next_appointment_time": next_time.isoformat(timespec="seconds")
                 if next_time
                 else None,
-                "date_established": str(p.date_established)
-                if getattr(p, "date_established", None)
+                "date_established": str(p.effective_date_established)
+                if getattr(p, "effective_date_established", None)
                 else None,
                 "balance": str(balance_result),
             })

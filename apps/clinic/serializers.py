@@ -78,7 +78,11 @@ class PatientListSerializer(serializers.ModelSerializer):
     last_service = serializers.CharField(read_only=True, allow_null=True)
     next_appointment_date = serializers.DateField(read_only=True, allow_null=True)
     next_appointment_time = serializers.TimeField(read_only=True, allow_null=True)
-    date_established = serializers.DateField(read_only=True, allow_null=True)
+    date_established = serializers.DateField(
+        source="effective_date_established",
+        read_only=True,
+        allow_null=True,
+    )
 
     class Meta:
         model = Patient
