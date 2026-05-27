@@ -18,6 +18,11 @@ class Patient(TimeStampedModel):
     phone = models.CharField(max_length=20, db_index=True)
     email = models.EmailField(blank=True)
     date_of_birth = models.DateField(null=True, blank=True)
+    date_established = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Staff override for date established. When blank, the system uses the first non-cancelled appointment date.",
+    )
     # Intake / demographics (Relief Chiropractic patient form)
     address_line1 = models.CharField(max_length=200, blank=True)
     address_line2 = models.CharField(max_length=200, blank=True)

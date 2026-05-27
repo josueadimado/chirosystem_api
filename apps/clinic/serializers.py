@@ -72,6 +72,7 @@ class PatientSerializer(serializers.ModelSerializer):
 class PatientListSerializer(serializers.ModelSerializer):
     """Lightweight patient row for paginated directory lists (doctors, desk search)."""
 
+    no_show_count = serializers.IntegerField(read_only=True, default=0)
     visit_count = serializers.IntegerField(read_only=True, default=0)
     last_visit = serializers.DateField(read_only=True, allow_null=True)
     last_service = serializers.CharField(read_only=True, allow_null=True)
@@ -88,6 +89,7 @@ class PatientListSerializer(serializers.ModelSerializer):
             "phone",
             "email",
             "date_of_birth",
+            "no_show_count",
             "visit_count",
             "last_visit",
             "last_service",
@@ -354,10 +356,11 @@ class AppointmentSerializer(serializers.ModelSerializer):
     """Staff/doctor PATCH: optional waive_late_cancel_fee when cancelling a massage inside the 24h window."""
 
     waive_late_cancel_fee = serializers.BooleanField(required=False, write_only=True, default=False)
+    reason_for_visit = serializers.SerializerMethodField()
 
     class Meta:
         model = Appointment
-        fields = _APPOINTMENT_FIELD_NAMES + ("waive_late_cancel_fee",)
+        fields = _APPOINTMENT_FIELD_NAMES + ("waive_late_cancel_fee", "reason_for_visit")
         read_only_fields = (
             "day_before_reminder_sms_at",
             "day_before_reminder_email_at",
@@ -365,6 +368,18 @@ class AppointmentSerializer(serializers.ModelSerializer):
             "same_day_reminder_email_at",
             "google_calendar_event_id",
         )
+
+    def get_reason_for_visit(self, obj):
+        return _appointment_reason_for_visit(obj)
+
+
+def _appointment_reason_for_visit(obj) -> str:
+    """Patient-entered reason at online booking (stored on linked visit, if any)."""
+    try:
+        visit = obj.visit
+    except Visit.DoesNotExist:
+        return ""
+    return (visit.reason_for_visit or "").strip()
 
 
 class AppointmentListSerializer(serializers.ModelSerializer):
@@ -376,6 +391,7 @@ class AppointmentListSerializer(serializers.ModelSerializer):
     service_type = serializers.SerializerMethodField()
     start_time_display = serializers.SerializerMethodField()
     end_time_display = serializers.SerializerMethodField()
+    reason_for_visit = serializers.SerializerMethodField()
 
     class Meta:
         model = Appointment
@@ -394,6 +410,7 @@ class AppointmentListSerializer(serializers.ModelSerializer):
             "start_time_display",
             "end_time_display",
             "status",
+            "reason_for_visit",
         )
 
     def get_patient_name(self, obj):
@@ -413,6 +430,9 @@ class AppointmentListSerializer(serializers.ModelSerializer):
 
     def get_end_time_display(self, obj):
         return obj.end_time.strftime("%I:%M %p")
+
+    def get_reason_for_visit(self, obj):
+        return _appointment_reason_for_visit(obj)
 
 
 class PublicBookingSerializer(serializers.Serializer):
@@ -621,6 +641,7 @@ class PatientIntakeUpdateSerializer(serializers.Serializer):
     emergency_contact_name = serializers.CharField(required=False, allow_blank=True, max_length=200)
     emergency_contact_phone = serializers.CharField(required=False, allow_blank=True, max_length=30)
     date_of_birth = serializers.DateField(required=False, allow_null=True)
+    date_established = serializers.DateField(required=False, allow_null=True)
     marital_status = serializers.CharField(required=False, allow_blank=True, max_length=1)
 
     def validate_marital_status(self, value):

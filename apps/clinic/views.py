@@ -1240,7 +1240,7 @@ class ServiceViewSet(viewsets.ModelViewSet):
 
 class AppointmentViewSet(viewsets.ModelViewSet):
     queryset = _defer_patient_card_fields(
-        Appointment.objects.select_related("patient", "provider", "booked_service").all().order_by(
+        Appointment.objects.select_related("patient", "provider", "booked_service", "visit").all().order_by(
             "appointment_date", "start_time"
         ),
         patient_prefix="patient",
@@ -2863,6 +2863,7 @@ class AdminViewSet(viewsets.ViewSet):
                 "last_name": p.last_name,
                 "phone": p.phone,
                 "email": p.email or "",
+                "no_show_count": getattr(p, "no_show_count", 0) or 0,
                 "visit_count": getattr(p, "visit_count", 0) or 0,
                 "last_visit": str(p.last_visit) if p.last_visit else None,
                 "last_service": (getattr(p, "last_service", None) or "").strip() or None,
@@ -2961,6 +2962,13 @@ class AdminViewSet(viewsets.ViewSet):
                     {"detail": duplicate_patient_message(dup)},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+        if "date_established" in data:
+            if getattr(request.user, "role", None) not in ("owner_admin", "staff"):
+                return Response(
+                    {"detail": "Only owner or staff can change date established."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            patient.date_established = data["date_established"]
         if "online_chiro_intake_waived" in data:
             if getattr(request.user, "role", None) not in ("owner_admin", "staff"):
                 return Response(
@@ -3252,6 +3260,7 @@ class DoctorViewSet(viewsets.ViewSet):
         ser.is_valid(raise_exception=True)
         data = {**ser.validated_data}
         data.pop("online_chiro_intake_waived", None)
+        data.pop("date_established", None)
         for field in (
             "address_line1",
             "address_line2",

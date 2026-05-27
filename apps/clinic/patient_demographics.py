@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from django.db.models import Count, Min, OuterRef, Q, Subquery
-from django.db.models.functions import TruncDate
+from django.db.models import Count, F, Min, OuterRef, Q, Subquery
+from django.db.models.functions import Coalesce, TruncDate
 from django.utils import timezone
 
 from .models import Appointment, Patient, Visit
@@ -42,6 +42,11 @@ def annotate_patient_list_stats(qs):
         .order_by("appointment_date", "start_time")
     )
     return qs.annotate(
+        no_show_count=Count(
+            "appointment",
+            filter=Q(appointment__status=Appointment.Status.NO_SHOW),
+            distinct=True,
+        ),
         visit_count=Count(
             "visit",
             filter=Q(visit__status=Visit.Status.COMPLETED),
@@ -51,10 +56,12 @@ def annotate_patient_list_stats(qs):
         last_service=Subquery(last_appt.values("booked_service__name")[:1]),
         next_appointment_date=Subquery(next_appt.values("appointment_date")[:1]),
         next_appointment_time=Subquery(next_appt.values("start_time")[:1]),
-        date_established=Min(
+        _first_appointment_date=Min(
             "appointment__appointment_date",
             filter=~Q(appointment__status__in=_APPT_EXCLUDED),
         ),
+    ).annotate(
+        date_established=Coalesce(F("date_established"), F("_first_appointment_date")),
     )
 
 
@@ -68,14 +75,31 @@ def _patient_age_years(date_of_birth) -> int | None:
     return max(0, years)
 
 
+def _first_appointment_date(patient: Patient):
+    return (
+        Appointment.objects.filter(patient=patient)
+        .exclude(status__in=_APPT_EXCLUDED)
+        .aggregate(d=Min("appointment_date"))["d"]
+    )
+
+
+def effective_date_established(patient: Patient):
+    """Manual staff date when set; otherwise first non-cancelled appointment."""
+    manual = patient.date_established
+    if manual:
+        return manual
+    return _first_appointment_date(patient)
+
+
 def patient_demographics_summary(patient: Patient) -> dict:
     """
     Extra demographics for patient_detail responses.
-    date_established = first non-cancelled appointment date.
+    date_established = staff override or first non-cancelled appointment.
     last_seen = most recent completed visit only (never a future booking).
     """
-    appt_qs = Appointment.objects.filter(patient=patient).exclude(status__in=_APPT_EXCLUDED)
-    first_date = appt_qs.aggregate(d=Min("appointment_date"))["d"]
+    first_date = _first_appointment_date(patient)
+    manual = patient.date_established
+    effective = manual or first_date
 
     now = timezone.now()
     last_visit = (
@@ -97,7 +121,9 @@ def patient_demographics_summary(patient: Patient) -> dict:
     return {
         "marital_status": (patient.marital_status or "").strip(),
         "age": _patient_age_years(patient.date_of_birth),
-        "date_established": str(first_date) if first_date else None,
+        "date_established": str(effective) if effective else None,
+        "date_established_override": str(manual) if manual else None,
+        "first_appointment_date": str(first_date) if first_date else None,
         "last_seen": last_seen,
     }
 
