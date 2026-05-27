@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from django.db.models import Min
+from django.db.models import Count, Min, OuterRef, Q, Subquery
+from django.db.models.functions import TruncDate
 from django.utils import timezone
 
 from .models import Appointment, Patient, Visit
@@ -13,6 +14,48 @@ _APPT_EXCLUDED = (
     Appointment.Status.CANCELLED,
     Appointment.Status.NO_SHOW,
 )
+_FUTURE_APPT_EXCLUDED = (
+    Appointment.Status.CANCELLED,
+    Appointment.Status.NO_SHOW,
+    Appointment.Status.COMPLETED,
+)
+
+
+def annotate_patient_list_stats(qs):
+    """Directory list stats: completed visits, last service, next booking, date established."""
+    appt_base = Appointment.objects.filter(patient_id=OuterRef("pk")).exclude(status__in=_APPT_EXCLUDED)
+    last_appt = appt_base.order_by("-appointment_date", "-start_time")
+    last_completed_visit = (
+        Visit.objects.filter(
+            patient_id=OuterRef("pk"),
+            status=Visit.Status.COMPLETED,
+            completed_at__isnull=False,
+            completed_at__lte=timezone.now(),
+        )
+        .order_by("-completed_at")
+        .annotate(visit_day=TruncDate("completed_at"))
+    )
+    today = timezone.localdate()
+    next_appt = (
+        Appointment.objects.filter(patient_id=OuterRef("pk"), appointment_date__gte=today)
+        .exclude(status__in=_FUTURE_APPT_EXCLUDED)
+        .order_by("appointment_date", "start_time")
+    )
+    return qs.annotate(
+        visit_count=Count(
+            "visit",
+            filter=Q(visit__status=Visit.Status.COMPLETED),
+            distinct=True,
+        ),
+        last_visit=Subquery(last_completed_visit.values("visit_day")[:1]),
+        last_service=Subquery(last_appt.values("booked_service__name")[:1]),
+        next_appointment_date=Subquery(next_appt.values("appointment_date")[:1]),
+        next_appointment_time=Subquery(next_appt.values("start_time")[:1]),
+        date_established=Min(
+            "appointment__appointment_date",
+            filter=~Q(appointment__status__in=_APPT_EXCLUDED),
+        ),
+    )
 
 
 def _patient_age_years(date_of_birth) -> int | None:

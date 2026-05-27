@@ -86,7 +86,11 @@ from .google_calendar_sync import (
     exchange_oauth_code,
     google_oauth_configured,
 )
-from .patient_demographics import apply_patient_directory_list_filter, patient_demographics_summary
+from .patient_demographics import (
+    annotate_patient_list_stats,
+    apply_patient_directory_list_filter,
+    patient_demographics_summary,
+)
 from .provider_patient_access import (
     appointment_matches_provider_discipline,
     clinical_access_level,
@@ -1032,37 +1036,7 @@ class PatientViewSet(viewsets.ModelViewSet):
         if self.action != "list":
             return qs
 
-        appt_base = Appointment.objects.filter(patient_id=OuterRef("pk")).exclude(
-            status__in=_APPT_EXCLUDED_FROM_VISIT_STATS
-        )
-        last_appt = appt_base.order_by("-appointment_date", "-start_time")
-        last_completed_visit = (
-            Visit.objects.filter(
-                patient_id=OuterRef("pk"),
-                status=Visit.Status.COMPLETED,
-                completed_at__isnull=False,
-                completed_at__lte=timezone.now(),
-            )
-            .order_by("-completed_at")
-            .annotate(visit_day=TruncDate("completed_at"))
-        )
-        today = timezone.localdate()
-        next_appt = (
-            Appointment.objects.filter(patient_id=OuterRef("pk"), appointment_date__gte=today)
-            .exclude(status__in=_FUTURE_APPT_EXCLUDED)
-            .order_by("appointment_date", "start_time")
-        )
-        qs = qs.annotate(
-            visit_count=Count(
-                "visit",
-                filter=Q(visit__status=Visit.Status.COMPLETED),
-                distinct=True,
-            ),
-            last_visit=Subquery(last_completed_visit.values("visit_day")[:1]),
-            last_service=Subquery(last_appt.values("booked_service__name")[:1]),
-            next_appointment_date=Subquery(next_appt.values("appointment_date")[:1]),
-            next_appointment_time=Subquery(next_appt.values("start_time")[:1]),
-        )
+        qs = annotate_patient_list_stats(qs)
         directory = (self.request.query_params.get("directory") or "").strip()
         qs = apply_patient_directory_list_filter(qs, directory)
         prov = provider_for_doctor_user(self.request.user)
@@ -2862,29 +2836,38 @@ class AdminViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["get"])
     def patients(self, request):
-        """List all patients with last_visit and balance for admin."""
+        """List all patients with directory stats and open invoice balance for admin."""
         from django.db.models import Sum
 
-        patients_qs = _defer_patient_card_fields(Patient.objects.all()).order_by("last_name", "first_name")
+        patients_qs = annotate_patient_list_stats(
+            _defer_patient_card_fields(Patient.objects.all())
+        ).order_by("last_name", "first_name")
         data = []
         for p in patients_qs:
-            last_appt = (
-                Appointment.objects.filter(patient=p)
-                .order_by("-appointment_date", "-start_time")
-                .first()
-            )
             balance_result = (
                 Invoice.objects.filter(patient=p, status=Invoice.Status.ISSUED)
                 .aggregate(total=Sum("total_amount"))["total"]
                 or 0
             )
+            next_time = p.next_appointment_time
             data.append({
                 "id": p.id,
                 "first_name": p.first_name,
                 "last_name": p.last_name,
                 "phone": p.phone,
                 "email": p.email or "",
-                "last_visit": str(last_appt.appointment_date) if last_appt else None,
+                "visit_count": getattr(p, "visit_count", 0) or 0,
+                "last_visit": str(p.last_visit) if p.last_visit else None,
+                "last_service": (getattr(p, "last_service", None) or "").strip() or None,
+                "next_appointment_date": str(p.next_appointment_date)
+                if getattr(p, "next_appointment_date", None)
+                else None,
+                "next_appointment_time": next_time.isoformat(timespec="seconds")
+                if next_time
+                else None,
+                "date_established": str(p.date_established)
+                if getattr(p, "date_established", None)
+                else None,
                 "balance": str(balance_result),
             })
         return Response(data)
