@@ -197,12 +197,17 @@ def _visit_invoice_bill_totals(visit: Visit, inv: Invoice) -> dict:
     pay_sum = inv.payments.filter(status=Payment.Status.SUCCESSFUL).aggregate(s=Sum("amount"))["s"]
     pay_sum = pay_sum if pay_sum is not None else Decimal("0")
     payments_received = (pay_sum + inv.credit_applied_total).quantize(Decimal("0.01"))
+    patient_charge = inv.total_amount.quantize(Decimal("0.01"))
+    remaining_client = (patient_charge - payments_received).quantize(Decimal("0.01"))
+    if remaining_client < Decimal("0"):
+        remaining_client = Decimal("0.00")
 
     return {
         "bill_charges_total": str(documented),
-        "patient_charge_total": str(inv.total_amount.quantize(Decimal("0.01"))),
+        "patient_charge_total": str(patient_charge),
         "insurance_remaining_total": str(insurance),
         "payments_received_total": str(payments_received),
+        "remaining_client_responsibility_total": str(remaining_client),
         "payments_card_cash_total": str(pay_sum.quantize(Decimal("0.01"))),
     }
 
@@ -2561,12 +2566,20 @@ class AdminViewSet(viewsets.ViewSet):
             if inv.visit_id:
                 row.update(_visit_invoice_bill_totals(inv.visit, inv))
             else:
+                pay_sum = inv.payments.filter(status=Payment.Status.SUCCESSFUL).aggregate(s=Sum("amount"))["s"]
+                pay_sum = pay_sum if pay_sum is not None else Decimal("0")
+                payments_received = (pay_sum + inv.credit_applied_total).quantize(Decimal("0.01"))
+                patient_charge = inv.total_amount.quantize(Decimal("0.01"))
+                remaining_client = (patient_charge - payments_received).quantize(Decimal("0.01"))
+                if remaining_client < Decimal("0"):
+                    remaining_client = Decimal("0.00")
                 row.update(
                     {
                         "bill_charges_total": str(inv.subtotal),
-                        "patient_charge_total": str(inv.total_amount),
+                        "patient_charge_total": str(patient_charge),
                         "insurance_remaining_total": "0.00",
-                        "payments_received_total": "0.00",
+                        "payments_received_total": str(payments_received),
+                        "remaining_client_responsibility_total": str(remaining_client),
                     }
                 )
             rows.append(row)
