@@ -59,9 +59,9 @@ from apps.clinic.voice_logging import (
     upsert_voice_call_log,
 )
 
-from django.conf import settings
 from django.utils import timezone
-from zoneinfo import ZoneInfo
+
+from apps.clinic.timezone_utils import today_clinic
 
 # ORM helpers for async WebSocket handlers (Django forbids sync DB in async context).
 _booking_catalog_async = sync_to_async(_booking_catalog_json, thread_sensitive=True)
@@ -101,8 +101,7 @@ def _inter_visit_buffer_minutes(prev: "ServiceEntry", next_svc: "ServiceEntry") 
 
 
 def _today_clinic_date() -> date_type:
-    tz_name = getattr(settings, "CLINIC_TIMEZONE", "America/Detroit")
-    return timezone.now().astimezone(ZoneInfo(tz_name)).date()
+    return today_clinic()
 
 
 def _ordinal_day(n: int) -> str:
@@ -1445,8 +1444,7 @@ async def handle_confirm_services(ws: WebSocket, state: ConversationState, speec
 
 
 async def handle_datetime(ws: WebSocket, state: ConversationState, speech: str):
-    tz_name = getattr(settings, "CLINIC_TIMEZONE", "America/Detroit")
-    today = timezone.now().astimezone(ZoneInfo(tz_name)).date()
+    today = today_clinic()
 
     # OpenAI first (natural phrases); local regex fills any gaps OpenAI missed.
     ai_date, ai_time = await _openai_parse_datetime_async(speech, today.isoformat())
@@ -2355,8 +2353,7 @@ async def handle_confirm_reschedule(ws: WebSocket, state: ConversationState, spe
 
 async def handle_reschedule_datetime(ws: WebSocket, state: ConversationState, speech: str):
     """Collect new date/time and apply reschedule_appointment_public."""
-    tz_name = getattr(settings, "CLINIC_TIMEZONE", "America/Detroit")
-    today = timezone.now().astimezone(ZoneInfo(tz_name)).date()
+    today = today_clinic()
 
     ai_date, ai_time = await _openai_parse_datetime_async(speech, today.isoformat())
     appt_date, start_time = ai_date, ai_time

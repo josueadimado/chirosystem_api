@@ -486,6 +486,17 @@ class ClinicSettings(TimeStampedModel):
         help_text="Default place-of-service code on printed bill lines.",
     )
     business_hours = models.JSONField(default=list)
+    timezone = models.CharField(
+        max_length=64,
+        default="America/Detroit",
+        help_text=(
+            "IANA timezone for the clinic. "
+            "Controls scheduling, AI voice, "
+            "and appointment times. "
+            "Example: America/Detroit, "
+            "America/Chicago, America/New_York"
+        ),
+    )
     no_show_fee = models.DecimalField(
         max_digits=10,
         decimal_places=2,
@@ -515,6 +526,7 @@ class ClinicSettings(TimeStampedModel):
                 "pos_default": "11",
                 "no_show_fee": Decimal("25.00"),
                 "business_hours": list(_DEFAULT_CLINIC_BUSINESS_HOURS),
+                "timezone": "America/Detroit",
             },
         )
         if not obj.business_hours:

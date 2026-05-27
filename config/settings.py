@@ -131,7 +131,7 @@ SIMPLE_JWT = {
 }
 
 LANGUAGE_CODE = "en-us"
-# Clinic wall clock for scheduling, "today", and Django localdate() — not the server's or developer's TZ.
+# Clinic wall clock fallback when DB timezone is unset. Prefer Admin → Settings (ClinicSettings.timezone).
 CLINIC_TIMEZONE = os.getenv("CLINIC_TIMEZONE", "America/Detroit")
 TIME_ZONE = CLINIC_TIMEZONE
 USE_I18N = True
@@ -170,7 +170,9 @@ else:
             "LOCATION": "chiroflow",
         }
     }
-# Used for “tomorrow” appointment SMS reminders and Celery Beat crontab (see CLINIC_TIMEZONE above).
+# CELERY_TIMEZONE is set from env at worker startup (not read from DB on each task).
+# To change clinic timezone for the app, use Admin → Settings (saved on ClinicSettings).
+# Restart Celery workers after changing CELERY_TIMEZONE in .env if you use env override.
 CELERY_TIMEZONE = CLINIC_TIMEZONE
 # Kiosk: earliest self-service check-in is this many minutes before the scheduled start (staff can complete check-in earlier in admin).
 KIOSK_EARLY_CHECKIN_MINUTES_BEFORE = int(os.getenv("KIOSK_EARLY_CHECKIN_MINUTES_BEFORE", "15"))

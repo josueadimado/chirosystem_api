@@ -675,6 +675,7 @@ class PatientIntakeUpdateSerializer(serializers.Serializer):
 class ClinicProfileUpdateSerializer(serializers.Serializer):
     """Partial update for admin Settings (owner/staff only)."""
 
+    timezone = serializers.CharField(max_length=64, required=False)
     clinic_name = serializers.CharField(max_length=200, required=False)
     address_line1 = serializers.CharField(max_length=200, required=False, allow_blank=True)
     city_state_zip = serializers.CharField(max_length=200, required=False, allow_blank=True)
@@ -693,6 +694,14 @@ class ClinicProfileUpdateSerializer(serializers.Serializer):
         child=serializers.DictField(child=serializers.CharField(allow_blank=True)),
         required=False,
     )
+
+    def validate_timezone(self, value):
+        from apps.clinic.timezone_utils import is_valid_iana_timezone
+
+        tz_name = (value or "").strip() or "America/Detroit"
+        if not is_valid_iana_timezone(tz_name):
+            raise serializers.ValidationError("Please select a valid timezone")
+        return tz_name
 
     def validate_business_hours(self, value):
         for row in value:

@@ -153,6 +153,7 @@ def _clinic_settings_bill_header():
         "employer_tax_id": (s.employer_tax_id or "").strip(),
         "provider_billing_id": (s.provider_billing_id or "").strip(),
         "pos_default": s.pos_default,
+        "timezone": (s.timezone or "America/Detroit").strip(),
     }
 
 
@@ -2172,6 +2173,13 @@ class AdminViewSet(viewsets.ViewSet):
 
     permission_classes = [IsOwnerOrDoctor]
 
+    @action(detail=False, methods=["get"], url_path="timezones")
+    def timezones(self, request):
+        """All valid IANA timezones grouped by region (admin Settings timezone picker)."""
+        from apps.clinic.timezone_utils import get_all_timezones
+
+        return Response(get_all_timezones())
+
     @action(detail=False, methods=["get"])
     def dashboard_summary(self, request):
         today = timezone.localdate()
@@ -2332,6 +2340,8 @@ class AdminViewSet(viewsets.ViewSet):
         ser = ClinicProfileUpdateSerializer(data=request.data, partial=True)
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
+        if "timezone" in data:
+            solo.timezone = data["timezone"]
         for field in (
             "clinic_name",
             "address_line1",

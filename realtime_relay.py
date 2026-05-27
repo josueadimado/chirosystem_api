@@ -28,6 +28,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
 
 from apps.clinic.models import Appointment, ClinicSettings, Patient, Provider, Service, VoiceCallLog
+from apps.clinic.timezone_utils import clinic_tz_name, now_clinic
 from apps.clinic.patient_phone import patients_matching_phone
 from apps.clinic.public_booking_service import (
     cancel_appointment_public,
@@ -243,6 +244,9 @@ def _build_system_prompt(*, from_number: str) -> str:
         elif len(matches) > 1:
             returning_note = "\nMultiple patients share this phone — confirm full name before booking."
 
+    now = now_clinic()
+    tz_label = clinic_tz_name()
+
     return f"""You are Sarah, the friendly front desk receptionist at {clinic.clinic_name} in Michigan.
 
 You are on a phone call helping patients book, reschedule, or cancel appointments.
@@ -251,7 +255,15 @@ CLINIC INFORMATION:
 Name: {clinic.clinic_name}
 Phone: (269) 408-0303
 Hours: {hours}
-Timezone: America/Detroit
+Timezone: {tz_label}
+
+CURRENT TIME CONTEXT:
+Date: {now.strftime("%A, %B %d, %Y")}
+Time: {now.strftime("%I:%M %p")}
+Timezone: {tz_label}
+
+Never offer appointment times that are before the current time above when booking for today.
+If no slots remain today say: "We don't have any more openings today — would tomorrow work?"
 
 AVAILABLE SERVICES (use service_id and provider_id in tools):
 {_services_prompt_block(catalog)}
