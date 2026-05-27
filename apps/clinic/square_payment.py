@@ -267,6 +267,200 @@ def create_payment_link_for_invoice(
     return None
 
 
+def _invoice_for_terminal_checkout(invoice: Invoice) -> Invoice:
+    """Reload invoice with relations needed for Terminal display line items."""
+    return (
+        Invoice.objects.select_related("patient", "appointment", "appointment__booked_service", "visit")
+        .prefetch_related("visit__rendered_services__service")
+        .get(pk=invoice.pk)
+    )
+
+
+def _terminal_checkout_note(inv: Invoice) -> str:
+    patient_name = f"{inv.patient.first_name or ''} {inv.patient.last_name or ''}".strip() or "Patient"
+    appt = inv.appointment
+    visit_date = str(appt.appointment_date) if appt else ""
+    return f"{patient_name} · {visit_date} · {inv.invoice_number}"[:500]
+
+
+def _build_terminal_order_line_items(inv: Invoice) -> list:
+    """
+    Line items shown on the Square Terminal when show_itemized_cart is enabled.
+    First patient-charge line includes the client name; additional lines are service names.
+    """
+    from square.requests.money import MoneyParams
+    from square.requests.order_line_item import OrderLineItemParams
+
+    patient_name = f"{inv.patient.first_name or ''} {inv.patient.last_name or ''}".strip() or "Patient"
+    items: list[OrderLineItemParams] = []
+    visit = inv.visit
+    if visit:
+        charged = [rs for rs in visit.rendered_services.all() if rs.charges_patient]
+        for idx, rs in enumerate(charged):
+            svc_name = ((rs.service.name if rs.service else None) or "Service").strip()
+            label = f"{patient_name} — {svc_name}" if idx == 0 else svc_name
+            cents = int((Decimal(rs.total_price) * 100).quantize(Decimal("1")))
+            if cents <= 0:
+                continue
+            items.append(
+                OrderLineItemParams(
+                    quantity=str(max(1, int(rs.quantity))),
+                    name=label[:512],
+                    item_type="ITEM",
+                    base_price_money=MoneyParams(amount=cents, currency="USD"),
+                )
+            )
+    if not items:
+        svc = "Visit"
+        if inv.appointment and inv.appointment.booked_service:
+            svc = (inv.appointment.booked_service.name or "Visit").strip()
+        amount_cents = _money_cents(inv)
+        items.append(
+            OrderLineItemParams(
+                quantity="1",
+                name=f"{patient_name} — {svc}"[:512],
+                item_type="ITEM",
+                base_price_money=MoneyParams(amount=amount_cents, currency="USD"),
+            )
+        )
+    return items
+
+
+def _create_square_order_for_terminal_checkout(inv: Invoice, *, amount_cents: int) -> str | None:
+    """
+    Create an OPEN Square order so the Terminal can show an itemized cart (name + services + amount).
+    Returns order id or None if order creation fails (caller may fall back to amount-only checkout).
+    """
+    from square.requests.money import MoneyParams
+    from square.requests.order import OrderParams
+    from square.requests.order_line_item_discount import OrderLineItemDiscountParams
+
+    loc = get_location_id()
+    if not loc:
+        return None
+
+    line_items = _build_terminal_order_line_items(inv)
+    if not line_items:
+        return None
+
+    lines_subtotal_cents = 0
+    for li in line_items:
+        bpm = getattr(li, "base_price_money", None)
+        if bpm is None and isinstance(li, dict):
+            bpm = li.get("base_price_money")
+        qty = getattr(li, "quantity", None) or (li.get("quantity") if isinstance(li, dict) else "1")
+        try:
+            q = max(1, int(str(qty)))
+        except ValueError:
+            q = 1
+        amt = getattr(bpm, "amount", None) if bpm is not None else (bpm or {}).get("amount")
+        if isinstance(amt, int):
+            lines_subtotal_cents += amt * q
+
+    order_kwargs: dict = {
+        "location_id": loc,
+        "reference_id": str(inv.id)[:40],
+        "line_items": line_items,
+    }
+    discount_cents = lines_subtotal_cents - amount_cents
+    if discount_cents > 0:
+        order_kwargs["discounts"] = [
+            OrderLineItemDiscountParams(
+                name="Professional discount",
+                type="FIXED_AMOUNT",
+                scope="ORDER",
+                amount_money=MoneyParams(amount=discount_cents, currency="USD"),
+            )
+        ]
+    elif lines_subtotal_cents != amount_cents:
+        # Totals must match Terminal amount — one line: client name + primary service.
+        from square.requests.order_line_item import OrderLineItemParams
+
+        svc = "Visit"
+        if inv.appointment and inv.appointment.booked_service:
+            svc = (inv.appointment.booked_service.name or "Visit").strip()
+        patient_name = f"{inv.patient.first_name or ''} {inv.patient.last_name or ''}".strip() or "Patient"
+        order_kwargs["line_items"] = [
+            OrderLineItemParams(
+                quantity="1",
+                name=f"{patient_name} — {svc}"[:512],
+                item_type="ITEM",
+                base_price_money=MoneyParams(amount=amount_cents, currency="USD"),
+            )
+        ]
+
+    client = get_square_client()
+    try:
+        res = client.orders.create(
+            idempotency_key=str(uuid.uuid4()),
+            order=OrderParams(**order_kwargs),
+        )
+    except Exception as exc:
+        logger.warning("Square order create for Terminal failed: %s", exc)
+        return None
+    if res.errors:
+        logger.warning(
+            "Square order create for Terminal failed: %s",
+            getattr(res.errors[0], "detail", None) or res.errors,
+        )
+        return None
+    order = res.order
+    if order and order.id:
+        return order.id
+    return None
+
+
+def _send_terminal_checkout(
+    *,
+    amount_cents: int,
+    device_id: str,
+    reference_id: str,
+    note: str,
+    invoice: Invoice | None = None,
+) -> dict:
+    """Create Terminal checkout; uses Square Order + itemized cart when invoice is provided."""
+    from square.requests.device_checkout_options import DeviceCheckoutOptionsParams
+    from square.requests.money import MoneyParams
+    from square.requests.terminal_checkout import TerminalCheckoutParams
+
+    order_id: str | None = None
+    if invoice is not None:
+        try:
+            inv = _invoice_for_terminal_checkout(invoice)
+            order_id = _create_square_order_for_terminal_checkout(inv, amount_cents=amount_cents)
+        except Exception as exc:
+            logger.warning("Terminal order prep failed, using amount-only checkout: %s", exc)
+
+    device_options_kwargs: dict = {"device_id": device_id}
+    if order_id:
+        device_options_kwargs["show_itemized_cart"] = True
+
+    client = get_square_client()
+    checkout_kwargs: dict = {
+        "amount_money": MoneyParams(amount=amount_cents, currency="USD"),
+        "reference_id": reference_id[:40],
+        "note": note[:500],
+        "device_options": DeviceCheckoutOptionsParams(**device_options_kwargs),
+        "payment_type": "CARD_PRESENT",
+    }
+    if order_id:
+        checkout_kwargs["order_id"] = order_id
+
+    res = client.terminal.checkouts.create(
+        idempotency_key=str(uuid.uuid4()),
+        checkout=TerminalCheckoutParams(**checkout_kwargs),
+    )
+    if res.errors:
+        raise RuntimeError(res.errors[0].detail if res.errors else "Terminal checkout failed")
+    co = res.checkout
+    if not co or not co.id:
+        raise RuntimeError("Square did not return a terminal checkout id.")
+    out = {"checkout_id": co.id, "status": getattr(co, "status", None) or "PENDING"}
+    if order_id:
+        out["order_id"] = order_id
+    return out
+
+
 def create_payment_link_for_credit_topup(
     *,
     patient_id: int,
@@ -335,10 +529,6 @@ def create_terminal_checkout_for_invoice(invoice: Invoice) -> dict:
     Send a card-present payment to the configured Square Terminal device.
     Returns {"checkout_id": str, "status": str} or raises on error.
     """
-    from square.requests.device_checkout_options import DeviceCheckoutOptionsParams
-    from square.requests.money import MoneyParams
-    from square.requests.terminal_checkout import TerminalCheckoutParams
-
     device_id = get_terminal_device_id()
     if not device_id:
         raise ValueError("SQUARE_DEVICE_ID is not set — pair your Terminal in the Square Dashboard and paste the device id.")
@@ -347,23 +537,14 @@ def create_terminal_checkout_for_invoice(invoice: Invoice) -> dict:
     if amount_cents < _MIN_AMOUNT_CENTS:
         raise ValueError("Amount is below the minimum for card processing.")
 
-    client = get_square_client()
-    res = client.terminal.checkouts.create(
-        idempotency_key=str(uuid.uuid4()),
-        checkout=TerminalCheckoutParams(
-            amount_money=MoneyParams(amount=amount_cents, currency="USD"),
-            reference_id=str(invoice.id)[:40],
-            note=f"Invoice {invoice.invoice_number}",
-            device_options=DeviceCheckoutOptionsParams(device_id=device_id),
-            payment_type="CARD_PRESENT",
-        ),
+    inv = _invoice_for_terminal_checkout(invoice)
+    return _send_terminal_checkout(
+        amount_cents=amount_cents,
+        device_id=device_id,
+        reference_id=str(invoice.id),
+        note=_terminal_checkout_note(inv),
+        invoice=inv,
     )
-    if res.errors:
-        raise RuntimeError(res.errors[0].detail if res.errors else "Terminal checkout failed")
-    co = res.checkout
-    if not co or not co.id:
-        raise RuntimeError("Square did not return a terminal checkout id.")
-    return {"checkout_id": co.id, "status": getattr(co, "status", None) or "PENDING"}
 
 
 def try_push_terminal_checkout_to_kiosk(invoice: Invoice) -> None:
@@ -373,13 +554,8 @@ def try_push_terminal_checkout_to_kiosk(invoice: Invoice) -> None:
     Uses the same Create Terminal Checkout call as the desk reader with device id from
     get_kiosk_terminal_device_id(). Never raises — failures are logged only (bill is already saved).
 
-    Terminal Checkout exposes total on the device; patient name, visit date, and item labels are
-    included in the checkout ``note`` field (Square truncates as needed).
+    Uses the same Order + itemized cart flow as desk Terminal checkout (patient name and services on screen).
     """
-    from square.requests.device_checkout_options import DeviceCheckoutOptionsParams
-    from square.requests.money import MoneyParams
-    from square.requests.terminal_checkout import TerminalCheckoutParams
-
     try:
         if not square_configured():
             return
@@ -398,49 +574,19 @@ def try_push_terminal_checkout_to_kiosk(invoice: Invoice) -> None:
             logger.debug("try_push_terminal_checkout_to_kiosk: amount below minimum (%s cents)", amount_cents)
             return
 
-        patient = inv.patient
-        patient_name = f"{patient.first_name or ''} {patient.last_name or ''}".strip() or "Patient"
-        appt = inv.appointment
-        visit_date = str(appt.appointment_date) if appt else ""
-
-        line_parts: list[str] = []
-        visit_obj = inv.visit
-        if visit_obj:
-            for rs in visit_obj.rendered_services.select_related("service").all():
-                svc_name = (rs.service.name if rs.service else "Service")[:80]
-                line_parts.append(f"{rs.quantity}× {svc_name}")
-        lines_joined = "; ".join(line_parts)[:320]
-
-        note_core = f"{patient_name} · Date {visit_date} · {inv.invoice_number}"
-        if lines_joined:
-            note = f"{note_core} · {lines_joined}"
-        else:
-            note = note_core
-        note = note[:500]
-
-        client = get_square_client()
-        res = client.terminal.checkouts.create(
-            idempotency_key=str(uuid.uuid4()),
-            checkout=TerminalCheckoutParams(
-                amount_money=MoneyParams(amount=amount_cents, currency="USD"),
-                reference_id=str(inv.id)[:40],
-                note=note,
-                device_options=DeviceCheckoutOptionsParams(device_id=device_id),
-                payment_type="CARD_PRESENT",
-            ),
+        out = _send_terminal_checkout(
+            amount_cents=amount_cents,
+            device_id=device_id,
+            reference_id=str(inv.id),
+            note=_terminal_checkout_note(inv),
+            invoice=inv,
         )
-        if res.errors:
-            logger.warning(
-                "Kiosk Terminal checkout failed after bill save (non-blocking): %s",
-                getattr(res.errors[0], "detail", None) or res.errors,
-            )
-            return
-        co = res.checkout
         logger.info(
-            "Kiosk Terminal checkout queued for invoice %s checkout_id=%s device=%s…",
+            "Kiosk Terminal checkout queued for invoice %s checkout_id=%s device=%s… order=%s",
             inv.id,
-            getattr(co, "id", None),
+            out.get("checkout_id"),
             device_id[:8],
+            out.get("order_id"),
         )
     except Exception as exc:
         logger.warning(
@@ -455,10 +601,6 @@ def create_terminal_checkout_for_credit_topup(*, patient_id: int, amount_usd: De
     Send a card-present top-up charge to the configured Square Terminal.
     The webhook / poller applies credit by encoded reference_id.
     """
-    from square.requests.device_checkout_options import DeviceCheckoutOptionsParams
-    from square.requests.money import MoneyParams
-    from square.requests.terminal_checkout import TerminalCheckoutParams
-
     device_id = get_terminal_device_id()
     if not device_id:
         raise ValueError("SQUARE_DEVICE_ID is not set — pair your Terminal in the Square Dashboard and paste the device id.")
@@ -468,23 +610,15 @@ def create_terminal_checkout_for_credit_topup(*, patient_id: int, amount_usd: De
         raise ValueError("Amount is below the minimum for card processing.")
 
     reference_id = build_credit_topup_reference(patient_id=patient_id, amount_cents=amount_cents)
-    client = get_square_client()
-    res = client.terminal.checkouts.create(
-        idempotency_key=str(uuid.uuid4()),
-        checkout=TerminalCheckoutParams(
-            amount_money=MoneyParams(amount=amount_cents, currency="USD"),
-            reference_id=reference_id,
-            note=(note or f"Patient credit top-up ({patient_id})")[:500],
-            device_options=DeviceCheckoutOptionsParams(device_id=device_id),
-            payment_type="CARD_PRESENT",
-        ),
+    out = _send_terminal_checkout(
+        amount_cents=amount_cents,
+        device_id=device_id,
+        reference_id=reference_id,
+        note=(note or f"Patient credit top-up ({patient_id})")[:500],
+        invoice=None,
     )
-    if res.errors:
-        raise RuntimeError(res.errors[0].detail if res.errors else "Terminal checkout failed")
-    co = res.checkout
-    if not co or not co.id:
-        raise RuntimeError("Square did not return a terminal checkout id.")
-    return {"checkout_id": co.id, "status": getattr(co, "status", None) or "PENDING", "reference_id": reference_id}
+    out["reference_id"] = reference_id
+    return out
 
 
 def create_terminal_checkout_test(amount_cents: int) -> dict:
@@ -493,10 +627,6 @@ def create_terminal_checkout_test(amount_cents: int) -> dict:
 
     Uses a non-numeric reference_id so polling never attaches this payment to an invoice.
     """
-    from square.requests.device_checkout_options import DeviceCheckoutOptionsParams
-    from square.requests.money import MoneyParams
-    from square.requests.terminal_checkout import TerminalCheckoutParams
-
     device_id = get_terminal_device_id()
     if not device_id:
         raise ValueError("SQUARE_DEVICE_ID is not set — pair your Terminal in the Square Dashboard and paste the device id.")
@@ -505,24 +635,13 @@ def create_terminal_checkout_test(amount_cents: int) -> dict:
         raise ValueError("Amount is below the minimum for card processing.")
 
     ref = f"admtest_{uuid.uuid4().hex}"[:40]
-
-    client = get_square_client()
-    res = client.terminal.checkouts.create(
-        idempotency_key=str(uuid.uuid4()),
-        checkout=TerminalCheckoutParams(
-            amount_money=MoneyParams(amount=amount_cents, currency="USD"),
-            reference_id=ref,
-            note="Admin Terminal connectivity test",
-            device_options=DeviceCheckoutOptionsParams(device_id=device_id),
-            payment_type="CARD_PRESENT",
-        ),
+    return _send_terminal_checkout(
+        amount_cents=amount_cents,
+        device_id=device_id,
+        reference_id=ref,
+        note="Admin Terminal connectivity test",
+        invoice=None,
     )
-    if res.errors:
-        raise RuntimeError(res.errors[0].detail if res.errors else "Terminal checkout failed")
-    co = res.checkout
-    if not co or not co.id:
-        raise RuntimeError("Square did not return a terminal checkout id.")
-    return {"checkout_id": co.id, "status": getattr(co, "status", None) or "PENDING"}
 
 
 def get_terminal_checkout_status(checkout_id: str) -> dict:
