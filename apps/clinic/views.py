@@ -656,6 +656,9 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             last_slot_start = desk_booking_last_slot_start_minute(day_end, required_span)
         else:
             last_slot_start = public_booking_last_slot_start_minute(appt_date, day_end)
+
+        from apps.clinic.timezone_utils import is_past_slot_for_clinic_today
+
         slot_grid: list[dict[str, object]] = []
         available: list[str] = []
         slot_start_times: list[str] = []
@@ -663,6 +666,9 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         while cursor <= last_slot_start:
             h, m = divmod(cursor, 60)
             slot_start_time = time_cls(hour=h, minute=m)
+            if not desk_mode and is_past_slot_for_clinic_today(slot_start_time, appt_date):
+                cursor += SLOT_INTERVAL
+                continue
             end_total = cursor + required_span
             end_h, end_m = divmod(end_total, 60)
             if end_h >= 24:

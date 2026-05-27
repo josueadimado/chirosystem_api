@@ -58,6 +58,19 @@ def filter_past_slot_times_for_date(
     return [s for s in slot_times if s >= cutoff_time]
 
 
+def is_past_slot_for_clinic_today(
+    slot_time: datetime.time,
+    appt_date: datetime.date,
+    *,
+    buffer_minutes: int = 30,
+) -> bool:
+    """True if this start time is too soon to book for today (clinic local clock)."""
+    if appt_date != today_clinic():
+        return False
+    cutoff_time = (now_clinic() + timedelta(minutes=buffer_minutes)).time()
+    return slot_time < cutoff_time
+
+
 def _timezone_display_label(tz: str) -> str:
     return tz.replace("_", " ")
 
