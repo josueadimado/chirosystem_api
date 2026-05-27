@@ -73,6 +73,7 @@ from .serializers import (
     complete_visit_with_services,
     revise_unpaid_visit_billing,
 )
+from .analytics import build_admin_analytics_payload
 from .pagination import StandardPageNumberPagination
 from .square_helpers import (
     get_application_id,
@@ -2262,6 +2263,14 @@ class AdminViewSet(viewsets.ViewSet):
             "avg_handle_seconds": avg_sec,
             "openai_configured": bool((getattr(settings, "OPENAI_API_KEY", "") or "").strip()),
         })
+
+    @action(detail=False, methods=["get"])
+    def analytics(self, request):
+        """Business overview for admin analytics dashboard (owner/staff only)."""
+        denied = self._admin_staff_only(request)
+        if denied:
+            return denied
+        return Response(build_admin_analytics_payload())
 
     @action(detail=False, methods=["get"], url_path="voice_calls")
     def voice_calls(self, request):
