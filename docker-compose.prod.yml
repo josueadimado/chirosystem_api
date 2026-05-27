@@ -41,6 +41,7 @@ services:
     environment:
       DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-config.settings}
       DEBUG: "false"
+      DOCKER_ENV: "1"
       POSTGRES_HOST: db
       POSTGRES_PORT: "5432"
       DATABASE_URL: postgresql://${POSTGRES_USER:-chiroflow_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-chiroflow}
@@ -55,17 +56,18 @@ services:
     ports:
       - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
     healthcheck:
+      # Port check + /health/ (loopback hosts are always in ALLOWED_HOSTS).
       test:
         [
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/', timeout=3)",
+          "import socket, urllib.request; s=socket.create_connection(('127.0.0.1',8000),3); s.close(); urllib.request.urlopen('http://127.0.0.1:8000/health/', timeout=3)",
         ]
       interval: 15s
-      timeout: 5s
-      retries: 12
-      start_period: 300s
+      timeout: 10s
+      retries: 8
+      start_period: 180s
     stop_grace_period: 30s
     networks:
       - default

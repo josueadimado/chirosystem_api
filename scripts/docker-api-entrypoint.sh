@@ -20,7 +20,13 @@ if [ -n "${DATABASE_URL:-}" ]; then
 fi
 
 echo "[api] Running migrations…"
-python manage.py migrate --noinput
+if ! python manage.py migrate --noinput; then
+  echo "[api] ERROR: migrate failed. Common fixes:"
+  echo "[api]   - POSTGRES_PASSWORD in .env must match the password used when the database volume was first created."
+  echo "[api]   - POSTGRES_USER in .env must match (compose default: chiroflow_user)."
+  echo "[api]   - Remove DATABASE_URL from .env if it points at localhost; compose sets host db."
+  exit 1
+fi
 
 echo "[api] Collecting static files…"
 python manage.py collectstatic --noinput

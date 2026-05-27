@@ -13,7 +13,16 @@ else:
     # Production: crash loudly if secret key is missing — no insecure fallback
     SECRET_KEY = os.environ["DJANGO_SECRET_KEY"]
 
-ALLOWED_HOSTS = [h.strip() for h in os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if h.strip()]
+_allowed_raw = (
+    os.environ.get("ALLOWED_HOSTS")
+    or os.environ.get("DJANGO_ALLOWED_HOSTS")
+    or "localhost,127.0.0.1"
+)
+ALLOWED_HOSTS = [h.strip() for h in _allowed_raw.split(",") if h.strip()]
+# Docker health checks and Gunicorn bind to 127.0.0.1 — always allow loopback even when production sets only the public domain.
+for _loopback in ("127.0.0.1", "localhost", "[::1]"):
+    if _loopback not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(_loopback)
 # Next.js in Docker proxies to this API using hostname `api` or `host.docker.internal` — those must be allowed or Django returns 400.
 _docker_env = os.environ.get("DOCKER_ENV", "").lower() in ("1", "true", "yes")
 if _docker_env or os.environ.get("ALLOWED_HOSTS_ALLOW_DOCKER", "").lower() in ("1", "true", "yes"):
@@ -336,7 +345,8 @@ except OSError:
 if not DEBUG:
     SECURE_SSL_REDIRECT = True
     # Docker / load balancer health probes hit Gunicorn over plain HTTP inside the container.
-    SECURE_REDIRECT_EXEMPT = [r"^health/"]
+    # Paths are matched after lstrip("/") — see SecurityMiddleware in Django.
+    SECURE_REDIRECT_EXEMPT = [r"^health/?$"]
     SECURE_HSTS_SECONDS = 31536000  # 1 year
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     SECURE_HSTS_PRELOAD = True
