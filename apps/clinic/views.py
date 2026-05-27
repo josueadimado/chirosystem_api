@@ -74,6 +74,7 @@ from .serializers import (
     revise_unpaid_visit_billing,
 )
 from .analytics import build_admin_analytics_payload
+from .doctor_analytics import build_doctor_my_analytics_payload
 from .pagination import StandardPageNumberPagination
 from .square_helpers import (
     get_application_id,
@@ -3010,6 +3011,14 @@ class DoctorViewSet(viewsets.ViewSet):
                 "full_name": request.user.full_name or request.user.username,
             }
         )
+
+    @action(detail=False, methods=["get"], url_path="my-analytics")
+    def my_analytics(self, request):
+        """Performance and patient stats for the logged-in doctor's provider."""
+        provider = self._get_provider(request)
+        if not provider:
+            return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
+        return Response(build_doctor_my_analytics_payload(provider))
 
     @action(detail=False, methods=["get"])
     def appointments(self, request):
