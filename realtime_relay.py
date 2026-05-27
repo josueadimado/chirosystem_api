@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import datetime
 from datetime import date as date_type, time as dt_time
 from decimal import Decimal
 from typing import Any
@@ -28,7 +29,12 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
 
 from apps.clinic.models import Appointment, ClinicSettings, Patient, Provider, Service, VoiceCallLog
-from apps.clinic.timezone_utils import clinic_tz_name, now_clinic
+from apps.clinic.timezone_utils import (
+    filter_past_slot_times_for_date,
+    get_clinic_tz_name,
+    now_clinic,
+    today_clinic,
+)
 from apps.clinic.patient_phone import patients_matching_phone
 from apps.clinic.public_booking_service import (
     cancel_appointment_public,
@@ -245,7 +251,20 @@ def _build_system_prompt(*, from_number: str) -> str:
             returning_note = "\nMultiple patients share this phone — confirm full name before booking."
 
     now = now_clinic()
-    tz_label = clinic_tz_name()
+    tz_name = get_clinic_tz_name()
+    time_context = f"""
+CURRENT DATE AND TIME:
+Today is {now.strftime("%A, %B %d, %Y")}
+Current time is {now.strftime("%I:%M %p")}
+Timezone: {tz_name}
+
+CRITICAL TIME RULES:
+- Never offer appointment times that are before {now.strftime("%I:%M %p")} when booking for today
+- If check_availability returns suggest_tomorrow: true say:
+  "We don't have any more openings today — would tomorrow or another day work for you?"
+- When caller says "today" use {now.strftime("%Y-%m-%d")} as the date
+- When caller says "this afternoon" or "later today" only consider times after {now.strftime("%I:%M %p")}
+"""
 
     return f"""You are Sarah, the friendly front desk receptionist at {clinic.clinic_name} in Michigan.
 
@@ -255,15 +274,8 @@ CLINIC INFORMATION:
 Name: {clinic.clinic_name}
 Phone: (269) 408-0303
 Hours: {hours}
-Timezone: {tz_label}
-
-CURRENT TIME CONTEXT:
-Date: {now.strftime("%A, %B %d, %Y")}
-Time: {now.strftime("%I:%M %p")}
-Timezone: {tz_label}
-
-Never offer appointment times that are before the current time above when booking for today.
-If no slots remain today say: "We don't have any more openings today — would tomorrow work?"
+Timezone: {tz_name}
+{time_context}
 
 AVAILABLE SERVICES (use service_id and provider_id in tools):
 {_services_prompt_block(catalog)}
@@ -365,15 +377,15 @@ def _service_row(catalog: dict[str, Any], service_id: int) -> dict[str, Any] | N
     return None
 
 
-def get_public_available_slots(
+def _get_public_available_slot_times(
     *,
     service_id: int,
     appt_date: date_type,
     provider_id: int | None = None,
-) -> list[str]:
+) -> list[dt_time]:
     """
     Same slot logic as public booking availability (views.booking_options.availability).
-    Returns human labels like '9:00 AM', '9:15 AM'.
+    Returns start times as datetime.time objects.
     """
     from apps.clinic.booking_availability import provider_interval_blocked_online
     from apps.clinic.online_booking_hours import (
@@ -420,7 +432,7 @@ def get_public_available_slots(
         for m in range(s.hour * 60 + s.minute, e.hour * 60 + e.minute):
             taken.add(m)
 
-    available: list[str] = []
+    available: list[dt_time] = []
     cursor = day_start
     while cursor <= last_slot_start:
         h, m = divmod(cursor, 60)
@@ -441,11 +453,69 @@ def get_public_available_slots(
                 slot_end_time,
                 block_overlap_end=treat_end,
             ):
-                suffix = "AM" if h < 12 else "PM"
-                dh = h if 1 <= h <= 12 else (h - 12 if h > 12 else 12)
-                available.append(f"{dh}:{m:02d} {suffix}")
+                available.append(slot_start_time)
         cursor += CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES
     return available
+
+
+def get_public_available_slots(
+    *,
+    service_id: int,
+    appt_date: date_type,
+    provider_id: int | None = None,
+) -> list[str]:
+    """Human labels like '9:00 AM' (no past-slot filter — use _check_availability_sync for voice AI)."""
+    times = _get_public_available_slot_times(
+        service_id=service_id, appt_date=appt_date, provider_id=provider_id
+    )
+    return [
+        t.strftime("%I:%M %p").lstrip("0")
+        for t in times
+    ]
+
+
+def _check_availability_sync(
+    service_id: int,
+    date_str: str,
+    provider_id: int | None = None,
+) -> dict[str, Any]:
+    """
+    Availability for AI voice: clinic-local today + 30-minute buffer filters past slots.
+    """
+    try:
+        requested_date = datetime.date.fromisoformat(date_str)
+    except ValueError:
+        return {"available": False, "error": "Invalid date format"}
+
+    today = today_clinic()
+    slots = _get_public_available_slot_times(
+        service_id=service_id,
+        appt_date=requested_date,
+        provider_id=provider_id,
+    )
+    slots = filter_past_slot_times_for_date(slots, requested_date, buffer_minutes=30)
+
+    if requested_date == today and not slots:
+        return {
+            "available": False,
+            "slots": [],
+            "suggest_tomorrow": True,
+            "message": "There are no more available slots for today.",
+        }
+
+    if not slots:
+        return {
+            "available": False,
+            "slots": [],
+            "message": "No available slots for that date.",
+        }
+
+    return {
+        "available": True,
+        "date": date_str,
+        "slots": [s.strftime("%I:%M %p").lstrip("0") for s in slots[:8]],
+        "timezone": get_clinic_tz_name(),
+    }
 
 
 def _get_upcoming_appointments(phone: str) -> list[dict[str, Any]]:
@@ -455,12 +525,11 @@ def _get_upcoming_appointments(phone: str) -> list[dict[str, Any]]:
     patients = patients_matching_phone(norm)
     if not patients:
         return []
-    now = timezone.now()
     rows = (
         Appointment.objects.filter(
             patient__in=patients,
             status=Appointment.Status.BOOKED,
-            appointment_date__gte=now.date(),
+            appointment_date__gte=today_clinic(),
         )
         .select_related("booked_service")
         .order_by("appointment_date", "start_time")[:5]
@@ -581,7 +650,17 @@ def _reschedule_appointment_sync(
     }
 
 
-_check_availability_async = sync_to_async(get_public_available_slots, thread_sensitive=True)
+def _check_availability_for_date(
+    service_id: int,
+    appt_date: date_type,
+    provider_id: int | None = None,
+) -> dict[str, Any]:
+    return _check_availability_sync(
+        service_id, appt_date.isoformat(), provider_id=provider_id
+    )
+
+
+_check_availability_async = sync_to_async(_check_availability_for_date, thread_sensitive=True)
 _get_upcoming_async = sync_to_async(_get_upcoming_appointments, thread_sensitive=True)
 _book_async = sync_to_async(_book_appointment_sync, thread_sensitive=True)
 _cancel_async = sync_to_async(_cancel_appointment_sync, thread_sensitive=True)
@@ -597,10 +676,10 @@ async def _run_tool(name: str, args: dict[str, Any], *, call_sid: str, from_numb
             appt_date = date_type.fromisoformat(str(args["date"]))
             provider_id = args.get("provider_id")
             pid = int(provider_id) if provider_id is not None else None
-            slots = await _check_availability_async(
+            result = await _check_availability_async(
                 service_id=service_id, appt_date=appt_date, provider_id=pid
             )
-            return json.dumps({"available_slots": slots, "date": appt_date.isoformat()})
+            return json.dumps(result)
 
         if name == "book_appointment":
             catalog = await sync_to_async(_booking_catalog_json, thread_sensitive=True)()

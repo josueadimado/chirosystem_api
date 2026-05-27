@@ -61,7 +61,7 @@ from apps.clinic.voice_logging import (
 
 from django.utils import timezone
 
-from apps.clinic.timezone_utils import today_clinic
+from apps.clinic.timezone_utils import now_clinic, today_clinic
 
 # ORM helpers for async WebSocket handlers (Django forbids sync DB in async context).
 _booking_catalog_async = sync_to_async(_booking_catalog_json, thread_sensitive=True)
@@ -909,6 +909,10 @@ def _find_nearby_slots(
         for m in range(s.hour * 60 + s.minute, e.hour * 60 + e.minute):
             taken.add(m)
 
+    past_cutoff: dt_time | None = None
+    if appt_date == today_clinic():
+        past_cutoff = (now_clinic() + timedelta(minutes=30)).time()
+
     slots: list[tuple[int, str]] = []
     cursor = day_start
     target_min = rejected_time.hour * 60 + rejected_time.minute if rejected_time else 600
@@ -927,6 +931,9 @@ def _find_nearby_slots(
             if not provider_interval_blocked_online(
                 provider.pk, appt_date, st, et, block_overlap_end=treat_t
             ):
+                if past_cutoff is not None and st < past_cutoff:
+                    cursor += slot_step
+                    continue
                 suffix = "AM" if h < 12 else "PM"
                 dh = h if 1 <= h <= 12 else (h - 12 if h > 12 else 12)
                 label = f"{dh}:{m:02d} {suffix}"

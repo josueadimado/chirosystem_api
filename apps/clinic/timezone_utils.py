@@ -3,26 +3,29 @@
 from __future__ import annotations
 
 import datetime
+from datetime import timedelta
 
 from django.conf import settings
 from django.utils import timezone
 from zoneinfo import ZoneInfo
 
 
-def get_clinic_timezone() -> ZoneInfo:
-    """
-    Get clinic timezone from database first, fall back to settings,
-    then fall back to America/Detroit.
-    """
+def get_clinic_tz_name() -> str:
+    """IANA timezone name: ClinicSettings DB → CLINIC_TIMEZONE env → Detroit."""
     try:
         from apps.clinic.models import ClinicSettings
 
         clinic = ClinicSettings.get_solo()
-        tz_name = clinic.timezone or getattr(settings, "CLINIC_TIMEZONE", "America/Detroit")
+        if clinic.timezone:
+            return clinic.timezone
     except Exception:
-        tz_name = getattr(settings, "CLINIC_TIMEZONE", "America/Detroit")
+        pass
+    return getattr(settings, "CLINIC_TIMEZONE", "America/Detroit")
+
+
+def get_clinic_timezone() -> ZoneInfo:
     try:
-        return ZoneInfo(str(tz_name))
+        return ZoneInfo(get_clinic_tz_name())
     except Exception:
         return ZoneInfo("America/Detroit")
 
@@ -38,8 +41,21 @@ def today_clinic() -> datetime.date:
 
 
 def clinic_tz_name() -> str:
-    """Clinic timezone name as string."""
-    return str(get_clinic_timezone())
+    """Alias for get_clinic_tz_name (backward compatible)."""
+    return get_clinic_tz_name()
+
+
+def filter_past_slot_times_for_date(
+    slot_times: list[datetime.time],
+    appt_date: datetime.date,
+    *,
+    buffer_minutes: int = 30,
+) -> list[datetime.time]:
+    """Drop slots before now+buffer when booking for today (clinic local time)."""
+    if appt_date != today_clinic():
+        return slot_times
+    cutoff_time = (now_clinic() + timedelta(minutes=buffer_minutes)).time()
+    return [s for s in slot_times if s >= cutoff_time]
 
 
 def _timezone_display_label(tz: str) -> str:
