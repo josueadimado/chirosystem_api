@@ -243,6 +243,10 @@ def validate_appointment_duration_span_for_desk(
     if end_m <= start_m:
         return "End time must be after the start time.", False
 
+    # Reschedule / new start: block times that have already passed (allow end-only extension on today's visit).
+    if previous_end_time is None and slot_start_is_in_past(appt_date, start_time):
+        return "That start time has already passed. Pick a later time today or a future date.", False
+
     duration = end_m - start_m
     step = CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES
     if duration < step:
