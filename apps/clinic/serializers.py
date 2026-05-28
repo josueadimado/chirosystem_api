@@ -497,8 +497,19 @@ class PublicBookingSerializer(serializers.Serializer):
         if not valid:
             raise serializers.ValidationError({"phone": msg})
         if attrs.get("service_id"):
-            if not Service.objects.filter(pk=attrs["service_id"], is_active=True).exists():
-                raise serializers.ValidationError({"service_id": "Invalid or inactive service."})
+            svc = Service.objects.filter(
+                pk=attrs["service_id"],
+                is_active=True,
+                show_in_public_booking=True,
+            ).first()
+            if not svc:
+                raise serializers.ValidationError(
+                    {"service_id": "Invalid or inactive service for online booking."}
+                )
+            # Always use catalog duration/price for slot checks and appointment end time (not client body).
+            attrs["service_duration_minutes"] = int(svc.duration_minutes)
+            attrs["service_price"] = svc.price
+            attrs["service_name"] = svc.label_for_public_booking()
         if attrs.get("provider_id"):
             if not Provider.objects.filter(pk=attrs["provider_id"], active=True).exists():
                 raise serializers.ValidationError({"provider_id": "Invalid or inactive provider."})

@@ -683,11 +683,19 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             display_h = h if 1 <= h <= 12 else (h - 12 if h > 12 else 12)
             return f"{display_h}:{m:02d} {suffix}"
 
-        busy_qs = Appointment.objects.filter(
-            provider=provider,
-            appointment_date=appt_date,
-        ).exclude(
-            status__in=[Appointment.Status.CANCELLED, Appointment.Status.NO_SHOW, Appointment.Status.COMPLETED]
+        busy_qs = (
+            Appointment.objects.filter(
+                provider=provider,
+                appointment_date=appt_date,
+            )
+            .exclude(
+                status__in=[
+                    Appointment.Status.CANCELLED,
+                    Appointment.Status.NO_SHOW,
+                    Appointment.Status.COMPLETED,
+                ]
+            )
+            .select_related("booked_service")
         )
         exclude_raw = (request.query_params.get("exclude_appointment_id") or "").strip()
         phone_for_exclude = (request.query_params.get("phone") or "").strip()
@@ -846,7 +854,16 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             cursor += SLOT_INTERVAL
 
         return Response(
-            {"available_slots": available, "slot_start_times": slot_start_times, "slot_grid": slot_grid},
+            {
+                "available_slots": available,
+                "slot_start_times": slot_start_times,
+                "slot_grid": slot_grid,
+                # Lets the booking UI confirm which visit length was used for this grid.
+                "visit_duration_minutes": closing_compliance_span,
+                "calendar_span_minutes": required_span,
+                "service_id": service.id,
+                "service_name": service.label_for_public_booking(),
+            },
         )
 
     @action(detail=False, methods=["get"], url_path="patient-lookup")
