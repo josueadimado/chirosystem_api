@@ -1513,6 +1513,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
     def prior_chart_notes(self, request, pk=None):
         """Earlier visits for this patient — handoff reminders and consultation SOAP notes."""
         from .patient_prior_chart_notes import prior_chart_notes_for_appointment
+from .patient_prior_diagnoses import consultation_diagnosis_prefill_for_appointment
 
         appt = self.get_object()
         return Response({"prior_visits": prior_chart_notes_for_appointment(appt)})
@@ -3665,6 +3666,29 @@ class DoctorViewSet(viewsets.ViewSet):
             }
             for inv in qs
         ])
+
+    @action(detail=True, methods=["get"], url_path="consultation_diagnoses")
+    def consultation_diagnoses(self, request, pk=None):
+        """Catalog diagnosis IDs for this consultation — prior visit prefill when this visit has none yet."""
+        provider = self._get_provider(request)
+        if not provider:
+            return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
+        appointment = (
+            Appointment.objects.filter(pk=pk, provider=provider)
+            .select_related("booked_service")
+            .first()
+        )
+        if not appointment:
+            return Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
+        if appointment.status not in (
+            Appointment.Status.IN_CONSULTATION,
+            Appointment.Status.CHECKED_IN,
+        ):
+            return Response(
+                {"detail": "Diagnosis prefill is only available for active consultations."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(consultation_diagnosis_prefill_for_appointment(appointment))
 
     @action(detail=True, methods=["post"])
     def start_visit(self, request, pk=None):
