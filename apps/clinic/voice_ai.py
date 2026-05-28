@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 from django.conf import settings
 
 from .models import Service
+from .voice_pricing import normalize_service_speech
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +168,7 @@ def match_service_from_speech(speech: str, services: list[dict]) -> dict | None:
     Fuzzy-match a service from the caller's speech against known service names.
     Tries exact, contains, keyword overlap — all instantly, no API call.
     """
-    s_lower = speech.lower().strip()
+    s_lower = normalize_service_speech(speech).strip()
     s_lower = re.sub(r"^(i('d| would) like( (a|an|the))?\s*|i want( (a|an|the))?\s*|"
                      r"(can i|could i) (get|have|book)( (a|an|the))?\s*|"
                      r"(let('s| us) (do|go with)( (a|an|the))?\s*)|"
@@ -222,7 +223,7 @@ def match_services_from_speech(speech: str, services: list[dict]) -> list[dict]:
     massage and also chiropractic", etc.
     Returns a deduplicated list of matched services (1 or more).
     """
-    s_lower = speech.lower().strip()
+    s_lower = normalize_service_speech(speech).strip()
     s_lower = re.sub(r"^(i('d| would) like( (a|an|the))?\s*|i want( (a|an|the))?\s*|"
                      r"(can i|could i) (get|have|book)( (a|an|the))?\s*|"
                      r"(let('s| us) (do|go with)( (a|an|the))?\s*)|"

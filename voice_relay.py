@@ -52,6 +52,11 @@ from apps.clinic.voice_ai import (
     openai_parse_datetime,
     parse_datetime_from_speech,
 )
+from apps.clinic.voice_pricing import (
+    after_booking_voice_facts,
+    format_voice_price,
+    is_new_patient_voice_service,
+)
 from apps.clinic.voice_logging import (
     async_append_voice_conversation_turn,
     async_upsert_voice_call_log,
@@ -520,6 +525,7 @@ class ServiceEntry:
         self.service_duration: int = svc["duration_minutes"]
         self.service_price: str = svc["price"]
         self.service_type: str = (svc.get("service_type") or "").strip()
+        self.is_new_client_intake: bool = bool(svc.get("is_new_client_intake"))
         self.provider_id: int | None = provider_id
         self.provider_name: str = provider_name
         self.appointment_date: str = ""
@@ -1515,16 +1521,19 @@ async def handle_datetime(ws: WebSocket, state: ConversationState, speech: str):
         gap = _inter_visit_buffer_minutes(svc, next_svc)
         next_start = _add_minutes(end_t, gap) if end_t else None
         next_time_spoken = _time_plain_english(next_start) if next_start else "after a short break"
+        fee1 = format_voice_price(svc.service_price)
+        fee2 = format_voice_price(next_svc.service_price)
         if gap == 0:
             await _speak_llm(
                 ws,
                 f"Confirm multi-service booking with {name}.{returning_note} "
                 f"REQUIRED FACTS you MUST say out loud in plain English: "
-                f"1) First, {svc.service_name} on {when_plain}. "
-                f"2) Then {next_svc.service_name} right after at {next_time_spoken} that same day (back-to-back, no break). "
+                f"1) First, {svc.service_name} on {when_plain}, fee {fee1}. "
+                f"2) Then {next_svc.service_name} right after at {next_time_spoken} that same day "
+                f"(back-to-back, no break), fee {fee2}. "
                 f"Ask if that sounds good. Be natural.",
-                f"Alright {name}, here's the plan: first {svc.service_name} on {when_plain}, "
-                f"then {next_svc.service_name} right after at {next_time_spoken}, back-to-back. "
+                f"Alright {name}, here's the plan: first {svc.service_name} on {when_plain} ({fee1}), "
+                f"then {next_svc.service_name} right after at {next_time_spoken} ({fee2}), back-to-back. "
                 f"Does that work for you?",
             )
         else:
@@ -1532,12 +1541,12 @@ async def handle_datetime(ws: WebSocket, state: ConversationState, speech: str):
                 ws,
                 f"Confirm multi-service booking with {name}.{returning_note} "
                 f"REQUIRED FACTS you MUST say out loud in plain English: "
-                f"1) First, {svc.service_name} on {when_plain}. "
+                f"1) First, {svc.service_name} on {when_plain}, fee {fee1}. "
                 f"2) Then a fifteen-minute break. "
-                f"3) Then {next_svc.service_name} at {next_time_spoken} that same day. "
+                f"3) Then {next_svc.service_name} at {next_time_spoken} that same day, fee {fee2}. "
                 f"Ask if that sounds good. Be natural.",
-                f"Alright {name}, here's the plan: first {svc.service_name} on {when_plain}, "
-                f"then a fifteen-minute break, then {next_svc.service_name} at {next_time_spoken}. "
+                f"Alright {name}, here's the plan: first {svc.service_name} on {when_plain} ({fee1}), "
+                f"then a fifteen-minute break, then {next_svc.service_name} at {next_time_spoken} ({fee2}). "
                 f"Does that work for you?",
             )
     else:
@@ -1545,9 +1554,12 @@ async def handle_datetime(ws: WebSocket, state: ConversationState, speech: str):
             ws,
             f"Confirm a single appointment with {name}.{returning_note} "
             f"REQUIRED FACTS you MUST say out loud in plain English: "
-            f"{svc.service_name} on {when_plain}. "
+            f"{svc.service_name} on {when_plain}, fee {format_voice_price(svc.service_price)} "
+            f"({svc.service_duration} minutes). "
             f"Ask if that's good. Keep it natural and brief.",
-            f"Perfect, {name}! So that's {svc.service_name} on {when_plain}. Shall I lock that in?",
+            f"Perfect, {name}! So that's {svc.service_name} on {when_plain} — "
+            f"{format_voice_price(svc.service_price)} for {svc.service_duration} minutes. "
+            f"Shall I lock that in?",
         state=state,
         )
 
@@ -2446,6 +2458,38 @@ async def handle_reschedule_datetime(ws: WebSocket, state: ConversationState, sp
         )
 
 
+def _service_entry_for_name(state: ConversationState, service_name: str) -> ServiceEntry | None:
+    for s in state.services:
+        if s.service_name == service_name:
+            return s
+    return None
+
+
+def _intake_after_booking_facts_for_entry(entry: ServiceEntry | None) -> str:
+    if not entry:
+        return ""
+    if not is_new_patient_voice_service(
+        svc_dict={
+            "name": entry.service_name,
+            "is_new_client_intake": entry.is_new_client_intake,
+            "service_type": entry.service_type,
+        }
+    ):
+        return ""
+    facts = after_booking_voice_facts(
+        svc_dict={
+            "name": entry.service_name,
+            "price": entry.service_price,
+            "duration_minutes": entry.service_duration,
+            "is_new_client_intake": entry.is_new_client_intake,
+            "service_type": entry.service_type,
+        }
+    )
+    return (
+        f" Also say: {facts['payment_line']} {facts['paperwork_line']}"
+    )
+
+
 async def _build_final_message(ws: WebSocket, state: ConversationState, booked: list[tuple[str, str]]):
     name = state.caller_name
     returning_note = (
@@ -2455,27 +2499,46 @@ async def _build_final_message(ws: WebSocket, state: ConversationState, booked: 
     )
     if len(booked) == 1:
         svc_name, when_plain = booked[0]
+        entry = _service_entry_for_name(state, svc_name)
+        price_note = (
+            f" Fee for this visit: {format_voice_price(entry.service_price)}."
+            if entry
+            else ""
+        )
+        intake_note = _intake_after_booking_facts_for_entry(entry)
         await _end_session_speaking_llm(
             ws,
             f"The appointment is confirmed! Tell {name} their booking details and say goodbye. "
             f"Be genuinely warm and excited for them. Mention they'll get a text and email. "
             f"{returning_note}"
-            f"REQUIRED FACTS (say in plain English): {svc_name} on {when_plain}. "
+            f"REQUIRED FACTS (say in plain English): {svc_name} on {when_plain}.{price_note}{intake_note} "
+            f"Use only this service's fee — do not quote a different visit's price. "
             f"Confirmation sent via text and email.",
-            f"You're all set, {name}! Your {svc_name} is booked for {when_plain}. "
-            "You'll get a text and email confirmation. Have an awesome day!",
+            f"You're all set, {name}! Your {svc_name} is booked for {when_plain}."
+            + (f" The fee is {format_voice_price(entry.service_price)} due on your visit date." if entry else "")
+            + " You'll get a text and email confirmation. Have an awesome day!",
         state=state,
         )
     else:
-        details = " — ".join(f"{n} ({w})" for n, w in booked)
+        detail_parts = []
+        for svc_name, when_plain in booked:
+            entry = _service_entry_for_name(state, svc_name)
+            fee = (
+                f", fee {format_voice_price(entry.service_price)}"
+                if entry
+                else ""
+            )
+            detail_parts.append(f"{svc_name} on {when_plain}{fee}")
+        details = " — ".join(detail_parts)
         await _end_session_speaking_llm(
             ws,
             f"Both appointments are confirmed for {name}! Tell them the details and say goodbye warmly. "
             f"Mention they'll get a text and email for each appointment. "
             f"{returning_note}"
-            f"REQUIRED FACTS (plain English): {details}.",
+            f"REQUIRED FACTS (plain English): {details}. "
+            f"Use each appointment's own fee — do not mix up prices between services.",
             f"You're all set, {name}! Both appointments are confirmed: "
-            + "; ".join(f"{n} — {w}" for n, w in booked)
+            + "; ".join(detail_parts)
             + ". "
             "You'll get confirmations for each by text and email. Have a wonderful day!",
         state=state,

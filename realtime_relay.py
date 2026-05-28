@@ -44,6 +44,14 @@ from apps.clinic.public_booking_service import (
 from apps.clinic.serializers import PublicBookingSerializer
 from apps.clinic.utils import normalize_phone
 from apps.clinic.voice_ai import _booking_catalog_json, _parse_time_12h
+from apps.clinic.voice_pricing import (
+    book_appointment_tool_message,
+    find_catalog_service,
+    find_reexamination_service,
+    is_new_patient_voice_service,
+    realtime_after_booking_prompt_block,
+    service_price_duration_facts,
+)
 from apps.clinic.voice_logging import (
     async_append_voice_conversation_turn,
     async_upsert_voice_call_log,
@@ -63,11 +71,6 @@ OPENAI_REALTIME_URL = (
 )
 
 # ─── Tool schemas (OpenAI Realtime) ───────────────────────────────────
-
-# Service id for RE-EXAMINATION (returning patients after 1+ year gap).
-RE_EXAMINATION_SERVICE_ID = 31
-NEW_PATIENT_PAPERWORK_URL = "https://www.reliefchiropractic.net/s/New-Patient-Paperwork-2025.doc"
-NEW_OFFICE_VISIT_UPFRONT_USD = 105
 
 _REALTIME_ACTIVE_APPOINTMENT_STATUSES = (
     Appointment.Status.BOOKED,
@@ -217,13 +220,20 @@ def _returning_patient_prompt_note(patient: Patient) -> str:
             if last_appt
             else "they are on file but have no prior visit date in the system"
         )
+        catalog = _booking_catalog_json()
+        reexam = find_reexamination_service(catalog)
+        reexam_hint = ""
+        if reexam:
+            _, dur, price = service_price_duration_facts(reexam)
+            reexam_hint = (
+                f" For chiropractic, suggest {reexam['name']} (service_id {reexam['id']}) — "
+                f"{dur} minutes, {price} — not the New Office Visit price."
+            )
         return (
             f"\nRETURNING PATIENT (RE-INTAKE NEEDED): "
             f"{patient.first_name} {patient.last_name} is on file but {gap_detail}. "
-            f"They must be treated like a new patient for paperwork and chiropractic intake. "
-            f"After booking remind them to arrive 25 minutes early for paperwork OR "
-            f"download it at reliefchiropractic.net (New Patient Paperwork 2025). "
-            f"If they want chiropractic suggest RE-EXAMINATION or New Office Visit first."
+            f"They must be treated like a new patient for chiropractic intake.{reexam_hint} "
+            f"After booking, quote the exact fee for the service you booked (see AFTER BOOKING section)."
         )
 
     days_label = str(days_since) if days_since is not None else "unknown"
@@ -322,39 +332,13 @@ If you answered an insurance question during this call, remember that — after 
 "Your insurance will be billed and you will be reimbursed based on your health benefit plan."
 If insurance was never discussed on this call, do NOT mention insurance billing after booking.
 
-═══════════════════════════════════════
-AFTER BOOKING (NEW OFFICE VISIT / FIRST VISIT)
-═══════════════════════════════════════
-Applies after booking New Office Visit or any first-visit / intake service (including RE-EXAMINATION for re-intake).
-
-Confirm date and time, then ALWAYS say these two things (in a warm, natural way):
-
-Thing 1 — Payment (always):
-"Please note your first visit fee is $105 due on the date of service."
-
-Thing 2 — Paperwork (always):
-"Please bring completed new patient paperwork or arrive 20 to 25 minutes early to fill it out at the clinic. You can download it at reliefchiropractic.net — look for New Patient Paperwork 2025."
-
-Optional — only if caller asked about insurance BEFORE booking on this call:
-"Your insurance will be billed and you will be reimbursed based on your health benefit plan."
-
-If they did NOT ask about insurance: do NOT mention insurance billing. Only $105 fee and paperwork.
-
-Paperwork download link (if they want the direct link): {NEW_PATIENT_PAPERWORK_URL}
-
-RE-INTAKE PATIENTS (last visit over 1 year ago):
-- Treat like new patient for paperwork and payment reminders after booking
-- For chiropractic suggest RE-EXAMINATION (service_id: 31) instead of New Office Visit since they are already in the system
-  Say: "Since it has been over a year since your last visit, we will need you to do a RE-EXAMINATION first. It is [duration] minutes and [price]. Would that work for you?"
-- After booking use AFTER BOOKING (NEW OFFICE VISIT / FIRST VISIT) above
+{realtime_after_booking_prompt_block(catalog)}
 
 CHIROPRACTIC NEW PATIENT RULES:
 If a caller says they have never been to the clinic before AND wants chiropractic:
 - Do NOT book "Chiropractic Visit" directly
-- Suggest "New Office Visit" first
-  Say: "For first-time chiropractic patients we start with a New Office Visit so the doctor can do a proper assessment. It's [duration] minutes and [price]. Would you like to book that?"
-- After they agree book New Office Visit
-- Then use AFTER BOOKING (NEW OFFICE VISIT / FIRST VISIT): $105 fee, paperwork, insurance line only if they asked about insurance earlier
+- Suggest New Office Visit first — quote its price and duration from AVAILABLE SERVICES only
+- After they agree, book that service and state THAT service's fee after booking (never a different visit's price)
 
 IMPORTANT:
 - Always check availability before confirming a booking
@@ -371,10 +355,7 @@ def _default_provider_id(catalog: dict[str, Any], service_id: int) -> int | None
 
 
 def _service_row(catalog: dict[str, Any], service_id: int) -> dict[str, Any] | None:
-    for svc in catalog.get("services") or []:
-        if int(svc["id"]) == int(service_id):
-            return svc
-    return None
+    return find_catalog_service(catalog, service_id)
 
 
 def _get_public_available_slot_times(
@@ -548,24 +529,6 @@ def _get_upcoming_appointments(phone: str) -> list[dict[str, Any]]:
     return out
 
 
-def _is_new_patient_service(service: Service | None) -> bool:
-    """True when Sarah should give first-visit paperwork / 25-minute-early instructions."""
-    if service is None:
-        return False
-    if service.pk == RE_EXAMINATION_SERVICE_ID:
-        return True
-    if getattr(service, "is_new_client_intake", False):
-        return True
-    name = (service.name or "").lower()
-    return (
-        "new" in name
-        or "intake" in name
-        or "office visit" in name
-        or "re-examination" in name
-        or "reexamination" in name
-    )
-
-
 def _book_appointment_sync(payload: dict[str, Any]) -> dict[str, Any]:
     ser = PublicBookingSerializer(data=payload)
     if not ser.is_valid():
@@ -576,26 +539,16 @@ def _book_appointment_sync(payload: dict[str, Any]) -> dict[str, Any]:
     if err:
         return {"ok": False, "success": False, "error": err}
     svc = appt.booked_service
-    svc_name = svc.name if svc else ""
+    svc_name = svc.label_for_public_booking() if svc else ""
     date_s = appt.appointment_date.isoformat()
     time_s = appt.start_time.strftime("%I:%M %p").lstrip("0")
-    is_new = _is_new_patient_service(svc)
-    if is_new:
-        message = (
-            f"Booked {svc_name} on {date_s} at {time_s}. "
-            "Tell the caller: "
-            f"1. Appointment confirmed for {date_s} at {time_s} "
-            f"2. First visit fee: ${NEW_OFFICE_VISIT_UPFRONT_USD} due on date of service "
-            "3. Bring paperwork OR arrive 20-25 min early to fill it out at the clinic "
-            "4. Download: reliefchiropractic.net - New Patient Paperwork 2025 "
-            "Note: Only add insurance reimbursement info if caller asked about insurance earlier in the call."
-        )
-    else:
-        message = (
-            f"Booked {svc_name} on {date_s} at {time_s}. "
-            "Returning visit: short confirmation and confirmation text only — "
-            "do not mention 25 minutes early or paperwork download."
-        )
+    is_new = is_new_patient_voice_service(service=svc)
+    message = book_appointment_tool_message(
+        service_name=svc_name,
+        date_s=date_s,
+        time_s=time_s,
+        service=svc,
+    )
     return {
         "ok": True,
         "success": True,
