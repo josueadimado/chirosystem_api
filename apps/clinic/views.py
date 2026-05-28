@@ -119,6 +119,7 @@ from .square_payment import (
     get_frontend_base_url,
     get_terminal_checkout_status,
     try_push_terminal_checkout_to_kiosk,
+    reconcile_open_invoices_for_patient,
     try_reconcile_invoice_from_square,
 )
 from .booking_availability import provider_interval_blocked_online
@@ -412,6 +413,9 @@ def _serialize_patient_appointment_history(request, appointments, *, force_read_
     appt_list = list(appointments)
     if not appt_list:
         return []
+    patient_id = appt_list[0].patient_id
+    if patient_id:
+        reconcile_open_invoices_for_patient(patient_id)
     ids = [a.id for a in appt_list]
     visits = Visit.objects.filter(appointment_id__in=ids).prefetch_related(
         Prefetch(
