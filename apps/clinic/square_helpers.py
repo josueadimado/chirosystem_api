@@ -255,9 +255,18 @@ def get_square_payment_status_for_admin() -> dict:
                 "ok": True if frontend_set else None,
                 "hint": None if frontend_set else "FRONTEND_BASE_URL — where patients return after paying a link.",
             },
+            {
+                "id": "pos_callback",
+                "label": "Square POS callback URL (iPad/Android Square POS app)",
+                "ok": True if pos_cb_set else None,
+                "hint": None
+                if pos_cb_set
+                else "SQUARE_POS_CALLBACK_URL — optional; not a device id. Used if launching Square POS from a tablet browser.",
+            },
         ],
         "web_payments_ready": web_ready and api_ok is True and location_matches is not False,
         "terminal_reader_ready": terminal_ready and api_ok is True and location_matches is not False,
+        "pos_callback_configured": pos_cb_set,
         "square_locations_found": location_ids_count,
     }
 

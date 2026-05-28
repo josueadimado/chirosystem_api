@@ -406,6 +406,7 @@ class AppointmentListSerializer(serializers.ModelSerializer):
     start_time_display = serializers.SerializerMethodField()
     end_time_display = serializers.SerializerMethodField()
     reason_for_visit = serializers.SerializerMethodField()
+    patient_date_of_birth = serializers.SerializerMethodField()
 
     class Meta:
         model = Appointment
@@ -413,6 +414,7 @@ class AppointmentListSerializer(serializers.ModelSerializer):
             "id",
             "patient",
             "patient_name",
+            "patient_date_of_birth",
             "provider",
             "provider_name",
             "booked_service",
@@ -447,6 +449,10 @@ class AppointmentListSerializer(serializers.ModelSerializer):
 
     def get_reason_for_visit(self, obj):
         return _appointment_reason_for_visit(obj)
+
+    def get_patient_date_of_birth(self, obj):
+        dob = obj.patient.date_of_birth
+        return str(dob) if dob else None
 
 
 class PublicBookingSerializer(serializers.Serializer):
