@@ -95,6 +95,7 @@ from .patient_demographics import (
     annotate_patient_unpaid_balances,
     apply_patient_intake_validated_data,
     apply_patient_directory_list_filter,
+    patient_account_summary,
     patient_demographics_summary,
 )
 from .visit_diagnosis import diagnosis_ids_from_visit, serialize_visit_diagnoses
@@ -520,6 +521,7 @@ def _serialize_patient_appointment_history(request, appointments, *, force_read_
             inv_payload = {
                 "id": inv.id,
                 "invoice_number": inv.invoice_number,
+                "kind": inv.kind,
                 "subtotal": str(inv.subtotal),
                 "discount": str(inv.discount),
                 "credit_applied_total": str(inv.credit_applied_total),
@@ -3181,6 +3183,7 @@ class AdminViewSet(viewsets.ViewSet):
                 "sms_consent_at": patient.sms_consent_at.isoformat() if patient.sms_consent_at else None,
                 "appointments": _serialize_patient_appointment_history(request, appointments),
                 **patient_demographics_summary(patient),
+                "account_summary": patient_account_summary(patient),
             }
         )
 
@@ -3483,6 +3486,7 @@ class DoctorViewSet(viewsets.ViewSet):
                     request, appointments, force_read_only=(access == "read_only")
                 ),
                 **patient_demographics_summary(patient),
+                "account_summary": patient_account_summary(patient),
             }
         )
 

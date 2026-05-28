@@ -140,6 +140,52 @@ def effective_date_established(patient: Patient):
     return _first_appointment_date(patient)
 
 
+def patient_account_summary(patient: Patient) -> dict:
+    """
+    Unpaid balances (by invoice kind) and appointment counts for chart/history headers.
+    Uses subquery balances so totals match Admin → Billing.
+    """
+    annotated = annotate_patient_unpaid_balances(
+        annotate_patient_list_stats(Patient.objects.filter(pk=patient.pk)),
+    ).first()
+    bal_visit = getattr(annotated, "balance_visit", None) or Decimal("0")
+    bal_no_show = getattr(annotated, "balance_no_show_fee", None) or Decimal("0")
+    bal_late_cancel = getattr(annotated, "balance_late_cancel_fee", None) or Decimal("0")
+    balance_total = (bal_visit + bal_no_show + bal_late_cancel).quantize(Decimal("0.01"))
+
+    today = timezone.localdate()
+    upcoming_qs = (
+        Appointment.objects.filter(patient=patient, appointment_date__gte=today)
+        .exclude(status__in=_FUTURE_APPT_EXCLUDED)
+        .order_by("appointment_date", "start_time")
+    )
+    next_appt = upcoming_qs.first()
+    next_date = str(next_appt.appointment_date) if next_appt else None
+    next_time = next_appt.start_time.strftime("%I:%M %p") if next_appt else None
+
+    cancelled_count = Appointment.objects.filter(
+        patient=patient,
+        status=Appointment.Status.CANCELLED,
+    ).count()
+
+    def money(d: Decimal) -> str:
+        return str(d.quantize(Decimal("0.01")))
+
+    return {
+        "balance_total": money(balance_total),
+        "balance_visit": money(bal_visit),
+        "balance_no_show_fee": money(bal_no_show),
+        "balance_late_cancel_fee": money(bal_late_cancel),
+        "has_overdue": bool(getattr(annotated, "has_overdue_invoice", False)),
+        "visit_count": int(getattr(annotated, "visit_count", 0) or 0),
+        "no_show_count": int(getattr(annotated, "no_show_count", 0) or 0),
+        "upcoming_count": upcoming_qs.count(),
+        "cancelled_count": cancelled_count,
+        "next_appointment_date": next_date,
+        "next_appointment_time": next_time,
+    }
+
+
 def patient_demographics_summary(patient: Patient) -> dict:
     """
     Extra demographics for patient_detail responses.
