@@ -3894,16 +3894,9 @@ class StaffNotificationViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
 
 
 class KioskViewSet(viewsets.ViewSet):
-    """Public kiosk: patient lookup and check-in by phone."""
+    """Public kiosk: patient lookup and check-in by phone (supports shared household numbers)."""
 
     permission_classes = [permissions.AllowAny]
-
-    @staticmethod
-    def _patient_for_kiosk_phone(norm: str) -> Optional[Patient]:
-        for p in Patient.objects.iterator(chunk_size=200):
-            if normalize_phone(p.phone) == norm:
-                return p
-        return None
 
     @staticmethod
     def _kiosk_appointments_qs(patient: Patient):
@@ -3916,6 +3909,19 @@ class KioskViewSet(viewsets.ViewSet):
             .order_by("appointment_date", "start_time")
         )
 
+    @staticmethod
+    def _kiosk_appt_choice(appt: Appointment, *, can_checkin: bool, earliest_local: datetime | None = None) -> dict:
+        payload = {
+            "appointment_id": appt.id,
+            "patient": f"{appt.patient.first_name} {appt.patient.last_name}",
+            "provider": str(appt.provider),
+            "start_time_display": format_time_12h(appt.start_time),
+            "can_checkin": can_checkin,
+        }
+        if not can_checkin and earliest_local is not None:
+            payload["earliest_checkin_display"] = format_time_12h(earliest_local.time())
+        return payload
+
     @classmethod
     def _kiosk_minutes_before(cls) -> int:
         v = getattr(settings, "KIOSK_EARLY_CHECKIN_MINUTES_BEFORE", 15)
@@ -3926,21 +3932,42 @@ class KioskViewSet(viewsets.ViewSet):
 
     @classmethod
     def _can_kiosk_checkin_now(cls, appt: Appointment):
-        """Return (allowed, start_local, earliest_local)."""
-        tz = timezone.get_current_timezone()
-        start_local = timezone.make_aware(
-            datetime.combine(appt.appointment_date, appt.start_time),
-            tz,
-        )
+        """Return (allowed, start_local, earliest_local) in clinic timezone."""
+        from apps.clinic.timezone_utils import get_clinic_timezone, now_clinic
+
+        tz = get_clinic_timezone()
+        start_local = datetime.combine(appt.appointment_date, appt.start_time, tzinfo=tz)
         minutes = cls._kiosk_minutes_before()
         earliest_local = start_local - timedelta(minutes=minutes)
-        now_local = timezone.localtime()
-        return now_local >= earliest_local, start_local, earliest_local
+        return now_clinic() >= earliest_local, start_local, earliest_local
+
+    @staticmethod
+    def _today_appointments_for_phone(norm: str) -> tuple[list[Patient], list[Appointment], list[Appointment]]:
+        """All patients on this number, their today appts, and all non-cancelled appts (for future lookup)."""
+        from apps.clinic.patient_phone import patients_matching_phone
+        from apps.clinic.timezone_utils import today_clinic
+
+        today = today_clinic()
+        patients = patients_matching_phone(norm)
+        if not patients:
+            return [], [], []
+
+        all_appts: list[Appointment] = []
+        today_appts: list[Appointment] = []
+        for patient in patients:
+            qs = list(KioskViewSet._kiosk_appointments_qs(patient))
+            all_appts.extend(qs)
+            today_appts.extend(a for a in qs if a.appointment_date == today)
+        today_appts.sort(key=lambda a: (a.start_time, a.pk))
+        all_appts.sort(key=lambda a: (a.appointment_date, a.start_time, a.pk))
+        return patients, today_appts, all_appts
 
     @action(detail=False, methods=["post"])
     def lookup(self, request):
         phone = request.data.get("phone")
-        today = timezone.localdate()
+        from apps.clinic.timezone_utils import today_clinic
+
+        today = today_clinic()
         valid, msg = validate_phone(phone or "")
         if not valid:
             return Response(
@@ -3948,8 +3975,8 @@ class KioskViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         norm = normalize_phone(phone)
-        patient = self._patient_for_kiosk_phone(norm)
-        if not patient:
+        patients, today_appts, all_appts = self._today_appointments_for_phone(norm)
+        if not patients:
             return Response(
                 {
                     "result": "not_found",
@@ -3960,37 +3987,53 @@ class KioskViewSet(viewsets.ViewSet):
                 }
             )
 
-        qs = list(self._kiosk_appointments_qs(patient))
-        today_appts = [a for a in qs if a.appointment_date == today]
-
         open_today = [a for a in today_appts if a.status == Appointment.Status.BOOKED]
         if open_today:
-            appt = min(open_today, key=lambda a: (a.start_time, a.pk))
-            allowed, start_local, earliest_local = self._can_kiosk_checkin_now(appt)
-            if not allowed:
+            choices: list[dict] = []
+            for appt in open_today:
+                allowed, _, earliest_local = self._can_kiosk_checkin_now(appt)
+                choices.append(
+                    self._kiosk_appt_choice(appt, can_checkin=allowed, earliest_local=earliest_local)
+                )
+
+            if len(choices) > 1:
                 return Response(
                     {
-                        "result": "too_early",
+                        "result": "choose_patient",
                         "message": (
-                            "You are here before your check-in window. Please wait until closer to your "
-                            "appointment time, or ask the front desk if you need help."
+                            "We found more than one appointment for this phone number today. "
+                            "Please tap the name of the person checking in."
                         ),
+                        "choices": choices,
+                    }
+                )
+
+            choice = choices[0]
+            appt = open_today[0]
+            if choice["can_checkin"]:
+                return Response(
+                    {
+                        "result": "ready",
                         "appointment_id": appt.id,
-                        "patient": f"{appt.patient.first_name} {appt.patient.last_name}",
-                        "provider": str(appt.provider),
-                        "start_time_display": format_time_12h(appt.start_time),
-                        "earliest_checkin_display": format_time_12h(earliest_local.time()),
+                        "patient": choice["patient"],
+                        "provider": choice["provider"],
+                        "time": str(appt.start_time),
+                        "start_time_display": choice["start_time_display"],
+                        "status": appt.status,
                     }
                 )
             return Response(
                 {
-                    "result": "ready",
+                    "result": "too_early",
+                    "message": (
+                        "You are here before your check-in window. Please wait until closer to your "
+                        "appointment time, or ask the front desk if you need help."
+                    ),
                     "appointment_id": appt.id,
-                    "patient": f"{appt.patient.first_name} {appt.patient.last_name}",
-                    "provider": str(appt.provider),
-                    "time": str(appt.start_time),
-                    "start_time_display": format_time_12h(appt.start_time),
-                    "status": appt.status,
+                    "patient": choice["patient"],
+                    "provider": choice["provider"],
+                    "start_time_display": choice["start_time_display"],
+                    "earliest_checkin_display": choice.get("earliest_checkin_display", ""),
                 }
             )
 
@@ -4005,14 +4048,22 @@ class KioskViewSet(viewsets.ViewSet):
             )
         ]
         if in_progress_today:
+            if len(in_progress_today) > 1:
+                names = ", ".join(
+                    f"{a.patient.first_name} {a.patient.last_name}" for a in in_progress_today
+                )
+                detail = f"Checked in today: {names}."
+            else:
+                detail = (
+                    "Our records show you have already completed check-in for today. "
+                    "Please have a seat in the waiting area — we will call you when it is time."
+                )
             appt = min(in_progress_today, key=lambda a: (a.start_time, a.pk))
             return Response(
                 {
                     "result": "already_checked_in",
-                    "message": (
-                        "Our records show you have already completed check-in for today. "
-                        "Please have a seat in the waiting area — we will call you when it is time."
-                    ),
+                    "message": detail,
+                    "patient": f"{appt.patient.first_name} {appt.patient.last_name}",
                     "start_time_display": format_time_12h(appt.start_time),
                 }
             )
@@ -4028,19 +4079,21 @@ class KioskViewSet(viewsets.ViewSet):
                 }
             )
 
-        future = [a for a in qs if a.appointment_date > today]
+        future = [a for a in all_appts if a.appointment_date > today]
         if future:
             nxt = min(future, key=lambda a: (a.appointment_date, a.start_time))
             date_disp = nxt.appointment_date.strftime("%A, %B %d, %Y")
+            who = f"{nxt.patient.first_name} {nxt.patient.last_name}"
             return Response(
                 {
                     "result": "wrong_day",
                     "message": (
-                        f"We do not see an appointment for you today. Your next visit with us is scheduled for "
-                        f"{date_disp} at {format_time_12h(nxt.start_time)}."
+                        f"We do not see an appointment for today on this number. "
+                        f"The next visit is for {who} on {date_disp} at {format_time_12h(nxt.start_time)}."
                     ),
                     "appointment_date_display": date_disp,
                     "start_time_display": format_time_12h(nxt.start_time),
+                    "patient": who,
                 }
             )
 
@@ -4056,11 +4109,24 @@ class KioskViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"])
     def checkin(self, request):
+        from apps.clinic.patient_phone import patient_matches_phone_normalized
+        from apps.clinic.timezone_utils import today_clinic
+
         appointment_id = request.data.get("appointment_id")
         if appointment_id is None:
             return Response({"detail": "appointment_id is required."}, status=status.HTTP_400_BAD_REQUEST)
-        appt = get_object_or_404(Appointment, pk=appointment_id)
-        today = timezone.localdate()
+        appt = get_object_or_404(Appointment.objects.select_related("patient"), pk=appointment_id)
+        phone = request.data.get("phone")
+        if phone:
+            valid, msg = validate_phone(phone)
+            if not valid:
+                return Response({"detail": msg}, status=status.HTTP_400_BAD_REQUEST)
+            if not patient_matches_phone_normalized(appt.patient, normalize_phone(phone)):
+                return Response(
+                    {"detail": "This appointment does not match that phone number."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+        today = today_clinic()
         if appt.appointment_date != today:
             return Response(
                 {"detail": "Check-in is only available on the day of your appointment."},
