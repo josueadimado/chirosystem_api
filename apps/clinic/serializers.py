@@ -407,6 +407,8 @@ class AppointmentListSerializer(serializers.ModelSerializer):
     end_time_display = serializers.SerializerMethodField()
     reason_for_visit = serializers.SerializerMethodField()
     patient_date_of_birth = serializers.SerializerMethodField()
+    invoice_kind = serializers.SerializerMethodField()
+    display_status = serializers.SerializerMethodField()
 
     class Meta:
         model = Appointment
@@ -426,6 +428,8 @@ class AppointmentListSerializer(serializers.ModelSerializer):
             "start_time_display",
             "end_time_display",
             "status",
+            "display_status",
+            "invoice_kind",
             "reason_for_visit",
         )
 
@@ -453,6 +457,22 @@ class AppointmentListSerializer(serializers.ModelSerializer):
     def get_patient_date_of_birth(self, obj):
         dob = obj.patient.date_of_birth
         return str(dob) if dob else None
+
+    def get_invoice_kind(self, obj):
+        try:
+            return obj.invoice.kind
+        except Invoice.DoesNotExist:
+            return None
+
+    def get_display_status(self, obj):
+        """Calendar/UI status: legacy no-shows stored as awaiting_payment + no_show_fee invoice."""
+        if obj.status == Appointment.Status.AWAITING_PAYMENT:
+            try:
+                if obj.invoice.kind == Invoice.Kind.NO_SHOW_FEE:
+                    return Appointment.Status.NO_SHOW
+            except Invoice.DoesNotExist:
+                pass
+        return obj.status
 
 
 class PublicBookingSerializer(serializers.Serializer):

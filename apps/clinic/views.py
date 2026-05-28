@@ -1454,6 +1454,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         qs = super().get_queryset()
         if self.action != "list":
             return qs
+        qs = qs.select_related("invoice")
         params = self.request.query_params
         if params.get("date_from"):
             try:
@@ -1515,7 +1516,17 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         data = serializer.validated_data
         waive_late_cancel = bool(data.pop("waive_late_cancel_fee", False))
 
-        if inst.status in (Appointment.Status.CANCELLED, Appointment.Status.NO_SHOW):
+        def _appointment_locked_as_no_show(appt: Appointment) -> bool:
+            if appt.status == Appointment.Status.NO_SHOW:
+                return True
+            if appt.status == Appointment.Status.AWAITING_PAYMENT:
+                try:
+                    return appt.invoice.kind == Invoice.Kind.NO_SHOW_FEE
+                except Invoice.DoesNotExist:
+                    return False
+            return False
+
+        if inst.status == Appointment.Status.CANCELLED or _appointment_locked_as_no_show(inst):
             allowed_terminal_fields = {"clinical_handoff_notes", "notes"}
             disallowed = set(data.keys()) - allowed_terminal_fields
             if disallowed:
@@ -1664,14 +1675,14 @@ class AppointmentViewSet(viewsets.ModelViewSet):
             if fee_amt > 0 and inst.status in (
                 Appointment.Status.BOOKED,
                 Appointment.Status.CHECKED_IN,
+                Appointment.Status.AWAITING_PAYMENT,
             ):
                 from .no_show_billing import apply_no_show_fee_for_appointment
 
                 with transaction.atomic():
                     locked = Appointment.objects.select_for_update().get(pk=inst.pk)
                     ctx = apply_no_show_fee_for_appointment(locked, fee_amt)
-                if ctx.get("use_awaiting_payment_instead"):
-                    data["status"] = Appointment.Status.AWAITING_PAYMENT
+                # Keep appointment status as no_show; unpaid no-show fee is on the penalty invoice.
                 if ctx.get("clear_checkin"):
                     data["checked_in_at"] = None
                     data["consultation_started_at"] = None
