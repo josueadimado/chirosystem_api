@@ -233,6 +233,7 @@ def _invoice_bill_dict(inv: Invoice, *, preview: bool) -> dict:
         **header,
         "bill_title": "Patient Bill — PREVIEW (not paid yet)" if preview else "Patient Bill",
         "is_preview": preview,
+        "invoice_id": inv.pk,
         "invoice_number": inv.invoice_number,
         "patient_id": pat.pk,
         "date_of_service": str(inv.appointment.appointment_date),
@@ -293,6 +294,53 @@ def _invoice_bill_access_ok_for_preview(inv: Invoice) -> bool:
 def _invoice_bill_preview_requested(request) -> bool:
     v = (request.query_params.get("preview") or "").strip().lower()
     return v in ("1", "true", "yes")
+
+
+def _invoice_for_bill_email(invoice_id):
+    return (
+        Invoice.objects.select_related("patient", "appointment__provider", "visit")
+        .prefetch_related("visit__rendered_services__service")
+        .filter(pk=invoice_id)
+        .first()
+    )
+
+
+def _email_patient_bill_response(request, *, provider=None):
+    """POST body: { invoice_id }. Emails paid bill to patient email on file."""
+    from apps.clinic.patient_bill_email import PatientBillEmailError, send_patient_bill_email
+
+    raw = request.data.get("invoice_id")
+    if raw is None:
+        return Response({"detail": "invoice_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        invoice_id = int(raw)
+    except (TypeError, ValueError):
+        return Response({"detail": "invoice_id must be a number."}, status=status.HTTP_400_BAD_REQUEST)
+
+    inv = _invoice_for_bill_email(invoice_id)
+    if not inv:
+        return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    if provider is not None:
+        if not inv.appointment_id or inv.appointment.provider_id != provider.id:
+            return Response(
+                {"detail": "You can only email bills for appointments on your schedule."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+    try:
+        bill = _invoice_bill_dict(inv, preview=False)
+        recipient = send_patient_bill_email(inv, bill)
+    except PatientBillEmailError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response(
+        {
+            "detail": f"Patient bill emailed to {recipient}.",
+            "recipient": recipient,
+        },
+        status=status.HTTP_200_OK,
+    )
 
 
 def _printable_invoice_line(rs, pos_default):
@@ -2906,6 +2954,11 @@ class AdminViewSet(viewsets.ViewSet):
             )
         return Response(_invoice_bill_dict(inv, preview=False))
 
+    @action(detail=False, methods=["post"], url_path="email-patient-bill")
+    def email_patient_bill(self, request):
+        """Email paid patient bill to the patient's email (owner/staff/doctor)."""
+        return _email_patient_bill_response(request)
+
     @action(detail=False, methods=["get"])
     def patients(self, request):
         """List all patients with directory stats and open invoice balance for admin."""
@@ -3372,6 +3425,14 @@ class DoctorViewSet(viewsets.ViewSet):
                 status=status.HTTP_409_CONFLICT,
             )
         return Response(_invoice_bill_dict(inv, preview=False))
+
+    @action(detail=False, methods=["post"], url_path="email-patient-bill")
+    def email_patient_bill(self, request):
+        """Email paid patient bill to the patient's email on file."""
+        provider = self._get_provider(request)
+        if not provider:
+            return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
+        return _email_patient_bill_response(request, provider=provider)
 
     @action(detail=False, methods=["get"], url_path="invoice_search")
     def invoice_search(self, request):

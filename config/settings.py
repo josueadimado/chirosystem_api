@@ -279,6 +279,10 @@ EMAIL_USE_TLS = os.environ.get("EMAIL_USE_TLS", "true").lower() in ("1", "true",
 EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "").strip()
 EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "").strip()
 DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "noreply@localhost").strip()
+# Patient bill / receipt emails (doctors & front desk after payment)
+PATIENT_BILL_FROM_EMAIL = os.environ.get(
+    "PATIENT_BILL_FROM_EMAIL", "reliefchiropracticmi@gmail.com"
+).strip() or "reliefchiropracticmi@gmail.com"
 SERVER_EMAIL = DEFAULT_FROM_EMAIL
 if EMAIL_HOST:
     EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
