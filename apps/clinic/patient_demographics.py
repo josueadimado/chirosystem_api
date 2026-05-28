@@ -71,21 +71,41 @@ def annotate_patient_list_stats(qs):
     )
 
 
+def _unpaid_invoice_total_subquery(*, kind: str | None):
+    """
+    Per-patient sum of unpaid invoice totals.
+
+    Uses a subquery so totals stay correct when combined with appointment/visit
+    counts on the same queryset (plain Sum() on invoice__ would multiply rows).
+    """
+    filters = {
+        "patient_id": OuterRef("pk"),
+        "status__in": _UNPAID_INVOICE_STATUSES,
+    }
+    if kind is not None:
+        filters["kind"] = kind
+    return (
+        Invoice.objects.filter(**filters)
+        .values("patient_id")
+        .annotate(_sum=Sum("total_amount"))
+        .values("_sum")[:1]
+    )
+
+
 def annotate_patient_unpaid_balances(qs):
     """Unpaid invoice totals by kind (issued + overdue) for admin patient directory filters."""
-    unpaid = Q(invoice__status__in=_UNPAID_INVOICE_STATUSES)
     zero = Value(Decimal("0.00"))
     return qs.annotate(
         balance_visit=Coalesce(
-            Sum("invoice__total_amount", filter=unpaid & Q(invoice__kind=Invoice.Kind.VISIT)),
+            Subquery(_unpaid_invoice_total_subquery(kind=Invoice.Kind.VISIT)),
             zero,
         ),
         balance_no_show_fee=Coalesce(
-            Sum("invoice__total_amount", filter=unpaid & Q(invoice__kind=Invoice.Kind.NO_SHOW_FEE)),
+            Subquery(_unpaid_invoice_total_subquery(kind=Invoice.Kind.NO_SHOW_FEE)),
             zero,
         ),
         balance_late_cancel_fee=Coalesce(
-            Sum("invoice__total_amount", filter=unpaid & Q(invoice__kind=Invoice.Kind.LATE_CANCEL_FEE)),
+            Subquery(_unpaid_invoice_total_subquery(kind=Invoice.Kind.LATE_CANCEL_FEE)),
             zero,
         ),
         has_overdue_invoice=Exists(
