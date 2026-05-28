@@ -574,7 +574,10 @@ def _save_appointment_handoff_notes(request):
         )
     appt.clinical_handoff_notes = notes
     appt.save(update_fields=["clinical_handoff_notes", "updated_at"])
-    return Response({"detail": "Saved.", "clinical_handoff_notes": appt.clinical_handoff_notes})
+    return Response({
+        "detail": "Reminders and handoff saved.",
+        "clinical_handoff_notes": appt.clinical_handoff_notes,
+    })
 
 
 class BookingOptionsViewSet(viewsets.ViewSet):
@@ -1505,6 +1508,14 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         if self.action == "book":
             return [permissions.AllowAny()]
         return super().get_permissions()
+
+    @action(detail=True, methods=["get"], url_path="prior_chart_notes")
+    def prior_chart_notes(self, request, pk=None):
+        """Earlier visits for this patient — handoff reminders and consultation SOAP notes."""
+        from .patient_prior_chart_notes import prior_chart_notes_for_appointment
+
+        appt = self.get_object()
+        return Response({"prior_visits": prior_chart_notes_for_appointment(appt)})
 
     def perform_create(self, serializer):
         appt = serializer.save()
@@ -4174,14 +4185,21 @@ class KioskViewSet(viewsets.ViewSet):
             .order_by("appointment_date", "start_time")
         )
 
-    @staticmethod
-    def _kiosk_appt_choice(appt: Appointment, *, can_checkin: bool, earliest_local: datetime | None = None) -> dict:
+    @classmethod
+    def _kiosk_appt_choice(
+        cls,
+        appt: Appointment,
+        *,
+        can_checkin: bool,
+        earliest_local: datetime | None = None,
+    ) -> dict:
         payload = {
             "appointment_id": appt.id,
             "patient": f"{appt.patient.first_name} {appt.patient.last_name}",
             "provider": str(appt.provider),
             "start_time_display": format_time_12h(appt.start_time),
             "can_checkin": can_checkin,
+            "early_checkin_minutes_before": cls._kiosk_minutes_before(),
         }
         if not can_checkin and earliest_local is not None:
             payload["earliest_checkin_display"] = format_time_12h(earliest_local.time())
@@ -4189,11 +4207,20 @@ class KioskViewSet(viewsets.ViewSet):
 
     @classmethod
     def _kiosk_minutes_before(cls) -> int:
-        v = getattr(settings, "KIOSK_EARLY_CHECKIN_MINUTES_BEFORE", 15)
+        v = getattr(settings, "KIOSK_EARLY_CHECKIN_MINUTES_BEFORE", 30)
         try:
             return max(0, int(v))
         except (TypeError, ValueError):
-            return 15
+            return 30
+
+    @staticmethod
+    def _desk_can_bypass_kiosk_early_window(request) -> bool:
+        """Logged-in admin/doctor/staff may check in from the schedule before the kiosk window opens."""
+        return bool(
+            request.user
+            and request.user.is_authenticated
+            and getattr(request.user, "role", None) in ("owner_admin", "doctor", "staff")
+        )
 
     @classmethod
     def _can_kiosk_checkin_now(cls, appt: Appointment):
@@ -4287,18 +4314,20 @@ class KioskViewSet(viewsets.ViewSet):
                         "status": appt.status,
                     }
                 )
+            minutes = self._kiosk_minutes_before()
             return Response(
                 {
                     "result": "too_early",
                     "message": (
-                        "You are here before your check-in window. Please wait until closer to your "
-                        "appointment time, or ask the front desk if you need help."
+                        f"You are here before your check-in window. Kiosk check-in opens up to "
+                        f"{minutes} minutes before your appointment, or ask the front desk if you need help."
                     ),
                     "appointment_id": appt.id,
                     "patient": choice["patient"],
                     "provider": choice["provider"],
                     "start_time_display": choice["start_time_display"],
                     "earliest_checkin_display": choice.get("earliest_checkin_display", ""),
+                    "early_checkin_minutes_before": minutes,
                 }
             )
 
@@ -4411,13 +4440,19 @@ class KioskViewSet(viewsets.ViewSet):
                 {"detail": "Check-in is already done or this visit is in progress."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        allowed, _, _ = self._can_kiosk_checkin_now(appt)
-        if not allowed:
+        allowed, _, earliest_local = self._can_kiosk_checkin_now(appt)
+        if not allowed and not (
+            not phone and self._desk_can_bypass_kiosk_early_window(request)
+        ):
+            minutes = self._kiosk_minutes_before()
+            earliest_disp = format_time_12h(earliest_local.time()) if earliest_local else ""
             return Response(
                 {
                     "detail": (
-                        "It is too early for check-in from this kiosk. Please wait until your scheduled time "
-                        "(or within the check-in window), or ask the front desk."
+                        f"It is too early for kiosk check-in. You can check in up to {minutes} minutes "
+                        f"before your appointment"
+                        + (f" (opens around {earliest_disp})" if earliest_disp else "")
+                        + ", or ask the front desk."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,

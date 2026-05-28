@@ -209,7 +209,10 @@ class Appointment(TimeStampedModel):
     clinical_handoff_notes = models.TextField(
         blank=True,
         default="",
-        help_text="Clinical or admin notes for future visits—visible to other doctors on this patient's chart.",
+        help_text=(
+            "Staff/doctor reminders for this visit (birthday, preferences, handoff to next provider). "
+            "Not the same as consultation SOAP notes on the Visit record."
+        ),
     )
     # Filled when each reminder channel was last sent for this appointment (nulled when date/time changes)
     day_before_reminder_sms_at = models.DateTimeField(null=True, blank=True)

@@ -334,7 +334,7 @@ class ProviderUnavailabilityBulkSerializer(serializers.Serializer):
 
 
 class AppointmentHandoffNotesSerializer(serializers.Serializer):
-    """Update persistent per-appointment chart / handoff notes (doctor on own appts, admin/staff any)."""
+    """Update visit reminders & handoff notes on the appointment (not consultation SOAP notes)."""
 
     appointment_id = serializers.IntegerField(min_value=1)
     clinical_handoff_notes = serializers.CharField(allow_blank=True, max_length=20000)

@@ -174,8 +174,8 @@ else:
 # To change clinic timezone for the app, use Admin → Settings (saved on ClinicSettings).
 # Restart Celery workers after changing CELERY_TIMEZONE in .env if you use env override.
 CELERY_TIMEZONE = CLINIC_TIMEZONE
-# Kiosk: earliest self-service check-in is this many minutes before the scheduled start (staff can complete check-in earlier in admin).
-KIOSK_EARLY_CHECKIN_MINUTES_BEFORE = int(os.getenv("KIOSK_EARLY_CHECKIN_MINUTES_BEFORE", "15"))
+# Kiosk: earliest patient self-service check-in on the appointment day (minutes before start). Staff desk check-in can be earlier.
+KIOSK_EARLY_CHECKIN_MINUTES_BEFORE = int(os.getenv("KIOSK_EARLY_CHECKIN_MINUTES_BEFORE", "30"))
 CELERY_BEAT_SCHEDULE = {
     "send-daily-appointment-sms-reminders": {
         "task": "apps.notifications.tasks.send_daily_appointment_reminders",
