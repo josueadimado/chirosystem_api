@@ -98,6 +98,7 @@ from .patient_demographics import (
     patient_account_summary,
     patient_demographics_summary,
 )
+from .patient_prior_diagnoses import consultation_diagnosis_prefill_for_appointment
 from .visit_diagnosis import diagnosis_ids_from_visit, serialize_visit_diagnoses
 from .provider_patient_access import (
     appointment_matches_provider_discipline,
@@ -1513,7 +1514,6 @@ class AppointmentViewSet(viewsets.ModelViewSet):
     def prior_chart_notes(self, request, pk=None):
         """Earlier visits for this patient — handoff reminders and consultation SOAP notes."""
         from .patient_prior_chart_notes import prior_chart_notes_for_appointment
-from .patient_prior_diagnoses import consultation_diagnosis_prefill_for_appointment
 
         appt = self.get_object()
         return Response({"prior_visits": prior_chart_notes_for_appointment(appt)})
