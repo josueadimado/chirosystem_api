@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import urllib.error
 import urllib.request
@@ -55,6 +56,57 @@ def get_kiosk_terminal_device_id() -> str:
     if raw:
         return raw
     return get_terminal_device_id()
+
+
+def _square_api_host() -> str:
+    env_raw = (
+        getattr(settings, "SQUARE_ENVIRONMENT", None) or os.environ.get("SQUARE_ENVIRONMENT", "sandbox") or "sandbox"
+    ).strip().lower()
+    return "https://connect.squareup.com" if env_raw == "production" else "https://connect.squareupsandbox.com"
+
+
+def square_api_json(method: str, path: str, body: dict | None = None) -> dict:
+    """Low-level Square REST call (same API version as admin health check)."""
+    token = (os.environ.get("SQUARE_ACCESS_TOKEN") or "").strip()
+    if not token:
+        raise RuntimeError("SQUARE_ACCESS_TOKEN is not set.")
+    url = f"{_square_api_host()}{path}"
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Square-Version": _SQUARE_API_VERSION,
+            "Content-Type": "application/json",
+        },
+        method=method.upper(),
+    )
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        return json.loads(resp.read().decode())
+
+
+def square_search_orders(
+    *,
+    location_ids: list[str],
+    reference_ids: list[str] | None = None,
+    customer_ids: list[str] | None = None,
+) -> list[dict]:
+    """Completed Square orders — used to find payments when reference_id is on the order, not the payment."""
+    if not location_ids:
+        return []
+    filt: dict = {"state_filter": {"states": ["COMPLETED"]}}
+    if reference_ids:
+        filt["reference_id_filter"] = {"reference_ids": [str(r)[:40] for r in reference_ids[:10]]}
+    if customer_ids:
+        filt["customer_filter"] = {"customer_ids": [str(c) for c in customer_ids[:1]]}
+    payload = {"location_ids": location_ids, "query": {"filter": filt}}
+    try:
+        res = square_api_json("POST", "/v2/orders/search", payload)
+    except Exception as exc:
+        logging.getLogger(__name__).debug("square_search_orders failed: %s", exc)
+        return []
+    return res.get("orders") or []
 
 
 def _square_locations_http_ping() -> tuple[bool, str | None, set[str]]:

@@ -120,6 +120,8 @@ from .square_payment import (
     get_terminal_checkout_status,
     try_push_terminal_checkout_to_kiosk,
     reconcile_open_invoices_for_patient,
+    staff_confirm_invoice_paid,
+    sync_invoice_payment_from_square,
     try_reconcile_invoice_from_square,
 )
 from .booking_availability import provider_interval_blocked_online
@@ -406,6 +408,63 @@ def _complete_visit_payload_from_validated(data: dict, rendered_payload: list) -
     else:
         payload["diagnosis"] = data.get("diagnosis", "")
     return payload
+
+
+def _parse_invoice_id_from_body(request) -> tuple[int | None, Response | None]:
+    raw = request.data.get("invoice_id")
+    if raw is None:
+        return None, Response({"detail": "invoice_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        return int(raw), None
+    except (TypeError, ValueError):
+        return None, Response({"detail": "Invalid invoice_id."}, status=status.HTTP_400_BAD_REQUEST)
+
+
+def _sync_invoice_payment_api_response(request) -> Response:
+    invoice_id, err = _parse_invoice_id_from_body(request)
+    if err:
+        return err
+    inv = Invoice.objects.filter(pk=invoice_id).select_related("appointment", "patient").first()
+    if not inv:
+        return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
+    return Response(sync_invoice_payment_from_square(inv))
+
+
+def _confirm_invoice_paid_api_response(request) -> Response:
+    """Staff: mark paid when Square app shows payment but automatic sync cannot match it."""
+    if getattr(request.user, "role", None) not in ("owner_admin", "staff"):
+        return Response(
+            {"detail": "Only clinic owner or staff can confirm a Square payment manually."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    invoice_id, err = _parse_invoice_id_from_body(request)
+    if err:
+        return err
+    inv = Invoice.objects.filter(pk=invoice_id).select_related("appointment", "patient").first()
+    if not inv:
+        return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
+    if inv.status == Invoice.Status.PAID:
+        return Response({"ok": True, "paid": True, "detail": "Invoice is already marked paid."})
+    confirm_no = (request.data.get("invoice_number") or "").strip()
+    if confirm_no and confirm_no != inv.invoice_number:
+        return Response(
+            {"detail": "Invoice number does not match. Open the correct bill and try again."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if not staff_confirm_invoice_paid(inv):
+        return Response({"detail": "Could not mark invoice paid."}, status=status.HTTP_409_CONFLICT)
+    inv.refresh_from_db()
+    if inv.appointment_id:
+        inv.appointment.refresh_from_db()
+    return Response(
+        {
+            "ok": True,
+            "paid": True,
+            "detail": "Marked paid — payment was verified in the Square app.",
+            "invoice_status": inv.status,
+            "appointment_status": inv.appointment.status,
+        }
+    )
 
 
 def _serialize_patient_appointment_history(request, appointments, *, force_read_only: bool = False):
@@ -3007,6 +3066,16 @@ class AdminViewSet(viewsets.ViewSet):
         """Email paid patient bill to the patient's email (owner/staff/doctor)."""
         return _email_patient_bill_response(request)
 
+    @action(detail=False, methods=["post"], url_path="sync-invoice-payment")
+    def sync_invoice_payment(self, request):
+        """Pull payment status from Square for a stuck awaiting-payment invoice."""
+        return _sync_invoice_payment_api_response(request)
+
+    @action(detail=False, methods=["post"], url_path="confirm-invoice-paid")
+    def confirm_invoice_paid(self, request):
+        """Mark invoice paid when staff verified payment in the Square app (sync could not match)."""
+        return _confirm_invoice_paid_api_response(request)
+
     @action(detail=False, methods=["get"])
     def patients(self, request):
         """List all patients with directory stats and open invoice balance for admin."""
@@ -3449,6 +3518,13 @@ class DoctorViewSet(viewsets.ViewSet):
             inv.refresh_from_db()
         paid = inv.status == Invoice.Status.PAID
         return Response({"paid": paid, "status": inv.status})
+
+    @action(detail=False, methods=["post"], url_path="sync-invoice-payment")
+    def sync_invoice_payment(self, request):
+        """Pull payment status from Square for a stuck awaiting-payment invoice."""
+        if not self._get_provider(request):
+            return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
+        return _sync_invoice_payment_api_response(request)
 
     @action(detail=False, methods=["get"], url_path="invoice_bill")
     def invoice_bill(self, request):

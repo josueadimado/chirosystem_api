@@ -19,6 +19,7 @@ from .square_helpers import (
     get_square_client,
     get_terminal_device_id,
     square_configured,
+    square_search_orders,
 )
 
 logger = logging.getLogger(__name__)
@@ -142,6 +143,45 @@ def _order_reference_matches_invoice(client, order_id: str | None, invoice_pk: i
         return False
 
 
+def _order_dict_matches_invoice(order: dict, invoice: Invoice) -> bool:
+    if _payment_reference_matches_invoice(order.get("reference_id"), invoice.pk):
+        return True
+    for li in order.get("line_items") or []:
+        if isinstance(li, dict) and _payment_note_matches_invoice(li.get("name"), invoice):
+            return True
+    return False
+
+
+def _payment_ids_from_order_dict(order: dict) -> list[str]:
+    ids: list[str] = []
+    for t in order.get("tenders") or []:
+        if not isinstance(t, dict):
+            continue
+        pid = t.get("payment_id")
+        if pid:
+            ids.append(str(pid).strip())
+    return ids
+
+
+def _payment_ids_from_order_obj(order) -> list[str]:
+    ids: list[str] = []
+    for t in getattr(order, "tenders", None) or []:
+        pid = getattr(t, "payment_id", None)
+        if pid:
+            ids.append(str(pid).strip())
+    return ids
+
+
+def _order_obj_matches_invoice(order, invoice: Invoice) -> bool:
+    if _payment_reference_matches_invoice(getattr(order, "reference_id", None), invoice.pk):
+        return True
+    for li in getattr(order, "line_items", None) or []:
+        name = getattr(li, "name", None) if not isinstance(li, dict) else li.get("name")
+        if _payment_note_matches_invoice(name, invoice):
+            return True
+    return False
+
+
 def _square_payment_matches_invoice(client, pay, invoice: Invoice) -> bool:
     if (getattr(pay, "status", None) or "").upper() != "COMPLETED":
         return False
@@ -153,6 +193,89 @@ def _square_payment_matches_invoice(client, pay, invoice: Invoice) -> bool:
     if order_id and _order_reference_matches_invoice(client, order_id, invoice.pk):
         return True
     return False
+
+
+def _payment_relaxed_cross_device_match(pay, invoice: Invoice, patient: Patient) -> bool:
+    """
+    Match a payment taken on another Square device (iPad, phone app, second reader) that may
+    not include our invoice reference — same patient, amount, and visit day only.
+    """
+    if (getattr(pay, "status", None) or "").upper() != "COMPLETED":
+        return False
+    amount_cents = _money_cents(invoice)
+    am = getattr(pay, "amount_money", None)
+    paid_cents = int(getattr(am, "amount", 0) or 0) if am else 0
+    if paid_cents < amount_cents:
+        return False
+    appt = invoice.appointment
+    if appt and appt.appointment_date:
+        created = str(getattr(pay, "created_at", None) or "")
+        if str(appt.appointment_date) not in created:
+            return False
+    cid = (patient.square_customer_id or "").strip()
+    pay_cid = (getattr(pay, "customer_id", None) or "").strip()
+    if cid and pay_cid == cid:
+        return True
+    note = (getattr(pay, "note", None) or "").lower()
+    fn = (patient.first_name or "").strip().lower()
+    ln = (patient.last_name or "").strip().lower()
+    if len(fn) >= 2 and len(ln) >= 2 and fn in note and ln in note:
+        return True
+    return False
+
+
+def _order_relaxed_cross_device_match(order: dict, invoice: Invoice, patient: Patient) -> bool:
+    if _order_dict_matches_invoice(order, invoice):
+        return True
+    total = order.get("total_money") or {}
+    order_cents = total.get("amount") if isinstance(total, dict) else None
+    if not isinstance(order_cents, int) or order_cents < _money_cents(invoice):
+        return False
+    created = str(order.get("created_at") or "")
+    appt = invoice.appointment
+    if appt and appt.appointment_date and str(appt.appointment_date) not in created:
+        return False
+    fn = (patient.first_name or "").strip().lower()
+    ln = (patient.last_name or "").strip().lower()
+    if len(fn) < 2 or len(ln) < 2:
+        return False
+    for li in order.get("line_items") or []:
+        if not isinstance(li, dict):
+            continue
+        name = (li.get("name") or "").lower()
+        if fn in name and ln in name:
+            return True
+    return False
+
+
+def _iter_terminal_checkouts(
+    client,
+    *,
+    reference_ids: list[str] | None = None,
+    statuses: tuple[str, ...] = ("COMPLETED",),
+    max_pages: int = 10,
+):
+    """All Terminal checkouts at the business — any paired device, not only our kiosk."""
+    from square.requests.search_terminal_checkouts_request import SearchTerminalCheckoutsRequest
+    from square.requests.terminal_checkout_filter import TerminalCheckoutFilterParams
+    from square.requests.terminal_checkout_query import TerminalCheckoutQueryParams
+
+    cursor = None
+    for _ in range(max_pages):
+        filt_kwargs: dict = {"statuses": list(statuses)}
+        if reference_ids:
+            filt_kwargs["reference_ids"] = reference_ids
+        body = SearchTerminalCheckoutsRequest(
+            query=TerminalCheckoutQueryParams(filter=TerminalCheckoutFilterParams(**filt_kwargs)),
+            cursor=cursor,
+        )
+        res = client.terminal.checkouts.search(body=body)
+        checkouts = getattr(res, "checkouts", None) or []
+        for co in checkouts:
+            yield co
+        cursor = getattr(res, "cursor", None)
+        if not cursor:
+            break
 
 
 def _iter_square_payments(client, *, begin_str: str, loc: str | None, amount_cents: int | None, max_pages: int = 8):
@@ -176,6 +299,64 @@ def _iter_square_payments(client, *, begin_str: str, loc: str | None, amount_cen
         cursor = getattr(res, "cursor", None)
         if not cursor:
             break
+
+
+def staff_confirm_invoice_paid(invoice: Invoice) -> bool:
+    """
+    Record payment when staff verified paid in the Square app but automatic sync could not
+    match the payment (missing reference / note in Square API).
+    """
+    ref = f"staff_confirm:{invoice.id}:{int(timezone.now().timestamp())}"[:120]
+    return mark_invoice_paid_from_square(invoice, ref)
+
+
+def sync_invoice_payment_from_square(invoice: Invoice | int) -> dict:
+    """Force Square reconcile; returns status for UI."""
+    if isinstance(invoice, int):
+        inv = Invoice.objects.filter(pk=invoice).select_related("appointment", "patient").first()
+    else:
+        inv = Invoice.objects.filter(pk=invoice.pk).select_related("appointment", "patient").first()
+    if not inv:
+        return {"ok": False, "paid": False, "detail": "Invoice not found."}
+    if inv.status == Invoice.Status.PAID:
+        return {
+            "ok": True,
+            "paid": True,
+            "detail": "Invoice is already marked paid.",
+            "invoice_status": inv.status,
+            "appointment_status": inv.appointment.status if inv.appointment_id else None,
+        }
+    if not square_configured():
+        return {
+            "ok": False,
+            "paid": False,
+            "detail": "Square is not configured on the server (missing SQUARE_ACCESS_TOKEN).",
+            "invoice_status": inv.status,
+        }
+    before = inv.status
+    try_reconcile_invoice_from_square(inv)
+    inv.refresh_from_db()
+    if inv.appointment_id:
+        inv.appointment.refresh_from_db()
+    paid = inv.status == Invoice.Status.PAID
+    if paid:
+        detail = "Payment found in Square and recorded."
+    elif before == inv.status:
+        detail = (
+            "Square did not return a matching payment for this invoice yet "
+            "(we checked all devices at your clinic location: readers, iPad, Square app, etc.). "
+            "If the Square app shows paid, use “Mark paid (verified in Square)” or check sandbox vs production mode."
+        )
+    else:
+        detail = f"Invoice status is now {inv.status}."
+    return {
+        "ok": paid,
+        "paid": paid,
+        "detail": detail,
+        "invoice_status": inv.status,
+        "appointment_status": inv.appointment.status if inv.appointment_id else None,
+        "square_configured": True,
+    }
 
 
 def reconcile_open_invoices_for_patient(patient: Patient | int) -> int:
@@ -227,40 +408,52 @@ def try_reconcile_invoice_from_square(invoice: Invoice | int) -> bool:
     loc = get_location_id()
     amount_cents = _money_cents(inv)
     client = get_square_client()
+    appt_date = inv.appointment.appointment_date if inv.appointment_id else None
+
+    if loc:
+        try:
+            for order in square_search_orders(location_ids=[loc], reference_ids=[ref]):
+                if not _order_dict_matches_invoice(order, inv):
+                    continue
+                for pid in _payment_ids_from_order_dict(order):
+                    if mark_invoice_paid_from_square(inv, pid):
+                        logger.info("Reconciled invoice %s from Square order %s", inv.pk, order.get("id"))
+                        return True
+            patient = inv.patient
+            cid = (patient.square_customer_id or "").strip() if patient else ""
+            if cid:
+                order_candidates: list[dict] = []
+                for order in square_search_orders(location_ids=[loc], customer_ids=[cid]):
+                    if _order_dict_matches_invoice(order, inv):
+                        for pid in _payment_ids_from_order_dict(order):
+                            if mark_invoice_paid_from_square(inv, pid):
+                                logger.info(
+                                    "Reconciled invoice %s from customer order %s",
+                                    inv.pk,
+                                    order.get("id"),
+                                )
+                                return True
+                    if patient and _order_relaxed_cross_device_match(order, inv, patient):
+                        order_candidates.append(order)
+                if patient and len(order_candidates) == 1:
+                    for pid in _payment_ids_from_order_dict(order_candidates[0]):
+                        if mark_invoice_paid_from_square(inv, pid):
+                            logger.info(
+                                "Reconciled invoice %s from cross-device order %s",
+                                inv.pk,
+                                order_candidates[0].get("id"),
+                            )
+                            return True
+        except Exception as exc:
+            logger.debug("Square orders search for invoice %s: %s", inv.pk, exc)
 
     try:
-        from square.requests.search_terminal_checkouts_request import SearchTerminalCheckoutsRequest
-        from square.requests.terminal_checkout_filter import TerminalCheckoutFilterParams
-        from square.requests.terminal_checkout_query import TerminalCheckoutQueryParams
-
-        search_res = client.terminal.checkouts.search(
-            body=SearchTerminalCheckoutsRequest(
-                query=TerminalCheckoutQueryParams(
-                    filter=TerminalCheckoutFilterParams(
-                        reference_ids=[ref],
-                        statuses=["COMPLETED"],
-                    )
-                )
-            )
-        )
-        checkouts = getattr(search_res, "checkouts", None) or []
-        for co in checkouts:
-            st = (getattr(co, "status", None) or "").upper()
-            if st != "COMPLETED":
-                continue
+        for co in _iter_terminal_checkouts(client, reference_ids=[ref]):
             payment_ids = getattr(co, "payment_ids", None) or []
-            if payment_ids:
-                if mark_invoice_paid_from_square(inv, payment_ids[0]):
-                    logger.info("Reconciled invoice %s from completed Terminal checkout %s", inv.pk, co.id)
-                    return True
-        wide_res = client.terminal.checkouts.search(
-            body=SearchTerminalCheckoutsRequest(
-                query=TerminalCheckoutQueryParams(
-                    filter=TerminalCheckoutFilterParams(statuses=["COMPLETED"])
-                )
-            )
-        )
-        for co in getattr(wide_res, "checkouts", None) or []:
+            if payment_ids and mark_invoice_paid_from_square(inv, payment_ids[0]):
+                logger.info("Reconciled invoice %s from completed Terminal checkout %s", inv.pk, co.id)
+                return True
+        for co in _iter_terminal_checkouts(client, reference_ids=None):
             note = getattr(co, "note", None) or ""
             checkout_ref = getattr(co, "reference_id", None)
             if not _payment_note_matches_invoice(note, inv) and not _payment_reference_matches_invoice(
@@ -270,7 +463,7 @@ def try_reconcile_invoice_from_square(invoice: Invoice | int) -> bool:
             payment_ids = getattr(co, "payment_ids", None) or []
             if payment_ids and mark_invoice_paid_from_square(inv, payment_ids[0]):
                 logger.info(
-                    "Reconciled invoice %s from Terminal checkout %s (note/reference match)",
+                    "Reconciled invoice %s from Terminal checkout %s on another device",
                     inv.pk,
                     co.id,
                 )
@@ -278,29 +471,100 @@ def try_reconcile_invoice_from_square(invoice: Invoice | int) -> bool:
     except Exception as exc:
         logger.debug("Terminal checkout search for invoice %s: %s", inv.pk, exc)
 
+    patient = inv.patient
+    cid = (patient.square_customer_id or "").strip() if patient else ""
+    if cid and amount_cents >= _MIN_AMOUNT_CENTS:
+        try:
+            begin = (inv.created_at or timezone.now()) - timedelta(days=7)
+            begin_str = begin.strftime("%Y-%m-%dT%H:%M:%SZ")
+            cursor = None
+            candidates: list = []
+            for _ in range(6):
+                list_kwargs: dict = {
+                    "begin_time": begin_str,
+                    "sort_order": "DESC",
+                    "limit": 100,
+                    "customer_id": cid,
+                }
+                if loc:
+                    list_kwargs["location_id"] = loc
+                if cursor:
+                    list_kwargs["cursor"] = cursor
+                res = client.payments.list(**list_kwargs)
+                payments = getattr(res, "payments", None) or []
+                for pay in payments:
+                    if (getattr(pay, "status", None) or "").upper() != "COMPLETED":
+                        continue
+                    am = getattr(pay, "amount_money", None)
+                    paid_cents = int(getattr(am, "amount", 0) or 0) if am else 0
+                    if paid_cents < amount_cents:
+                        continue
+                    if _square_payment_matches_invoice(client, pay, inv):
+                        pid = getattr(pay, "id", None)
+                        if pid and mark_invoice_paid_from_square(inv, pid):
+                            logger.info("Reconciled invoice %s from customer payment %s", inv.pk, pid)
+                            return True
+                    if appt_date and paid_cents == amount_cents:
+                        created = getattr(pay, "created_at", None) or ""
+                        if created and str(appt_date) in str(created):
+                            candidates.append(pay)
+                    elif patient and _payment_relaxed_cross_device_match(pay, inv, patient):
+                        candidates.append(pay)
+                cursor = getattr(res, "cursor", None)
+                if not cursor:
+                    break
+            if len(candidates) == 1:
+                pid = getattr(candidates[0], "id", None)
+                if pid and mark_invoice_paid_from_square(inv, pid):
+                    logger.info(
+                        "Reconciled invoice %s from sole customer payment on visit date %s (any device)",
+                        inv.pk,
+                        appt_date,
+                    )
+                    return True
+        except Exception as exc:
+            logger.debug("Square customer payment reconcile for invoice %s: %s", inv.pk, exc)
+
     try:
-        begin = (inv.created_at or timezone.now()) - timedelta(hours=72)
+        begin = (inv.created_at or timezone.now()) - timedelta(days=7)
         begin_str = begin.strftime("%Y-%m-%dT%H:%M:%SZ")
         amount_filter = amount_cents if amount_cents >= _MIN_AMOUNT_CENTS else None
+        cross_device_candidates: list = []
         for pay in _iter_square_payments(client, begin_str=begin_str, loc=loc, amount_cents=amount_filter):
-            if not _square_payment_matches_invoice(client, pay, inv):
-                continue
-            pid = getattr(pay, "id", None)
+            if _square_payment_matches_invoice(client, pay, inv):
+                pid = getattr(pay, "id", None)
+                if pid and mark_invoice_paid_from_square(inv, pid):
+                    logger.info("Reconciled invoice %s from Square payment %s", inv.pk, pid)
+                    return True
+            if patient and _payment_relaxed_cross_device_match(pay, inv, patient):
+                cross_device_candidates.append(pay)
+        if patient and len(cross_device_candidates) == 1:
+            pid = getattr(cross_device_candidates[0], "id", None)
             if pid and mark_invoice_paid_from_square(inv, pid):
-                logger.info("Reconciled invoice %s from Square payment %s", inv.pk, pid)
+                logger.info("Reconciled invoice %s from cross-device payment %s", inv.pk, pid)
                 return True
         if amount_filter is not None:
             for pay in _iter_square_payments(client, begin_str=begin_str, loc=loc, amount_cents=None, max_pages=4):
-                if not _square_payment_matches_invoice(client, pay, inv):
-                    continue
-                pid = getattr(pay, "id", None)
-                if pid and mark_invoice_paid_from_square(inv, pid):
-                    logger.info(
-                        "Reconciled invoice %s from Square payment %s (note/order match, no amount filter)",
-                        inv.pk,
-                        pid,
-                    )
-                    return True
+                if _square_payment_matches_invoice(client, pay, inv):
+                    pid = getattr(pay, "id", None)
+                    if pid and mark_invoice_paid_from_square(inv, pid):
+                        logger.info(
+                            "Reconciled invoice %s from Square payment %s (note/order match, no amount filter)",
+                            inv.pk,
+                            pid,
+                        )
+                        return True
+        if loc:
+            for pay in _iter_square_payments(client, begin_str=begin_str, loc=None, amount_cents=amount_filter, max_pages=3):
+                if _square_payment_matches_invoice(client, pay, inv):
+                    pid = getattr(pay, "id", None)
+                    if pid and mark_invoice_paid_from_square(inv, pid):
+                        logger.info(
+                            "Reconciled invoice %s from Square payment %s (no location filter)",
+                            inv.pk,
+                            pid,
+                        )
+                        return True
     except Exception as exc:
         logger.warning("Square payment list reconcile failed for invoice %s: %s", inv.pk, exc)
 
