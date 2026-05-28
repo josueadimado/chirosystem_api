@@ -1515,6 +1515,21 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         data = serializer.validated_data
         waive_late_cancel = bool(data.pop("waive_late_cancel_fee", False))
 
+        if inst.status in (Appointment.Status.CANCELLED, Appointment.Status.NO_SHOW):
+            allowed_terminal_fields = {"clinical_handoff_notes", "notes"}
+            disallowed = set(data.keys()) - allowed_terminal_fields
+            if disallowed:
+                label = "cancelled" if inst.status == Appointment.Status.CANCELLED else "no-show"
+                raise ValidationError(
+                    {
+                        "detail": (
+                            f"This appointment is marked {label}. "
+                            "Check-in, extend period, and reschedule are not available. "
+                            "Book a new visit instead."
+                        )
+                    }
+                )
+
         if role == "doctor":
             prov = Provider.objects.filter(user=user).first()
             if not prov or inst.provider_id != prov.id:
