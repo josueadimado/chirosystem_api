@@ -20,6 +20,7 @@ from rest_framework.response import Response
 from .models import (
     Appointment,
     ClinicSettings,
+    DiagnosisCode,
     Invoice,
     Patient,
     PatientCreditTransaction,
@@ -65,6 +66,7 @@ from .serializers import (
     ProviderSerializer,
     ProviderUnavailabilityBulkSerializer,
     ProviderUnavailabilitySerializer,
+    DiagnosisCodeSerializer,
     ServiceSerializer,
     StaffNotificationSerializer,
     VisitCompleteSerializer,
@@ -95,6 +97,7 @@ from .patient_demographics import (
     apply_patient_directory_list_filter,
     patient_demographics_summary,
 )
+from .visit_diagnosis import diagnosis_ids_from_visit, serialize_visit_diagnoses
 from .provider_patient_access import (
     appointment_matches_provider_discipline,
     clinical_access_level,
@@ -381,6 +384,28 @@ def _can_edit_handoff_notes(request, appointment: Appointment, *, force_read_onl
     return False
 
 
+def _visit_billing_diagnosis_payload(visit: Visit) -> dict:
+    return {
+        "diagnosis": visit.diagnosis or "",
+        "diagnoses": serialize_visit_diagnoses(visit),
+        "diagnosis_ids": diagnosis_ids_from_visit(visit),
+    }
+
+
+def _complete_visit_payload_from_validated(data: dict, rendered_payload: list) -> dict:
+    payload = {
+        "doctor_notes": data.get("doctor_notes", ""),
+        "rendered_services": rendered_payload,
+        "professional_discount": str(data.get("professional_discount", Decimal("0"))),
+        "professional_discount_reason": data.get("professional_discount_reason", ""),
+    }
+    if "diagnosis_ids" in data:
+        payload["diagnosis_ids"] = data["diagnosis_ids"]
+    else:
+        payload["diagnosis"] = data.get("diagnosis", "")
+    return payload
+
+
 def _serialize_patient_appointment_history(request, appointments, *, force_read_only: bool = False):
     """Build chart rows for patient_detail (visits, billing lines, handoff notes)."""
     appt_list = list(appointments)
@@ -391,7 +416,8 @@ def _serialize_patient_appointment_history(request, appointments, *, force_read_
         Prefetch(
             "rendered_services",
             queryset=VisitRenderedService.objects.select_related("service"),
-        )
+        ),
+        "visit_diagnoses",
     )
     visits_by_aid = {v.appointment_id: v for v in visits}
     invoices_by_aid = {i.appointment_id: i for i in Invoice.objects.filter(appointment_id__in=ids)}
@@ -420,6 +446,8 @@ def _serialize_patient_appointment_history(request, appointments, *, force_read_
                 "reason_for_visit": v.reason_for_visit or "",
                 "doctor_notes": v.doctor_notes or "",
                 "diagnosis": v.diagnosis or "",
+                "diagnoses": serialize_visit_diagnoses(v),
+                "diagnosis_ids": [d["id"] for d in serialize_visit_diagnoses(v) if d.get("id")],
                 "completed_at": v.completed_at.isoformat() if v.completed_at else None,
                 "rendered_services": lines,
             }
@@ -1321,6 +1349,26 @@ class ServiceViewSet(viewsets.ModelViewSet):
             )
             return qs.filter(visibility | Q(pk__in=list(booked_ids))).order_by("name").distinct()
         return qs
+
+
+class DiagnosisCodeViewSet(viewsets.ModelViewSet):
+    """Clinic diagnosis catalog — admin/staff maintain; doctors read active codes during consultations."""
+
+    queryset = DiagnosisCode.objects.all().order_by("code")
+    serializer_class = DiagnosisCodeSerializer
+    permission_classes = [IsOwnerOrDoctor]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        role = getattr(self.request.user, "role", None)
+        if role == "doctor":
+            return qs.filter(is_active=True)
+        return qs
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsOwnerOrDoctor()]
+        return [IsStaffOrOwnerAdmin()]
 
 
 class AppointmentViewSet(viewsets.ModelViewSet):
@@ -2820,7 +2868,8 @@ class AdminViewSet(viewsets.ViewSet):
                 Prefetch(
                     "rendered_services",
                     queryset=VisitRenderedService.objects.select_related("service").order_by("id"),
-                )
+                ),
+                "visit_diagnoses",
             )
             .first()
         )
@@ -2846,7 +2895,7 @@ class AdminViewSet(viewsets.ViewSet):
         ]
         return Response({
             "doctor_notes": visit.doctor_notes or "",
-            "diagnosis": visit.diagnosis or "",
+            **_visit_billing_diagnosis_payload(visit),
             "rendered_services": rendered,
             "invoice_id": invoice.id,
             "invoice_number": invoice.invoice_number,
@@ -2902,13 +2951,7 @@ class AdminViewSet(viewsets.ViewSet):
                     "unit_price": str(unit),
                 }
             )
-        payload = {
-            "doctor_notes": data.get("doctor_notes", ""),
-            "diagnosis": data.get("diagnosis", ""),
-            "rendered_services": rendered_payload,
-            "professional_discount": str(data.get("professional_discount", Decimal("0"))),
-            "professional_discount_reason": data.get("professional_discount_reason", ""),
-        }
+        payload = _complete_visit_payload_from_validated(data, rendered_payload)
         try:
             invoice = revise_unpaid_visit_billing(visit, payload)
         except ValueError as exc:
@@ -3362,9 +3405,7 @@ class DoctorViewSet(viewsets.ViewSet):
         data.pop("online_chiro_intake_waived", None)
         data.pop("date_established", None)
         data.pop("sms_consent", None)
-        for key in ("first_name", "last_name", "phone", "email"):
-            data.pop(key, None)
-        err = apply_patient_intake_validated_data(patient, data, allow_identity_fields=False)
+        err = apply_patient_intake_validated_data(patient, data, allow_identity_fields=True)
         if err:
             return Response({"detail": err}, status=status.HTTP_400_BAD_REQUEST)
         patient.save()
@@ -3544,13 +3585,7 @@ class DoctorViewSet(viewsets.ViewSet):
                     "unit_price": str(unit),
                 }
             )
-        payload = {
-            "doctor_notes": data.get("doctor_notes", ""),
-            "diagnosis": data.get("diagnosis", ""),
-            "rendered_services": rendered_payload,
-            "professional_discount": str(data.get("professional_discount", Decimal("0"))),
-            "professional_discount_reason": data.get("professional_discount_reason", ""),
-        }
+        payload = _complete_visit_payload_from_validated(data, rendered_payload)
         invoice = complete_visit_with_services(visit, payload)
         visit.appointment.status = Appointment.Status.AWAITING_PAYMENT
         visit.appointment.completed_at = timezone.now()
@@ -3586,7 +3621,8 @@ class DoctorViewSet(viewsets.ViewSet):
                 Prefetch(
                     "rendered_services",
                     queryset=VisitRenderedService.objects.select_related("service").order_by("id"),
-                )
+                ),
+                "visit_diagnoses",
             )
             .first()
         )
@@ -3613,7 +3649,7 @@ class DoctorViewSet(viewsets.ViewSet):
         return Response(
             {
                 "doctor_notes": visit.doctor_notes or "",
-                "diagnosis": visit.diagnosis or "",
+                **_visit_billing_diagnosis_payload(visit),
                 "rendered_services": rendered,
                 "invoice_id": invoice.id,
                 "invoice_number": invoice.invoice_number,
@@ -3661,13 +3697,7 @@ class DoctorViewSet(viewsets.ViewSet):
                     "unit_price": str(unit),
                 }
             )
-        payload = {
-            "doctor_notes": data.get("doctor_notes", ""),
-            "diagnosis": data.get("diagnosis", ""),
-            "rendered_services": rendered_payload,
-            "professional_discount": str(data.get("professional_discount", Decimal("0"))),
-            "professional_discount_reason": data.get("professional_discount_reason", ""),
-        }
+        payload = _complete_visit_payload_from_validated(data, rendered_payload)
         try:
             invoice = revise_unpaid_visit_billing(visit, payload)
         except ValueError as exc:

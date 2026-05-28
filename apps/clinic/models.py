@@ -265,8 +265,48 @@ class Visit(TimeStampedModel):
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.OPEN)
     reason_for_visit = models.TextField(blank=True)
     doctor_notes = models.TextField(blank=True)
-    diagnosis = models.TextField(blank=True)
+    diagnosis = models.TextField(
+        blank=True,
+        help_text="Formatted diagnosis lines for bills and chart (synced from visit_diagnoses when using the catalog).",
+    )
     completed_at = models.DateTimeField(null=True, blank=True)
+
+
+class DiagnosisCode(TimeStampedModel):
+    """Clinic diagnosis catalog — code + description (admin-maintained, chosen during consultations)."""
+
+    code = models.CharField(max_length=32, unique=True)
+    description = models.CharField(max_length=500)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["code"]
+        verbose_name = "Diagnosis code"
+        verbose_name_plural = "Diagnosis codes"
+
+    def __str__(self) -> str:
+        return f"{self.code} — {self.description}"
+
+
+class VisitDiagnosis(TimeStampedModel):
+    """Diagnoses selected for a visit (snapshots code/description for history if catalog entry changes)."""
+
+    visit = models.ForeignKey(Visit, on_delete=models.CASCADE, related_name="visit_diagnoses")
+    diagnosis = models.ForeignKey(
+        DiagnosisCode,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="visit_rows",
+    )
+    code = models.CharField(max_length=32)
+    description = models.CharField(max_length=500)
+
+    class Meta:
+        ordering = ["id"]
+
+    def __str__(self) -> str:
+        return f"{self.code} — {self.description}"
 
 
 class VisitRenderedService(TimeStampedModel):

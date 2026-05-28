@@ -9,6 +9,7 @@ from .patient_phone import duplicate_patient_message, find_duplicate_patient
 from .utils import validate_phone
 from .models import (
     Appointment,
+    DiagnosisCode,
     Invoice,
     Patient,
     PatientCreditTransaction,
@@ -21,6 +22,7 @@ from .models import (
     VisitRenderedService,
     VoiceCallLog,
 )
+from .visit_diagnosis import update_visit_diagnosis_fields
 
 User = get_user_model()
 
@@ -236,6 +238,12 @@ class ProviderSerializer(serializers.ModelSerializer):
 class ServiceSerializer(serializers.ModelSerializer):
     class Meta:
         model = Service
+        fields = "__all__"
+
+
+class DiagnosisCodeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DiagnosisCode
         fields = "__all__"
 
 
@@ -576,6 +584,11 @@ class DoctorCompleteVisitSerializer(serializers.Serializer):
 
     doctor_notes = serializers.CharField(required=False, allow_blank=True, default="")
     diagnosis = serializers.CharField(required=False, allow_blank=True, default="")
+    diagnosis_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        required=False,
+        allow_empty=True,
+    )
     rendered_services = serializers.ListField(child=serializers.DictField(), allow_empty=False)
     professional_discount = serializers.DecimalField(
         max_digits=10,
@@ -591,6 +604,19 @@ class DoctorCompleteVisitSerializer(serializers.Serializer):
         default="",
     )
     charge_saved_card_if_present = serializers.BooleanField(default=True)
+
+    def validate_diagnosis_ids(self, value):
+        if not value:
+            return value
+        found = set(
+            DiagnosisCode.objects.filter(pk__in=value, is_active=True).values_list("pk", flat=True)
+        )
+        missing = sorted(set(value) - found)
+        if missing:
+            raise serializers.ValidationError(
+                f"Invalid or inactive diagnosis id(s): {', '.join(str(i) for i in missing)}."
+            )
+        return value
 
     def validate_rendered_services(self, value):
         if not value:
@@ -729,9 +755,10 @@ class PatientCreditTransactionSerializer(serializers.ModelSerializer):
 def complete_visit_with_services(visit: Visit, payload: dict) -> Invoice:
     visit.doctor_notes = payload.get("doctor_notes", "")
     update_fields = ["doctor_notes", "status", "completed_at", "updated_at"]
-    if "diagnosis" in payload:
-        visit.diagnosis = payload.get("diagnosis", "") or ""
-        update_fields.insert(1, "diagnosis")
+    diag_fields = update_visit_diagnosis_fields(visit, payload)
+    for f in diag_fields:
+        if f not in update_fields:
+            update_fields.insert(1, f)
     visit.status = Visit.Status.COMPLETED
     visit.completed_at = timezone.now()
     visit.save(update_fields=update_fields)
@@ -811,9 +838,9 @@ def revise_unpaid_visit_billing(visit: Visit, payload: dict) -> Invoice:
     with transaction.atomic():
         visit.doctor_notes = payload.get("doctor_notes", "")
         update_fields = ["doctor_notes", "updated_at"]
-        if "diagnosis" in payload:
-            visit.diagnosis = payload.get("diagnosis", "") or ""
-            update_fields.insert(1, "diagnosis")
+        for f in update_visit_diagnosis_fields(visit, payload):
+            if f not in update_fields:
+                update_fields.insert(1, f)
         visit.save(update_fields=update_fields)
 
         subtotal = Decimal("0")

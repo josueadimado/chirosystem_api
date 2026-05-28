@@ -21,6 +21,7 @@ from apps.clinic.views import (
     PaymentViewSet,
     ProviderUnavailabilityViewSet,
     ProviderViewSet,
+    DiagnosisCodeViewSet,
     ServiceViewSet,
     StaffNotificationViewSet,
     VisitViewSet,
@@ -39,6 +40,7 @@ router.register(
     basename="provider-unavailability",
 )
 router.register("services", ServiceViewSet, basename="services")
+router.register("diagnoses", DiagnosisCodeViewSet, basename="diagnoses")
 router.register("appointments", AppointmentViewSet, basename="appointments")
 router.register("visits", VisitViewSet, basename="visits")
 router.register("invoices", InvoiceViewSet, basename="invoices")
