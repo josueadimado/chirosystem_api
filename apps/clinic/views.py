@@ -3598,7 +3598,9 @@ class DoctorViewSet(viewsets.ViewSet):
         followup.pop("already_paid", None)
         invoice.refresh_from_db()
         if invoice.status != Invoice.Status.PAID:
-            try_push_terminal_checkout_to_kiosk(invoice)
+            terminal_checkout_id = try_push_terminal_checkout_to_kiosk(invoice)
+            if terminal_checkout_id:
+                followup["terminal_checkout_id"] = terminal_checkout_id
         return Response(followup)
 
     @action(detail=True, methods=["get"], url_path="billing_for_edit")
@@ -3710,7 +3712,9 @@ class DoctorViewSet(viewsets.ViewSet):
         followup.pop("already_paid", None)
         invoice.refresh_from_db()
         if invoice.status != Invoice.Status.PAID:
-            try_push_terminal_checkout_to_kiosk(invoice)
+            terminal_checkout_id = try_push_terminal_checkout_to_kiosk(invoice)
+            if terminal_checkout_id:
+                followup["terminal_checkout_id"] = terminal_checkout_id
         return Response(followup)
 
     @action(detail=False, methods=["post"], url_path="prepare_invoice_payment")
