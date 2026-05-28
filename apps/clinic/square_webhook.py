@@ -17,6 +17,7 @@ from django.views.decorators.http import require_POST
 from .models import Invoice
 from .square_payment import (
     apply_credit_topup_from_square_payment,
+    invoice_open_for_square_settlement,
     mark_invoice_paid_from_square,
     parse_credit_topup_reference,
 )
@@ -99,7 +100,7 @@ def _handle_payment_object(payment: dict) -> None:
     inv_id = _invoice_id_from_reference(payment.get("reference_id"))
     if not inv_id:
         return
-    inv = Invoice.objects.filter(pk=inv_id, status=Invoice.Status.ISSUED).first()
+    inv = invoice_open_for_square_settlement(inv_id)
     if inv:
         mark_invoice_paid_from_square(inv, pid)
 
@@ -116,7 +117,7 @@ def _handle_terminal_checkout_object(checkout: dict) -> None:
     inv_id = _invoice_id_from_reference(checkout.get("reference_id"))
     if not inv_id:
         return
-    inv = Invoice.objects.filter(pk=inv_id, status=Invoice.Status.ISSUED).first()
+    inv = invoice_open_for_square_settlement(inv_id)
     if inv:
         mark_invoice_paid_from_square(inv, pid)
 

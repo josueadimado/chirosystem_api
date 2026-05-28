@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
+from datetime import timedelta
 from decimal import Decimal
 
 from django.db import transaction
@@ -25,6 +26,16 @@ logger = logging.getLogger(__name__)
 # Square card payments are typically >= 100 cents in production; keep a small floor for dev.
 _MIN_AMOUNT_CENTS = 100
 _CREDIT_TOPUP_REF_PREFIX = "ct_"
+_OPEN_INVOICE_STATUSES = (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT)
+
+
+def invoice_open_for_square_settlement(invoice_id: int) -> Invoice | None:
+    """Invoice still expecting payment — used by webhooks, polling, and Square reconcile."""
+    return (
+        Invoice.objects.filter(pk=invoice_id, status__in=_OPEN_INVOICE_STATUSES)
+        .select_related("appointment", "patient")
+        .first()
+    )
 
 
 def mark_invoice_paid_from_square(invoice: Invoice, square_payment_id: str) -> bool:
@@ -91,6 +102,110 @@ def mark_invoice_paid_from_square(invoice: Invoice, square_payment_id: str) -> b
             appt.save(update_fields=["status", "completed_at", "updated_at"])
 
     return True
+
+
+def _payment_reference_matches_invoice(payment_ref: str | None, invoice_pk: int) -> bool:
+    ref = (payment_ref or "").strip()
+    if not ref:
+        return False
+    if ref == str(invoice_pk):
+        return True
+    if ref.isdigit() and int(ref) == invoice_pk:
+        return True
+    return False
+
+
+def try_reconcile_invoice_from_square(invoice: Invoice | int) -> bool:
+    """
+    If Square already captured payment for this invoice (Terminal / webhook delay),
+    mark the invoice and appointment paid locally. Safe to call repeatedly.
+    """
+    if isinstance(invoice, int):
+        inv = (
+            Invoice.objects.filter(pk=invoice)
+            .select_related("appointment", "patient", "visit")
+            .first()
+        )
+    else:
+        inv = (
+            Invoice.objects.filter(pk=invoice.pk)
+            .select_related("appointment", "patient", "visit")
+            .first()
+        )
+    if not inv:
+        return False
+    if inv.status == Invoice.Status.PAID:
+        return True
+    if not square_configured():
+        return False
+
+    ref = str(inv.pk)
+    loc = get_location_id()
+    amount_cents = _money_cents(inv)
+    client = get_square_client()
+
+    try:
+        from square.requests.search_terminal_checkouts_request import SearchTerminalCheckoutsRequest
+        from square.requests.terminal_checkout_filter import TerminalCheckoutFilterParams
+        from square.requests.terminal_checkout_query import TerminalCheckoutQueryParams
+
+        search_res = client.terminal.checkouts.search(
+            body=SearchTerminalCheckoutsRequest(
+                query=TerminalCheckoutQueryParams(
+                    filter=TerminalCheckoutFilterParams(
+                        reference_ids=[ref],
+                        statuses=["COMPLETED"],
+                    )
+                )
+            )
+        )
+        checkouts = getattr(search_res, "checkouts", None) or []
+        for co in checkouts:
+            st = (getattr(co, "status", None) or "").upper()
+            if st != "COMPLETED":
+                continue
+            payment_ids = getattr(co, "payment_ids", None) or []
+            if payment_ids:
+                if mark_invoice_paid_from_square(inv, payment_ids[0]):
+                    logger.info("Reconciled invoice %s from completed Terminal checkout %s", inv.pk, co.id)
+                    return True
+    except Exception as exc:
+        logger.debug("Terminal checkout search for invoice %s: %s", inv.pk, exc)
+
+    try:
+        begin = (inv.created_at or timezone.now()) - timedelta(hours=72)
+        begin_str = begin.strftime("%Y-%m-%dT%H:%M:%SZ")
+        cursor = None
+        for _ in range(8):
+            list_kwargs: dict = {
+                "begin_time": begin_str,
+                "sort_order": "DESC",
+                "limit": 100,
+            }
+            if loc:
+                list_kwargs["location_id"] = loc
+            if amount_cents >= _MIN_AMOUNT_CENTS:
+                list_kwargs["total"] = amount_cents
+            if cursor:
+                list_kwargs["cursor"] = cursor
+            res = client.payments.list(**list_kwargs)
+            payments = getattr(res, "payments", None) or []
+            for pay in payments:
+                if (getattr(pay, "status", None) or "").upper() != "COMPLETED":
+                    continue
+                if _payment_reference_matches_invoice(getattr(pay, "reference_id", None), inv.pk):
+                    pid = getattr(pay, "id", None)
+                    if pid and mark_invoice_paid_from_square(inv, pid):
+                        logger.info("Reconciled invoice %s from Square payment %s", inv.pk, pid)
+                        return True
+            cursor = getattr(res, "cursor", None)
+            if not cursor:
+                break
+    except Exception as exc:
+        logger.warning("Square payment list reconcile failed for invoice %s: %s", inv.pk, exc)
+
+    inv.refresh_from_db()
+    return inv.status == Invoice.Status.PAID
 
 
 def _money_cents(invoice: Invoice) -> int:
@@ -663,10 +778,7 @@ def get_terminal_checkout_status(checkout_id: str) -> dict:
         out["payment_id"] = pid
         ref = (co.reference_id or "").strip()
         if ref.isdigit():
-            inv = Invoice.objects.filter(
-                pk=int(ref),
-                status__in=(Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT),
-            ).first()
+            inv = invoice_open_for_square_settlement(int(ref))
             if inv:
                 mark_invoice_paid_from_square(inv, pid)
         else:

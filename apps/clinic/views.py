@@ -119,6 +119,7 @@ from .square_payment import (
     get_frontend_base_url,
     get_terminal_checkout_status,
     try_push_terminal_checkout_to_kiosk,
+    try_reconcile_invoice_from_square,
 )
 from .booking_availability import provider_interval_blocked_online
 from .booking_provider_eligibility import apply_intake_chiropractic_provider_fallback, provider_can_offer_service_online
@@ -3207,6 +3208,17 @@ class DoctorViewSet(viewsets.ViewSet):
             )
         }
         for a in appts_today:
+            inv = invoice_by_aid.get(a.id)
+            if (
+                a.status == Appointment.Status.AWAITING_PAYMENT
+                and inv
+                and inv.status in (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT)
+            ):
+                try_reconcile_invoice_from_square(inv.id)
+                a.refresh_from_db()
+                inv = Invoice.objects.filter(pk=inv.id).only(
+                    "id", "appointment_id", "invoice_number", "total_amount", "status"
+                ).first()
             v = visit_by_aid.get(a.id)
             row = {
                 "id": a.id,
@@ -3428,6 +3440,9 @@ class DoctorViewSet(viewsets.ViewSet):
         inv = Invoice.objects.filter(pk=invoice_id).select_related("appointment").first()
         if not inv:
             return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
+        if inv.status != Invoice.Status.PAID:
+            try_reconcile_invoice_from_square(inv)
+            inv.refresh_from_db()
         paid = inv.status == Invoice.Status.PAID
         return Response({"paid": paid, "status": inv.status})
 
@@ -3739,9 +3754,32 @@ class DoctorViewSet(viewsets.ViewSet):
                 {"detail": "Only visits waiting on payment can use this action."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        inv = Invoice.objects.filter(appointment=appt).first()
+        inv = Invoice.objects.filter(appointment=appt).select_related("patient").first()
         if not inv:
             return Response({"detail": "No invoice for this visit."}, status=status.HTTP_404_NOT_FOUND)
+
+        if inv.status != Invoice.Status.PAID:
+            try_reconcile_invoice_from_square(inv)
+            inv.refresh_from_db()
+            appt.refresh_from_db()
+
+        if inv.status == Invoice.Status.PAID:
+            return Response(
+                {
+                    "invoice_id": inv.id,
+                    "invoice_number": inv.invoice_number,
+                    "total_amount": str(inv.total_amount),
+                    "patient_credit_balance": str(inv.patient.credit_balance),
+                    "already_paid": True,
+                    "payment": {
+                        "status": "charged_saved_card",
+                        "charged": True,
+                        "checkout_url": None,
+                        "charge_error": None,
+                        "payment_intent_id": None,
+                    },
+                }
+            )
 
         try_saved_card = bool(request.data.get("try_saved_card", False))
         followup = build_invoice_payment_followup_dict(inv, try_saved_card=try_saved_card)
