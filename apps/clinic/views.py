@@ -100,7 +100,10 @@ from .patient_demographics import (
     patient_account_summary,
     patient_demographics_summary,
 )
-from .doctor_dashboard_schedule_sort import sort_doctor_dashboard_appointments
+from .doctor_dashboard_appointments import (
+    appointments_for_doctor_dashboard,
+    serialize_doctor_dashboard_appointments,
+)
 from .patient_book_next_context import book_next_context_for_appointment
 from .patient_prior_diagnoses import (
     consultation_diagnosis_prefill_for_appointment,
@@ -3392,75 +3395,8 @@ class DoctorViewSet(viewsets.ViewSet):
         provider = self._get_provider(request)
         if not provider:
             return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
-        date_str = request.query_params.get("date")
-        if date_str:
-            try:
-                appt_date = timezone.datetime.strptime(date_str, "%Y-%m-%d").date()
-            except ValueError:
-                appt_date = timezone.localdate()
-        else:
-            appt_date = timezone.localdate()
-        qs = Appointment.objects.filter(provider=provider, appointment_date=appt_date).select_related(
-            "patient", "booked_service"
-        )
-        appts_today = sort_doctor_dashboard_appointments(list(qs), appt_date=appt_date)
-        appt_ids = [x.id for x in appts_today]
-        data = []
-        visit_by_aid = {
-            v.appointment_id: v
-            for v in Visit.objects.filter(appointment_id__in=appt_ids).only(
-                "id", "appointment_id", "reason_for_visit"
-            )
-        }
-        invoice_by_aid = {
-            inv.appointment_id: inv
-            for inv in Invoice.objects.filter(appointment_id__in=appt_ids).only(
-                "id", "appointment_id", "invoice_number", "total_amount", "status"
-            )
-        }
-        for a in appts_today:
-            inv = invoice_by_aid.get(a.id)
-            if (
-                a.status == Appointment.Status.AWAITING_PAYMENT
-                and inv
-                and inv.status in (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT)
-            ):
-                try_reconcile_invoice_from_square(inv.id)
-                a.refresh_from_db()
-                inv = Invoice.objects.filter(pk=inv.id).only(
-                    "id", "appointment_id", "invoice_number", "total_amount", "status"
-                ).first()
-            v = visit_by_aid.get(a.id)
-            row = {
-                "id": a.id,
-                "patient": f"{a.patient.first_name} {a.patient.last_name}",
-                "patient_id": a.patient_id,
-                "service": a.booked_service.name if a.booked_service else "",
-                "booked_service_id": a.booked_service_id,
-                "service_type": a.booked_service.service_type if a.booked_service else "",
-                "appointment_date": str(a.appointment_date),
-                "start_time": a.start_time.strftime("%I:%M %p"),
-                "start_time_iso": a.start_time.isoformat(timespec="seconds"),
-                "end_time_iso": a.end_time.isoformat(timespec="seconds"),
-                "end_time": a.end_time.strftime("%I:%M %p"),
-                "status": a.status,
-                "clinical_handoff_notes": a.clinical_handoff_notes or "",
-                "reason_for_visit": v.reason_for_visit if v else "",
-                "visit_id": v.id if v else None,
-                "card_last4": a.patient.card_last4 or "",
-                "card_brand": a.patient.card_brand or "",
-            }
-            inv = invoice_by_aid.get(a.id)
-            if (
-                a.status == Appointment.Status.AWAITING_PAYMENT
-                and inv
-                and inv.status in (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT)
-            ):
-                row["invoice_id"] = inv.id
-                row["invoice_number"] = inv.invoice_number
-                row["invoice_total"] = str(inv.total_amount)
-            data.append(row)
-        return Response(data)
+        appt_list = appointments_for_doctor_dashboard(provider, request)
+        return Response(serialize_doctor_dashboard_appointments(appt_list))
 
     @action(detail=False, methods=["get"])
     def patients(self, request):
