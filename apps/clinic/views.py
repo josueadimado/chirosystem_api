@@ -100,6 +100,7 @@ from .patient_demographics import (
     patient_account_summary,
     patient_demographics_summary,
 )
+from .doctor_dashboard_schedule_sort import sort_doctor_dashboard_appointments
 from .patient_book_next_context import book_next_context_for_appointment
 from .patient_prior_diagnoses import (
     consultation_diagnosis_prefill_for_appointment,
@@ -3399,12 +3400,10 @@ class DoctorViewSet(viewsets.ViewSet):
                 appt_date = timezone.localdate()
         else:
             appt_date = timezone.localdate()
-        qs = (
-            Appointment.objects.filter(provider=provider, appointment_date=appt_date)
-            .select_related("patient", "booked_service")
-            .order_by("start_time")
+        qs = Appointment.objects.filter(provider=provider, appointment_date=appt_date).select_related(
+            "patient", "booked_service"
         )
-        appts_today = list(qs)
+        appts_today = sort_doctor_dashboard_appointments(list(qs), appt_date=appt_date)
         appt_ids = [x.id for x in appts_today]
         data = []
         visit_by_aid = {
@@ -3442,6 +3441,7 @@ class DoctorViewSet(viewsets.ViewSet):
                 "appointment_date": str(a.appointment_date),
                 "start_time": a.start_time.strftime("%I:%M %p"),
                 "start_time_iso": a.start_time.isoformat(timespec="seconds"),
+                "end_time_iso": a.end_time.isoformat(timespec="seconds"),
                 "end_time": a.end_time.strftime("%I:%M %p"),
                 "status": a.status,
                 "clinical_handoff_notes": a.clinical_handoff_notes or "",
