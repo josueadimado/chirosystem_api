@@ -159,7 +159,16 @@ def send_patient_bill_email(inv, bill: dict) -> str:
             "Patient bill can only be emailed after the invoice is paid."
         )
 
+    from apps.clinic.patient_communication_prefs import patient_wants_bill_email
+
     patient = inv.patient
+    if not patient_wants_bill_email(patient):
+        raise PatientBillEmailError(
+            "This patient's profile is set to receive bills by text only (or not by email). "
+            "Open the patient chart → Demographics → Communication preferences and set "
+            "'Paid bills / receipts' to Email only or Text and email, and ensure an email is on file."
+        )
+
     to_email = (patient.email or "").strip()
     if not to_email:
         raise PatientBillEmailError(

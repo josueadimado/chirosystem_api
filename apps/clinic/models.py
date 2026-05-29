@@ -50,6 +50,41 @@ class Patient(TimeStampedModel):
         blank=True,
         help_text="When SMS consent was last recorded from the booking site.",
     )
+    # How to reach this patient for automated messages (staff/doctor can override per patient).
+    _notify_channel_help = (
+        "sms = text only, email = email only, both = send on both channels when contact info exists."
+    )
+    notify_booking = models.CharField(
+        max_length=10,
+        choices=[
+            ("sms", "Text (SMS) only"),
+            ("email", "Email only"),
+            ("both", "Text and email"),
+        ],
+        default="sms",
+        help_text="Booking / reschedule / cancel confirmations. " + _notify_channel_help,
+    )
+    notify_reminders = models.CharField(
+        max_length=10,
+        choices=[
+            ("sms", "Text (SMS) only"),
+            ("email", "Email only"),
+            ("both", "Text and email"),
+        ],
+        default="sms",
+        help_text="Day-before and same-day appointment reminders. SMS also requires SMS consent. "
+        + _notify_channel_help,
+    )
+    notify_bills = models.CharField(
+        max_length=10,
+        choices=[
+            ("sms", "Text (SMS) only"),
+            ("email", "Email only"),
+            ("both", "Text and email"),
+        ],
+        default="email",
+        help_text="Paid receipt / patient bill email from the portal. " + _notify_channel_help,
+    )
     # When True, public/voice booking skips "must book intake first" for chiropractic (migrated / established patients).
     online_chiro_intake_waived = models.BooleanField(
         default=False,

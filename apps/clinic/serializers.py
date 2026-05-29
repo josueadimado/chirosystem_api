@@ -340,6 +340,13 @@ class AppointmentHandoffNotesSerializer(serializers.Serializer):
     clinical_handoff_notes = serializers.CharField(allow_blank=True, max_length=20000)
 
 
+class AppointmentSoapNotesSerializer(serializers.Serializer):
+    """Save consultation (SOAP) notes on the visit while still in progress."""
+
+    appointment_id = serializers.IntegerField(min_value=1)
+    doctor_notes = serializers.CharField(allow_blank=True, max_length=50000)
+
+
 class VoiceCallLogSerializer(serializers.ModelSerializer):
     outcome_label = serializers.SerializerMethodField()
 
@@ -733,6 +740,9 @@ class PatientIntakeUpdateSerializer(serializers.Serializer):
     # Only owner_admin/staff may persist this (see AdminViewSet.patient_intake); doctors’ PATCH ignores it.
     online_chiro_intake_waived = serializers.BooleanField(required=False)
     sms_consent = serializers.BooleanField(required=False)
+    notify_booking = serializers.ChoiceField(choices=["sms", "email", "both"], required=False)
+    notify_reminders = serializers.ChoiceField(choices=["sms", "email", "both"], required=False)
+    notify_bills = serializers.ChoiceField(choices=["sms", "email", "both"], required=False)
 
 
 class ClinicProfileUpdateSerializer(serializers.Serializer):

@@ -231,6 +231,7 @@ def apply_patient_intake_validated_data(
     allow_date_established: bool = False,
     allow_online_waived: bool = False,
     allow_sms_consent: bool = False,
+    allow_communication_prefs: bool = False,
 ) -> str | None:
     """
     Apply PATCH intake fields to patient. Returns an error message when duplicate
@@ -282,6 +283,27 @@ def apply_patient_intake_validated_data(
         elif not new_consent:
             patient.sms_consent_at = None
         patient.sms_consent = new_consent
+
+    if allow_communication_prefs:
+        from apps.clinic.patient_communication_prefs import (
+            DEFAULT_NOTIFY_BILLS,
+            DEFAULT_NOTIFY_BOOKING,
+            DEFAULT_NOTIFY_REMINDERS,
+            normalize_notify_channel,
+        )
+
+        if "notify_booking" in data:
+            patient.notify_booking = normalize_notify_channel(
+                data["notify_booking"], default=DEFAULT_NOTIFY_BOOKING
+            )
+        if "notify_reminders" in data:
+            patient.notify_reminders = normalize_notify_channel(
+                data["notify_reminders"], default=DEFAULT_NOTIFY_REMINDERS
+            )
+        if "notify_bills" in data:
+            patient.notify_bills = normalize_notify_channel(
+                data["notify_bills"], default=DEFAULT_NOTIFY_BILLS
+            )
 
     return None
 

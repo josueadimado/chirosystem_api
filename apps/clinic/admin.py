@@ -194,9 +194,16 @@ class PatientAdmin(admin.ModelAdmin):
         ("Address & emergency", {"fields": ("address_line1", "address_line2", "city_state_zip", "emergency_contact_name", "emergency_contact_phone")}),
         ("Square (card on file hints)", {"fields": ("square_customer_id", "square_card_id", "card_brand", "card_last4")}),
         (
+            "Communication",
+            {
+                "fields": ("notify_booking", "notify_reminders", "notify_bills", "sms_consent", "sms_consent_at"),
+                "description": "Per-patient SMS/email for bookings, reminders, and bill receipts. Defaults: booking & reminders SMS, bills email.",
+            },
+        ),
+        (
             "Online booking",
             {
-                "fields": ("online_chiro_intake_waived", "sms_consent", "sms_consent_at"),
+                "fields": ("online_chiro_intake_waived",),
                 "description": "Check “Waive online chiro intake rule” for migrated or established patients who should book regular visits without a completed visit already in this system.",
             },
         ),

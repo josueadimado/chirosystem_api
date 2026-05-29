@@ -60,7 +60,13 @@ def send_booking_confirmation_sms_task(appointment_id: int) -> str:
     if not appt:
         return "appointment_missing"
 
-    to = (appt.patient.phone or "").strip()
+    patient = appt.patient
+    from apps.clinic.patient_communication_prefs import patient_wants_booking_sms
+
+    if not patient_wants_booking_sms(patient):
+        return "patient_pref_no_sms"
+
+    to = (patient.phone or "").strip()
     if not to:
         return "no_phone"
 
@@ -69,7 +75,7 @@ def send_booking_confirmation_sms_task(appointment_id: int) -> str:
     time_disp = format_time_12h(appt.start_time)
     est_pay = format_usd_plain(appt.booked_service.price) if appt.booked_service else ""
     body = booking_confirmation_body(
-        first_name=appt.patient.first_name.strip() or "there",
+        first_name=patient.first_name.strip() or "there",
         service_name=service_name,
         appt_date_display=date_disp,
         appt_time_display=time_disp,
@@ -100,11 +106,17 @@ def send_booking_confirmation_email_task(appointment_id: int) -> str:
     if not appt:
         return "appointment_missing"
 
-    email = (appt.patient.email or "").strip()
+    patient = appt.patient
+    from apps.clinic.patient_communication_prefs import patient_wants_booking_email
+
+    if not patient_wants_booking_email(patient):
+        return "patient_pref_no_email"
+
+    email = (patient.email or "").strip()
     if not email:
         return "no_email"
 
-    first_name = appt.patient.first_name.strip() or "there"
+    first_name = patient.first_name.strip() or "there"
     service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%A, %B %d, %Y")
     time_disp = format_time_12h(appt.start_time)
@@ -125,8 +137,7 @@ def send_booking_confirmation_email_task(appointment_id: int) -> str:
         f"  Time: {time_disp}\n"
         f"{est_block}"
         f"If you need to reschedule or cancel, please call us or visit our website.\n\n"
-        f"We'll remind you the day before your appointment via text (if you opted in for SMS) "
-        f"and via email when we have your email on file.\n\n"
+        f"We'll send appointment reminders using the contact preferences saved on your chart.\n\n"
         f"Thank you for choosing Relief Chiropractic!\n"
         f"— Relief Chiropractic Team"
     )
@@ -169,6 +180,11 @@ def send_daily_appointment_reminders() -> dict:
         .order_by("start_time")
     )
 
+    from apps.clinic.patient_communication_prefs import (
+        patient_wants_reminder_email,
+        patient_wants_reminder_sms,
+    )
+
     sms_sent = 0
     email_sent = 0
     twilio_on = twilio_configured()
@@ -183,7 +199,7 @@ def send_daily_appointment_reminders() -> dict:
         provider_display = str(appt.provider)
         first = patient.first_name.strip() or "there"
 
-        if twilio_on and patient.sms_consent and appt.day_before_reminder_sms_at is None:
+        if twilio_on and patient_wants_reminder_sms(patient) and appt.day_before_reminder_sms_at is None:
             to_phone = (patient.phone or "").strip()
             if to_phone:
                 body = appointment_reminder_body(
@@ -202,7 +218,7 @@ def send_daily_appointment_reminders() -> dict:
                     if updated:
                         sms_sent += 1
 
-        if smtp_on and appt.day_before_reminder_email_at is None:
+        if smtp_on and patient_wants_reminder_email(patient) and appt.day_before_reminder_email_at is None:
             em = (patient.email or "").strip()
             if em:
                 subject = f"Reminder — {service_name} tomorrow at {time_disp}"
@@ -406,6 +422,10 @@ def send_patient_cancel_confirmation_sms_task(appointment_id: int) -> str:
         return "not_cancelled"
 
     patient = appt.patient
+    from apps.clinic.patient_communication_prefs import patient_wants_booking_sms
+
+    if not patient_wants_booking_sms(patient):
+        return "patient_pref_no_sms"
     if not patient.sms_consent:
         return "no_sms_consent"
 
@@ -448,11 +468,17 @@ def send_patient_cancel_confirmation_email_task(appointment_id: int) -> str:
     if appt.status != Appointment.Status.CANCELLED:
         return "not_cancelled"
 
-    email = (appt.patient.email or "").strip()
+    patient = appt.patient
+    from apps.clinic.patient_communication_prefs import patient_wants_booking_email
+
+    if not patient_wants_booking_email(patient):
+        return "patient_pref_no_email"
+
+    email = (patient.email or "").strip()
     if not email:
         return "no_email"
 
-    first_name = appt.patient.first_name.strip() or "there"
+    first_name = patient.first_name.strip() or "there"
     service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%A, %B %d, %Y")
     time_disp = format_time_12h(appt.start_time)
@@ -502,6 +528,10 @@ def send_patient_reschedule_confirmation_sms_task(appointment_id: int) -> str:
         return "not_booked"
 
     patient = appt.patient
+    from apps.clinic.patient_communication_prefs import patient_wants_booking_sms
+
+    if not patient_wants_booking_sms(patient):
+        return "patient_pref_no_sms"
     if not patient.sms_consent:
         return "no_sms_consent"
 
@@ -544,11 +574,17 @@ def send_patient_reschedule_confirmation_email_task(appointment_id: int) -> str:
     if appt.status != Appointment.Status.BOOKED:
         return "not_booked"
 
-    email = (appt.patient.email or "").strip()
+    patient = appt.patient
+    from apps.clinic.patient_communication_prefs import patient_wants_booking_email
+
+    if not patient_wants_booking_email(patient):
+        return "patient_pref_no_email"
+
+    email = (patient.email or "").strip()
     if not email:
         return "no_email"
 
-    first_name = appt.patient.first_name.strip() or "there"
+    first_name = patient.first_name.strip() or "there"
     service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%A, %B %d, %Y")
     time_disp = format_time_12h(appt.start_time)
@@ -594,8 +630,10 @@ def send_provider_dashboard_reschedule_patient_sms_task(appointment_id: int) -> 
     if not appt:
         return "appointment_missing"
     p = appt.patient
-    if not p.sms_consent:
-        return "no_sms_consent"
+    from apps.clinic.patient_communication_prefs import patient_wants_booking_sms
+
+    if not patient_wants_booking_sms(p):
+        return "patient_pref_no_sms"
     to = (p.phone or "").strip()
     if not to:
         return "no_phone"
@@ -629,10 +667,15 @@ def send_provider_dashboard_reschedule_patient_email_task(appointment_id: int) -
     )
     if not appt:
         return "appointment_missing"
-    email = (appt.patient.email or "").strip()
+    patient = appt.patient
+    from apps.clinic.patient_communication_prefs import patient_wants_booking_email
+
+    if not patient_wants_booking_email(patient):
+        return "patient_pref_no_email"
+    email = (patient.email or "").strip()
     if not email:
         return "no_email"
-    first = appt.patient.first_name.strip() or "there"
+    first = patient.first_name.strip() or "there"
     service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%A, %B %d, %Y")
     time_disp = format_time_12h(appt.start_time)
@@ -675,7 +718,12 @@ def send_provider_dashboard_book_next_patient_sms_task(appointment_id: int) -> s
     )
     if not appt:
         return "appointment_missing"
-    to = (appt.patient.phone or "").strip()
+    patient = appt.patient
+    from apps.clinic.patient_communication_prefs import patient_wants_booking_sms
+
+    if not patient_wants_booking_sms(patient):
+        return "patient_pref_no_sms"
+    to = (patient.phone or "").strip()
     if not to:
         return "no_phone"
     service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
@@ -708,10 +756,15 @@ def send_provider_dashboard_book_next_patient_email_task(appointment_id: int) ->
     )
     if not appt:
         return "appointment_missing"
-    email = (appt.patient.email or "").strip()
+    patient = appt.patient
+    from apps.clinic.patient_communication_prefs import patient_wants_booking_email
+
+    if not patient_wants_booking_email(patient):
+        return "patient_pref_no_email"
+    email = (patient.email or "").strip()
     if not email:
         return "no_email"
-    first = appt.patient.first_name.strip() or "there"
+    first = patient.first_name.strip() or "there"
     service_name = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%A, %B %d, %Y")
     time_disp = format_time_12h(appt.start_time)

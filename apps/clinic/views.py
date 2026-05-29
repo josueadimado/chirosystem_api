@@ -43,6 +43,7 @@ from .public_booking_service import (
 from .utils import format_time_12h, normalize_phone, validate_phone
 from .serializers import (
     AppointmentHandoffNotesSerializer,
+    AppointmentSoapNotesSerializer,
     AppointmentListSerializer,
     AppointmentSerializer,
     ClinicProfileUpdateSerializer,
@@ -90,6 +91,7 @@ from .google_calendar_sync import (
     exchange_oauth_code,
     google_oauth_configured,
 )
+from .patient_communication_prefs import patient_communication_prefs_payload
 from .patient_demographics import (
     annotate_patient_list_stats,
     annotate_patient_unpaid_balances,
@@ -98,7 +100,11 @@ from .patient_demographics import (
     patient_account_summary,
     patient_demographics_summary,
 )
-from .patient_prior_diagnoses import consultation_diagnosis_prefill_for_appointment
+from .patient_book_next_context import book_next_context_for_appointment
+from .patient_prior_diagnoses import (
+    consultation_diagnosis_prefill_for_appointment,
+    consultation_workspace_for_appointment,
+)
 from .visit_diagnosis import diagnosis_ids_from_visit, serialize_visit_diagnoses
 from .provider_patient_access import (
     appointment_matches_provider_discipline,
@@ -578,6 +584,48 @@ def _save_appointment_handoff_notes(request):
     return Response({
         "detail": "Reminders and handoff saved.",
         "clinical_handoff_notes": appt.clinical_handoff_notes,
+    })
+
+
+def _save_appointment_soap_notes(request):
+    ser = AppointmentSoapNotesSerializer(data=request.data)
+    ser.is_valid(raise_exception=True)
+    aid = ser.validated_data["appointment_id"]
+    notes = ser.validated_data["doctor_notes"]
+    appt = Appointment.objects.filter(pk=aid).select_related("provider", "patient").first()
+    if not appt:
+        return Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
+    if appt.status != Appointment.Status.IN_CONSULTATION:
+        return Response(
+            {"detail": "SOAP notes can only be saved while the visit is in consultation."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    prov = provider_for_doctor_user(request.user)
+    if prov and clinical_access_level(prov, appt.patient) != "full":
+        return Response(
+            {
+                "detail": "This patient is outside your care type (chiropractic vs massage). "
+                "You can view their chart but cannot edit consultation notes."
+            },
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if not _can_edit_handoff_notes(request, appt):
+        return Response(
+            {"detail": "You cannot edit consultation notes on this appointment."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    try:
+        visit = appt.visit
+    except Visit.DoesNotExist:
+        return Response(
+            {"detail": "Start the visit before saving consultation notes."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    visit.doctor_notes = notes
+    visit.save(update_fields=["doctor_notes", "updated_at"])
+    return Response({
+        "detail": "Consultation notes saved.",
+        "doctor_notes": visit.doctor_notes,
     })
 
 
@@ -1518,6 +1566,30 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         appt = self.get_object()
         return Response({"prior_visits": prior_chart_notes_for_appointment(appt)})
 
+    @action(detail=True, methods=["get"], url_path="book_next_context")
+    def book_next_context(self, request, pk=None):
+        """Completed visit summary for the Book next visit flow."""
+        from .provider_self_schedule import user_may_manage_appointment
+
+        appt = (
+            Appointment.objects.select_related("patient", "provider", "booked_service")
+            .filter(pk=pk)
+            .first()
+        )
+        if not appt:
+            return Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
+        if appt.status != Appointment.Status.COMPLETED:
+            return Response(
+                {"detail": "Book next is only available after a completed visit."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not user_may_manage_appointment(request.user, appt):
+            return Response(
+                {"detail": "You do not have access to this appointment."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return Response(book_next_context_for_appointment(appt))
+
     def perform_create(self, serializer):
         appt = serializer.save()
         aid = appt.id
@@ -2063,6 +2135,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
             if err2:
                 code = status.HTTP_409_CONFLICT if is_conflict2 else status.HTTP_400_BAD_REQUEST
                 return Response({"detail": err2}, status=code)
+            handoff_notes = (request.data.get("clinical_handoff_notes") or "").strip()
             new_appt = Appointment.objects.create(
                 patient=patient,
                 provider=provider,
@@ -2071,6 +2144,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                 start_time=start_t,
                 end_time=end_t,
                 status=Appointment.Status.BOOKED,
+                clinical_handoff_notes=handoff_notes,
             )
 
         aid = new_appt.pk
@@ -3215,6 +3289,7 @@ class AdminViewSet(viewsets.ViewSet):
                 "online_chiro_intake_waived": patient.online_chiro_intake_waived,
                 "sms_consent": patient.sms_consent,
                 "sms_consent_at": patient.sms_consent_at.isoformat() if patient.sms_consent_at else None,
+                **patient_communication_prefs_payload(patient),
                 "appointments": _serialize_patient_appointment_history(request, appointments),
                 **patient_demographics_summary(patient),
                 "account_summary": patient_account_summary(patient),
@@ -3253,6 +3328,7 @@ class AdminViewSet(viewsets.ViewSet):
             allow_date_established=role in ("owner_admin", "staff"),
             allow_online_waived=role in ("owner_admin", "staff"),
             allow_sms_consent=role in ("owner_admin", "staff"),
+            allow_communication_prefs=True,
         )
         if err:
             return Response({"detail": err}, status=status.HTTP_400_BAD_REQUEST)
@@ -3514,6 +3590,9 @@ class DoctorViewSet(viewsets.ViewSet):
                 "card_last4": patient.card_last4 or "",
                 "has_saved_card": bool(patient.card_last4),
                 "online_chiro_intake_waived": patient.online_chiro_intake_waived,
+                "sms_consent": patient.sms_consent,
+                "sms_consent_at": patient.sms_consent_at.isoformat() if patient.sms_consent_at else None,
+                **patient_communication_prefs_payload(patient),
                 "clinical_access": access,
                 "clinical_access_message": clinical_access_message(provider, access),
                 "appointments": _serialize_patient_appointment_history(
@@ -3554,7 +3633,12 @@ class DoctorViewSet(viewsets.ViewSet):
         data.pop("online_chiro_intake_waived", None)
         data.pop("date_established", None)
         data.pop("sms_consent", None)
-        err = apply_patient_intake_validated_data(patient, data, allow_identity_fields=True)
+        err = apply_patient_intake_validated_data(
+            patient,
+            data,
+            allow_identity_fields=True,
+            allow_communication_prefs=True,
+        )
         if err:
             return Response({"detail": err}, status=status.HTTP_400_BAD_REQUEST)
         patient.save()
@@ -3688,7 +3772,12 @@ class DoctorViewSet(viewsets.ViewSet):
                 {"detail": "Diagnosis prefill is only available for active consultations."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        return Response(consultation_diagnosis_prefill_for_appointment(appointment))
+        return Response(consultation_workspace_for_appointment(appointment))
+
+    @action(detail=False, methods=["patch"], url_path="appointment_soap_notes")
+    def appointment_soap_notes(self, request):
+        """Save consultation (SOAP) notes while the visit is in progress."""
+        return _save_appointment_soap_notes(request)
 
     @action(detail=True, methods=["post"])
     def start_visit(self, request, pk=None):

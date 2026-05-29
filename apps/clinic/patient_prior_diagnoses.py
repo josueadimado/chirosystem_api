@@ -63,6 +63,23 @@ def _prior_visit_meta(visit: Visit) -> dict[str, str]:
     }
 
 
+def consultation_workspace_for_appointment(appointment: Appointment) -> dict:
+    """Diagnosis prefill + saved SOAP notes for the in-consultation workspace."""
+    payload = consultation_diagnosis_prefill_for_appointment(appointment)
+    payload["doctor_notes"] = _visit_doctor_notes(appointment)
+    return payload
+
+
+def _visit_doctor_notes(appointment: Appointment) -> str:
+    try:
+        visit = appointment.visit
+    except Visit.DoesNotExist:
+        return ""
+    if not visit:
+        return ""
+    return (visit.doctor_notes or "").strip()
+
+
 def consultation_diagnosis_prefill_for_appointment(appointment: Appointment) -> dict:
     """
     Diagnosis IDs to show checked when opening consultation.
