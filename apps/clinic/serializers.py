@@ -474,14 +474,9 @@ class AppointmentListSerializer(serializers.ModelSerializer):
             return None
 
     def get_display_status(self, obj):
-        """Calendar/UI status: legacy no-shows stored as awaiting_payment + no_show_fee invoice."""
-        if obj.status == Appointment.Status.AWAITING_PAYMENT:
-            try:
-                if obj.invoice.kind == Invoice.Kind.NO_SHOW_FEE:
-                    return Appointment.Status.NO_SHOW
-            except Invoice.DoesNotExist:
-                pass
-        return obj.status
+        from apps.clinic.appointment_display import appointment_ui_status
+
+        return appointment_ui_status(obj)
 
 
 class PublicBookingSerializer(serializers.Serializer):

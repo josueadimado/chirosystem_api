@@ -56,9 +56,16 @@ def serialize_doctor_dashboard_appointments(appt_list: list[Appointment]) -> lis
     invoice_by_aid = {
         inv.appointment_id: inv
         for inv in Invoice.objects.filter(appointment_id__in=appt_ids).only(
-            "id", "appointment_id", "invoice_number", "total_amount", "status"
+            "id",
+            "appointment_id",
+            "invoice_number",
+            "total_amount",
+            "status",
+            "kind",
         )
     }
+    from apps.clinic.appointment_display import appointment_ui_status
+
     data: list[dict] = []
     for a in appt_list:
         inv = invoice_by_aid.get(a.id)
@@ -86,6 +93,11 @@ def serialize_doctor_dashboard_appointments(appt_list: list[Appointment]) -> lis
             "end_time_iso": a.end_time.isoformat(timespec="seconds"),
             "end_time": a.end_time.strftime("%I:%M %p"),
             "status": a.status,
+            "display_status": appointment_ui_status(a, invoice_kind=inv.kind if inv else None),
+            "invoice_kind": inv.kind if inv else None,
+            "auto_no_show_processed_at": (
+                a.auto_no_show_processed_at.isoformat() if a.auto_no_show_processed_at else None
+            ),
             "clinical_handoff_notes": a.clinical_handoff_notes or "",
             "reason_for_visit": v.reason_for_visit if v else "",
             "visit_id": v.id if v else None,

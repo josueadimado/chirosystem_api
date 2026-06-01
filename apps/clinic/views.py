@@ -2540,18 +2540,23 @@ class AdminViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["get"])
     def dashboard_summary(self, request):
+        from apps.clinic.appointment_display import appointment_ui_status
+
         today = timezone.localdate()
-        appts = _defer_patient_card_fields(
+        all_today = _defer_patient_card_fields(
             Appointment.objects.filter(appointment_date=today)
             .select_related("patient", "provider", "booked_service")
-            .exclude(status__in=[Appointment.Status.CANCELLED, Appointment.Status.NO_SHOW])
             .order_by("start_time"),
             patient_prefix="patient",
+        )
+        appts = all_today.exclude(
+            status__in=[Appointment.Status.CANCELLED, Appointment.Status.NO_SHOW],
         )
 
         appointments_today = appts.count()
         checked_in = appts.filter(status=Appointment.Status.CHECKED_IN).count()
         completed = appts.filter(status=Appointment.Status.COMPLETED).count()
+        no_shows_today = all_today.filter(status=Appointment.Status.NO_SHOW).count()
 
         from django.db.models import Sum
         daily_revenue = Invoice.objects.filter(
@@ -2562,13 +2567,15 @@ class AdminViewSet(viewsets.ViewSet):
         unpaid_invoices = Invoice.objects.filter(status=Invoice.Status.ISSUED).count()
 
         today_schedule = []
-        for a in appts[:20]:
+        for a in all_today.exclude(status=Appointment.Status.CANCELLED)[:25]:
+            ui_status = appointment_ui_status(a)
             today_schedule.append({
                 "id": a.id,
                 "patient_name": f"{a.patient.first_name} {a.patient.last_name}",
                 "provider_name": str(a.provider),
                 "start_time": a.start_time.strftime("%I:%M %p"),
-                "status": a.status,
+                "status": ui_status,
+                "auto_no_show": bool(a.auto_no_show_processed_at),
             })
 
         recent_activity = []
@@ -2592,6 +2599,16 @@ class AdminViewSet(viewsets.ViewSet):
                         "kind": "completed",
                     }
                 )
+            elif a.status == Appointment.Status.NO_SHOW:
+                recent_activity.append(
+                    {
+                        "text": (
+                            f"{a.patient.first_name} {a.patient.last_name} marked no-show"
+                            + (" (automatic)." if a.auto_no_show_processed_at else ".")
+                        ),
+                        "kind": "other",
+                    }
+                )
         for p in _defer_patient_card_fields(
             Payment.objects.select_related("invoice__patient")
             .filter(paid_at__date=today)
@@ -2611,6 +2628,7 @@ class AdminViewSet(viewsets.ViewSet):
             "appointments_today": appointments_today,
             "checked_in": checked_in,
             "completed": completed,
+            "no_shows_today": no_shows_today,
             "daily_revenue": str(daily_revenue),
             "unpaid_invoices": unpaid_invoices,
             "today_schedule": today_schedule,
