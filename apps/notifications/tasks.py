@@ -403,8 +403,8 @@ def notify_provider_schedule_change_task(
 
 
 @shared_task
-def send_patient_cancel_confirmation_sms_task(appointment_id: int) -> str:
-    """Patient-facing SMS after public online cancel (requires sms_consent + phone)."""
+def send_patient_cancel_confirmation_sms_task(appointment_id: int, require_sms_consent: bool = True) -> str:
+    """Patient-facing SMS after cancel. Public flow requires sms_consent; staff portal does not."""
     from apps.clinic.models import Appointment
     from apps.clinic.twilio_sms import patient_cancel_confirmation_sms_body, send_sms, twilio_configured
 
@@ -426,7 +426,7 @@ def send_patient_cancel_confirmation_sms_task(appointment_id: int) -> str:
 
     if not patient_wants_booking_sms(patient):
         return "patient_pref_no_sms"
-    if not patient.sms_consent:
+    if require_sms_consent and not patient.sms_consent:
         return "no_sms_consent"
 
     to = (patient.phone or "").strip()
@@ -509,8 +509,8 @@ def send_patient_cancel_confirmation_email_task(appointment_id: int) -> str:
 
 
 @shared_task
-def send_patient_reschedule_confirmation_sms_task(appointment_id: int) -> str:
-    """Patient-facing SMS after public online reschedule (requires sms_consent + phone)."""
+def send_patient_reschedule_confirmation_sms_task(appointment_id: int, require_sms_consent: bool = True) -> str:
+    """Patient-facing SMS after reschedule. Public flow requires sms_consent; staff portal does not."""
     from apps.clinic.models import Appointment
     from apps.clinic.twilio_sms import patient_reschedule_confirmation_sms_body, send_sms, twilio_configured
 
@@ -532,7 +532,7 @@ def send_patient_reschedule_confirmation_sms_task(appointment_id: int) -> str:
 
     if not patient_wants_booking_sms(patient):
         return "patient_pref_no_sms"
-    if not patient.sms_consent:
+    if require_sms_consent and not patient.sms_consent:
         return "no_sms_consent"
 
     to = (patient.phone or "").strip()

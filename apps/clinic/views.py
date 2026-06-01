@@ -1616,7 +1616,13 @@ class AppointmentViewSet(viewsets.ModelViewSet):
 
             create_new_booking_in_app_notification(aid)
 
+        def queue_patient_confirmations():
+            from apps.clinic.patient_appointment_notifications import queue_patient_booking_confirmations
+
+            queue_patient_booking_confirmations(aid)
+
         transaction.on_commit(queue_in_app)
+        transaction.on_commit(queue_patient_confirmations)
 
     def perform_update(self, serializer):
         """If the visit time changes, allow a fresh day-before SMS reminder."""
@@ -1897,6 +1903,31 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         transaction.on_commit(queue_doctor_alerts)
         transaction.on_commit(queue_in_app)
 
+        became_cancelled = (
+            old["status"] != Appointment.Status.CANCELLED
+            and new.status == Appointment.Status.CANCELLED
+        )
+        schedule_changed = (date_changed or time_changed) and new.status in (
+            Appointment.Status.BOOKED,
+            Appointment.Status.CHECKED_IN,
+        )
+        if became_cancelled:
+
+            def queue_patient_cancel():
+                from apps.clinic.patient_appointment_notifications import queue_patient_cancel_confirmations
+
+                queue_patient_cancel_confirmations(aid, staff_initiated=True)
+
+            transaction.on_commit(queue_patient_cancel)
+        elif schedule_changed:
+
+            def queue_patient_reschedule():
+                from apps.clinic.patient_appointment_notifications import queue_patient_reschedule_confirmations
+
+                queue_patient_reschedule_confirmations(aid, staff_initiated=True)
+
+            transaction.on_commit(queue_patient_reschedule)
+
     def perform_destroy(self, instance):
         from .google_calendar_sync import delete_appointment_google_event_before_db_delete
 
@@ -1990,24 +2021,14 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         aid = appt.pk
 
         def queue_notifications():
-            from apps.notifications.tasks import (
-                send_provider_dashboard_reschedule_patient_email_task,
-                send_provider_dashboard_reschedule_patient_sms_task,
-                sync_appointment_google_calendar_task,
-            )
+            from apps.clinic.patient_appointment_notifications import queue_patient_reschedule_confirmations
+            from apps.notifications.tasks import sync_appointment_google_calendar_task
 
             try:
                 sync_appointment_google_calendar_task.delay(aid)
             except Exception:
                 logger.exception("Post-commit dispatch failed (calendar) reschedule appt=%s", aid)
-            try:
-                send_provider_dashboard_reschedule_patient_sms_task.delay(aid)
-            except Exception:
-                logger.exception("Post-commit dispatch failed (sms) reschedule appt=%s", aid)
-            try:
-                send_provider_dashboard_reschedule_patient_email_task.delay(aid)
-            except Exception:
-                logger.exception("Post-commit dispatch failed (email) reschedule appt=%s", aid)
+            queue_patient_reschedule_confirmations(aid, staff_initiated=True)
 
         with transaction.atomic():
             locked = (
@@ -2324,8 +2345,14 @@ class AppointmentViewSet(viewsets.ModelViewSet):
             except Exception:
                 logger.exception("Post-commit in-app notify failed desk-book appt=%s", aid)
 
+        def queue_patient_confirmations():
+            from apps.clinic.patient_appointment_notifications import queue_patient_booking_confirmations
+
+            queue_patient_booking_confirmations(aid)
+
         transaction.on_commit(queue_calendar)
         transaction.on_commit(queue_provider_notify)
+        transaction.on_commit(queue_patient_confirmations)
         transaction.on_commit(queue_in_app)
 
         return Response(

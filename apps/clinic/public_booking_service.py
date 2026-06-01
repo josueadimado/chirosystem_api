@@ -194,34 +194,13 @@ def create_appointment_from_public_booking(validated: dict) -> tuple[Appointment
         )
 
     def queue_after_book():
-        import logging as _log
+        from apps.clinic.patient_appointment_notifications import queue_patient_booking_confirmations
 
-        from apps.notifications.tasks import (
-            notify_provider_new_booking_task,
-            send_booking_confirmation_email_task,
-            send_booking_confirmation_sms_task,
-            sync_appointment_google_calendar_task,
+        queue_patient_booking_confirmations(
+            appointment.id,
+            include_provider_notify=True,
+            include_gcal=True,
         )
-
-        _logger = _log.getLogger(__name__)
-        tasks = [
-            ("sms", send_booking_confirmation_sms_task),
-            ("email", send_booking_confirmation_email_task),
-            ("provider_notify", notify_provider_new_booking_task),
-            ("gcal", sync_appointment_google_calendar_task),
-        ]
-        for label, task_fn in tasks:
-            try:
-                task_fn.delay(appointment.id)
-            except Exception:
-                _logger.warning(
-                    "Celery dispatch failed for %s (appt %s), running synchronously",
-                    label, appointment.id,
-                )
-                try:
-                    task_fn(appointment.id)
-                except Exception:
-                    _logger.exception("Sync fallback also failed for %s (appt %s)", label, appointment.id)
 
     def queue_in_app():
         from apps.clinic.in_app_notify import create_new_booking_in_app_notification
@@ -232,52 +211,6 @@ def create_appointment_from_public_booking(validated: dict) -> tuple[Appointment
     transaction.on_commit(queue_in_app)
 
     return appointment, None
-
-
-def _queue_patient_self_service_notifications(appointment_id: int, kind: str) -> None:
-    """
-    Dispatch patient SMS/email after public cancel or reschedule commits.
-    Same Celery + sync fallback pattern as new-booking confirmations; failures only log.
-    """
-    from apps.notifications.tasks import (
-        send_patient_cancel_confirmation_email_task,
-        send_patient_cancel_confirmation_sms_task,
-        send_patient_reschedule_confirmation_email_task,
-        send_patient_reschedule_confirmation_sms_task,
-    )
-
-    if kind == "cancel":
-        specs: list[tuple[str, object]] = [
-            ("sms", send_patient_cancel_confirmation_sms_task),
-            ("email", send_patient_cancel_confirmation_email_task),
-        ]
-    elif kind == "reschedule":
-        specs = [
-            ("sms", send_patient_reschedule_confirmation_sms_task),
-            ("email", send_patient_reschedule_confirmation_email_task),
-        ]
-    else:
-        return
-
-    for label, task_fn in specs:
-        try:
-            task_fn.delay(appointment_id)
-        except Exception:
-            logger.warning(
-                "Celery dispatch failed for patient %s confirmation %s (appt %s), running synchronously",
-                kind,
-                label,
-                appointment_id,
-            )
-            try:
-                task_fn(appointment_id)
-            except Exception:
-                logger.exception(
-                    "Sync fallback failed for patient %s confirmation %s (appt %s)",
-                    kind,
-                    label,
-                    appointment_id,
-                )
 
 
 def reschedule_appointment_public(
@@ -442,7 +375,9 @@ def reschedule_appointment_public(
     transaction.on_commit(queue_in_app)
 
     def queue_patient_confirmations():
-        _queue_patient_self_service_notifications(aid, "reschedule")
+        from apps.clinic.patient_appointment_notifications import queue_patient_reschedule_confirmations
+
+        queue_patient_reschedule_confirmations(aid, staff_initiated=False)
 
     transaction.on_commit(queue_patient_confirmations)
 
@@ -587,7 +522,9 @@ def cancel_appointment_public(*, phone_normalized: str, appointment_id: int) -> 
     transaction.on_commit(queue_calendar)
 
     def queue_patient_confirmations():
-        _queue_patient_self_service_notifications(aid, "cancel")
+        from apps.clinic.patient_appointment_notifications import queue_patient_cancel_confirmations
+
+        queue_patient_cancel_confirmations(aid, staff_initiated=False)
 
     transaction.on_commit(queue_patient_confirmations)
 
