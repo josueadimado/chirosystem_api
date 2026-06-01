@@ -1780,31 +1780,25 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                         if ctx.get("already_charged"):
                             inst.refresh_from_db()
 
+        manual_no_show_card_charged = False  # used when staff marks no-show (patient billing notice)
         if data.get("status") == Appointment.Status.NO_SHOW:
-            svc_ns = inst.booked_service
-            fee_amt = Decimal("0")
-            if svc_ns and svc_ns.service_type in (
-                Service.ServiceType.CHIROPRACTIC,
-                Service.ServiceType.MASSAGE,
-            ):
-                fee_amt = svc_ns.price or Decimal("0")
-            if fee_amt <= 0:
-                fee_amt = ClinicSettings.get_solo().no_show_fee or Decimal("0")
+            from .no_show_billing import apply_no_show_fee_for_appointment, compute_no_show_fee_for_appointment
+
+            fee_amt = compute_no_show_fee_for_appointment(inst)
             if fee_amt > 0 and inst.status in (
                 Appointment.Status.BOOKED,
                 Appointment.Status.CHECKED_IN,
                 Appointment.Status.AWAITING_PAYMENT,
             ):
-                from .no_show_billing import apply_no_show_fee_for_appointment
-
                 with transaction.atomic():
                     locked = Appointment.objects.select_for_update().get(pk=inst.pk)
                     ctx = apply_no_show_fee_for_appointment(locked, fee_amt)
+                manual_no_show_card_charged = bool(ctx.get("already_charged"))
                 # Keep appointment status as no_show; unpaid no-show fee is on the penalty invoice.
                 if ctx.get("clear_checkin"):
                     data["checked_in_at"] = None
                     data["consultation_started_at"] = None
-                if ctx.get("already_charged"):
+                if manual_no_show_card_charged:
                     inst.refresh_from_db()
 
         if data.get("status") == Appointment.Status.COMPLETED and inst.completed_at is None:
@@ -1927,6 +1921,37 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                 queue_patient_reschedule_confirmations(aid, staff_initiated=True)
 
             transaction.on_commit(queue_patient_reschedule)
+
+        became_no_show = (
+            old["status"] != Appointment.Status.NO_SHOW
+            and new.status == Appointment.Status.NO_SHOW
+        )
+        if became_no_show and new.auto_no_show_processed_at is None:
+            charged = manual_no_show_card_charged
+
+            def queue_no_show_billing_notice():
+                from apps.clinic.models import Invoice
+                from apps.clinic.no_show_patient_notice import send_no_show_patient_notice
+
+                appt = (
+                    Appointment.objects.select_related("patient", "provider", "booked_service")
+                    .get(pk=aid)
+                )
+                inv = (
+                    Invoice.objects.filter(
+                        appointment_id=aid,
+                        kind=Invoice.Kind.NO_SHOW_FEE,
+                    )
+                    .order_by("-created_at")
+                    .first()
+                )
+                send_no_show_patient_notice(
+                    appt,
+                    invoice=inv,
+                    card_charged=charged,
+                )
+
+            transaction.on_commit(queue_no_show_billing_notice)
 
     def perform_destroy(self, instance):
         from .google_calendar_sync import delete_appointment_google_event_before_db_delete
@@ -2663,6 +2688,8 @@ class AdminViewSet(viewsets.ViewSet):
             return Response({
                 **h,
                 "no_show_fee": str(solo.no_show_fee),
+                "auto_no_show_enabled": solo.auto_no_show_enabled,
+                "auto_no_show_grace_minutes": solo.auto_no_show_grace_minutes,
                 "business_hours": list(solo.business_hours or []),
             })
         if getattr(request.user, "role", None) not in ("owner_admin", "staff"):
@@ -2694,6 +2721,10 @@ class AdminViewSet(viewsets.ViewSet):
                 )
         if "no_show_fee" in data:
             solo.no_show_fee = data["no_show_fee"]
+        if "auto_no_show_enabled" in data:
+            solo.auto_no_show_enabled = data["auto_no_show_enabled"]
+        if "auto_no_show_grace_minutes" in data:
+            solo.auto_no_show_grace_minutes = data["auto_no_show_grace_minutes"]
         if "business_hours" in data:
             solo.business_hours = data["business_hours"]
         solo.save()
@@ -2701,6 +2732,8 @@ class AdminViewSet(viewsets.ViewSet):
         return Response({
             **h,
             "no_show_fee": str(solo.no_show_fee),
+            "auto_no_show_enabled": solo.auto_no_show_enabled,
+            "auto_no_show_grace_minutes": solo.auto_no_show_grace_minutes,
             "business_hours": list(solo.business_hours or []),
         })
 

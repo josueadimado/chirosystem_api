@@ -21,6 +21,20 @@ def get_no_show_fee_amount() -> Decimal:
     return ClinicSettings.get_solo().no_show_fee or Decimal("0")
 
 
+def compute_no_show_fee_for_appointment(appointment: Appointment) -> Decimal:
+    """Same fee rules as staff marking no-show on the schedule."""
+    svc = appointment.booked_service
+    fee_amt = Decimal("0")
+    if svc and svc.service_type in (
+        Service.ServiceType.CHIROPRACTIC,
+        Service.ServiceType.MASSAGE,
+    ):
+        fee_amt = svc.price or Decimal("0")
+    if fee_amt <= 0:
+        fee_amt = get_no_show_fee_amount()
+    return fee_amt
+
+
 def _get_or_create_penalty_service(*, billing_code: str, name: str, description: str, amount: Decimal) -> Service:
     s, _ = Service.objects.get_or_create(
         billing_code=billing_code,

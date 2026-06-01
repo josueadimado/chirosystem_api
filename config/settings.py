@@ -181,6 +181,10 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.notifications.tasks.send_daily_appointment_reminders",
         "schedule": crontab(hour=9, minute=0),
     },
+    "process-auto-no-show-appointments": {
+        "task": "apps.notifications.tasks.process_auto_no_show_appointments_task",
+        "schedule": crontab(minute="*/15"),
+    },
 }
 
 # Twilio SMS (optional). If any of these are missing, SMS is skipped — booking still works.

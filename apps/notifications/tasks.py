@@ -790,3 +790,14 @@ def send_provider_dashboard_book_next_patient_email_task(appointment_id: int) ->
     except Exception:
         logger.exception("Provider dashboard book-next email failed: appt=%s", appointment_id)
         return "send_failed"
+
+
+@shared_task
+def process_auto_no_show_appointments_task() -> dict:
+    """
+    Celery Beat (every 15 minutes): mark booked/checked-in visits as no-show when
+    start time + grace (default 60 min) has passed, apply fee billing, notify patient.
+    """
+    from apps.clinic.auto_no_show import process_auto_no_show_appointments
+
+    return process_auto_no_show_appointments()

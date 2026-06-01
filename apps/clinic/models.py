@@ -254,6 +254,13 @@ class Appointment(TimeStampedModel):
     day_before_reminder_email_at = models.DateTimeField(null=True, blank=True)
     same_day_reminder_sms_at = models.DateTimeField(null=True, blank=True)
     same_day_reminder_email_at = models.DateTimeField(null=True, blank=True)
+    auto_no_show_processed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Set when the system automatically marked this visit as no-show.",
+    )
+    no_show_notice_sms_at = models.DateTimeField(null=True, blank=True)
+    no_show_notice_email_at = models.DateTimeField(null=True, blank=True)
     # Google Calendar event on the provider's connected personal calendar
     google_calendar_event_id = models.CharField(max_length=255, blank=True)
 
@@ -582,6 +589,14 @@ class ClinicSettings(TimeStampedModel):
         help_text="Fallback no-show amount (USD) when the booked visit type has no price. "
         "Normally chiropractic and massage no-shows use the booked service price. "
         "Set to 0 to skip only that fallback. Card on file is charged when possible; otherwise the visit may stay in Awaiting payment.",
+    )
+    auto_no_show_enabled = models.BooleanField(
+        default=True,
+        help_text="Automatically mark unattended visits as no-show after the grace period.",
+    )
+    auto_no_show_grace_minutes = models.PositiveSmallIntegerField(
+        default=60,
+        help_text="Minutes after scheduled start before auto no-show runs.",
     )
 
     class Meta:

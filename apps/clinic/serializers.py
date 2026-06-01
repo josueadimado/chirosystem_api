@@ -416,6 +416,7 @@ class AppointmentListSerializer(serializers.ModelSerializer):
     patient_date_of_birth = serializers.SerializerMethodField()
     invoice_kind = serializers.SerializerMethodField()
     display_status = serializers.SerializerMethodField()
+    auto_no_show_processed_at = serializers.DateTimeField(read_only=True)
 
     class Meta:
         model = Appointment
@@ -437,6 +438,7 @@ class AppointmentListSerializer(serializers.ModelSerializer):
             "status",
             "display_status",
             "invoice_kind",
+            "auto_no_show_processed_at",
             "reason_for_visit",
         )
 
@@ -761,6 +763,12 @@ class ClinicProfileUpdateSerializer(serializers.Serializer):
         max_digits=10,
         decimal_places=2,
         min_value=Decimal("0"),
+        required=False,
+    )
+    auto_no_show_enabled = serializers.BooleanField(required=False)
+    auto_no_show_grace_minutes = serializers.IntegerField(
+        min_value=15,
+        max_value=240,
         required=False,
     )
     business_hours = serializers.ListField(

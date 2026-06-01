@@ -61,6 +61,11 @@ def patient_wants_bill_email(patient: Patient) -> bool:
     return _pref_includes_email(patient.notify_bills) and bool((patient.email or "").strip())
 
 
+def patient_wants_bill_sms(patient: Patient) -> bool:
+    """No-show fees, visit receipts, and other billing notices (notify_bills)."""
+    return _pref_includes_sms(patient.notify_bills) and bool((patient.phone or "").strip())
+
+
 def patient_communication_prefs_payload(patient: Patient) -> dict:
     return {
         "notify_booking": patient.notify_booking,

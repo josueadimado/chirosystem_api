@@ -159,6 +159,31 @@ def appointment_reminder_body(
     )
 
 
+def no_show_fee_notice_sms_body(
+    *,
+    first_name: str,
+    service_name: str,
+    appt_date_display: str,
+    appt_time_display: str,
+    provider_display: str,
+    fee_display: str,
+    card_charged: bool,
+    clinic_phone: str,
+) -> str:
+    """Patient SMS when a visit is marked no-show (billing prefs / notify_bills)."""
+    if card_charged and fee_display:
+        fee_part = f"We charged your card on file {fee_display} for the missed visit."
+    elif fee_display:
+        fee_part = f"A no-show fee of {fee_display} is due."
+    else:
+        fee_part = "Please call us if you need to reschedule."
+    return (
+        f"Relief Chiropractic: Hi {first_name}, you missed your {service_name} on "
+        f"{appt_date_display} at {appt_time_display} with {provider_display}. "
+        f"{fee_part} Questions? {clinic_phone}.{sms_footer()}"
+    )
+
+
 def provider_checkin_body(*, patient_name: str, time_display: str) -> str:
     return (
         f"Relief Chiropractic: {patient_name} completed check-in (scheduled {time_display}).{sms_footer()}"
