@@ -1,3 +1,5 @@
+from django.conf import settings
+from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import include, path
 
@@ -51,6 +53,9 @@ router.register("admin", AdminViewSet, basename="admin")
 
 urlpatterns = [
     path("health/", health, name="health"),
+    # Serve uploaded media files (patient documents, images).
+    # In production, use nginx to serve MEDIA_ROOT directly for better performance.
+    *static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT),
     path("admin/", admin.site.urls),
     path("api/v1/square/webhook/", square_webhook, name="square-webhook"),
     path("api/v1/square/pos-callback/", square_pos_callback, name="square-pos-callback"),

@@ -102,6 +102,45 @@ class Patient(TimeStampedModel):
         return f"{self.first_name} {self.last_name}"
 
 
+def _patient_document_upload_path(instance: "PatientDocument", filename: str) -> str:
+    return f"patient_documents/{instance.patient_id}/{filename}"
+
+
+class PatientDocument(TimeStampedModel):
+    """A file (image, PDF, etc.) attached to a patient's record by staff or a doctor."""
+
+    DOC_TYPES = [
+        ("insurance_card", "Insurance Card"),
+        ("x_ray", "X-Ray / Imaging"),
+        ("lab_result", "Lab Result"),
+        ("referral", "Referral Letter"),
+        ("intake_form", "Intake Form"),
+        ("other", "Other"),
+    ]
+
+    patient = models.ForeignKey(Patient, on_delete=models.CASCADE, related_name="documents")
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    file = models.FileField(upload_to=_patient_document_upload_path)
+    original_filename = models.CharField(max_length=255)
+    label = models.CharField(
+        max_length=200,
+        help_text="Short descriptive name shown in the chart (e.g. 'Blue Cross card front').",
+    )
+    doc_type = models.CharField(max_length=30, choices=DOC_TYPES, default="other")
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.label} — {self.patient}"
+
+
 class Provider(TimeStampedModel):
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     title = models.CharField(max_length=100, blank=True)

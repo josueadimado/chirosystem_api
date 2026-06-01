@@ -144,6 +144,16 @@ try:
     STATIC_ROOT.mkdir(parents=True, exist_ok=True)
 except OSError:
     pass
+
+# Media files — uploaded patient documents, insurance cards, images, etc.
+# In production, point MEDIA_ROOT at a volume and serve via nginx (or switch to S3 with django-storages).
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"
+try:
+    MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # In Docker, use redis://redis:6379/0 (Compose service name). Many .env files set REDIS_URL only.
