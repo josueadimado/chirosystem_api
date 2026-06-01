@@ -200,6 +200,51 @@ def _format_bill_display_date(d) -> str:
     return f"{d.strftime('%b')} {d.day}, {d.year}"
 
 
+def _serialize_billing_invoice_row(inv: Invoice) -> dict:
+    """One row for GET /admin/billing_invoices/ (list + detail modal)."""
+    row = {
+        "id": inv.id,
+        "invoice_number": inv.invoice_number,
+        "patient_id": inv.patient_id,
+        "patient_name": f"{inv.patient.first_name} {inv.patient.last_name}",
+        "patient_credit_balance": str(inv.patient.credit_balance),
+        "status": inv.status,
+        "kind": inv.kind,
+        "appointment_id": inv.appointment_id,
+        "appointment_status": inv.appointment.status if inv.appointment_id else None,
+        "appointment_date": str(inv.appointment.appointment_date) if inv.appointment_id else None,
+        "booked_service_id": inv.appointment.booked_service_id if inv.appointment_id else None,
+        "total_amount": str(inv.total_amount),
+        "subtotal": str(inv.subtotal),
+        "discount": str(inv.discount),
+        "credit_applied_total": str(inv.credit_applied_total),
+        "professional_discount_reason": inv.professional_discount_reason or "",
+        "tax": str(inv.tax),
+        "issued_at": inv.issued_at.isoformat() if inv.issued_at else None,
+        "paid_at": inv.paid_at.isoformat() if inv.paid_at else None,
+    }
+    if inv.visit_id:
+        row.update(_visit_invoice_bill_totals(inv.visit, inv))
+    else:
+        pay_sum = inv.payments.filter(status=Payment.Status.SUCCESSFUL).aggregate(s=Sum("amount"))["s"]
+        pay_sum = pay_sum if pay_sum is not None else Decimal("0")
+        payments_received = (pay_sum + inv.credit_applied_total).quantize(Decimal("0.01"))
+        patient_charge = inv.total_amount.quantize(Decimal("0.01"))
+        remaining_client = (patient_charge - payments_received).quantize(Decimal("0.01"))
+        if remaining_client < Decimal("0"):
+            remaining_client = Decimal("0.00")
+        row.update(
+            {
+                "bill_charges_total": str(inv.subtotal),
+                "patient_charge_total": str(patient_charge),
+                "insurance_remaining_total": "0.00",
+                "payments_received_total": str(payments_received),
+                "remaining_client_responsibility_total": str(remaining_client),
+            }
+        )
+    return row
+
+
 def _visit_invoice_bill_totals(visit: Visit, inv: Invoice) -> dict:
     """
     Split documented visit charges into patient (Relief Chiropractic) vs insurance-only lines.
@@ -2925,59 +2970,79 @@ class AdminViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["get"], url_path="billing_invoices")
     def billing_invoices(self, request):
-        """Invoices for admin billing UI (patient name + totals)."""
-        qs = _defer_patient_card_fields(
+        """
+        Invoices for admin billing UI. Paginated: ?page=1&page_size=25.
+        Filters: list_filter, kind, search, visit_date_from, visit_date_to, insurance_only=1.
+        Response includes summary counts for status tabs.
+        """
+        denied = self._admin_staff_only(request)
+        if denied:
+            return denied
+
+        base = _defer_patient_card_fields(
             Invoice.objects.select_related("patient", "appointment", "appointment__booked_service", "visit")
-            .prefetch_related("visit__rendered_services")
-            .order_by("-issued_at"),
+            .prefetch_related("visit__rendered_services"),
             patient_prefix="patient",
-        )[:250]
-        rows = []
-        for inv in qs:
-            row = {
-                "id": inv.id,
-                "invoice_number": inv.invoice_number,
-                "patient_id": inv.patient_id,
-                "patient_name": f"{inv.patient.first_name} {inv.patient.last_name}",
-                "patient_credit_balance": str(inv.patient.credit_balance),
-                "status": inv.status,
-                "kind": inv.kind,
-                "appointment_id": inv.appointment_id,
-                "appointment_status": inv.appointment.status if inv.appointment_id else None,
-                "appointment_date": str(inv.appointment.appointment_date)
-                if inv.appointment_id
-                else None,
-                "booked_service_id": inv.appointment.booked_service_id if inv.appointment_id else None,
-                "total_amount": str(inv.total_amount),
-                "subtotal": str(inv.subtotal),
-                "discount": str(inv.discount),
-                "credit_applied_total": str(inv.credit_applied_total),
-                "professional_discount_reason": inv.professional_discount_reason or "",
-                "tax": str(inv.tax),
-                "issued_at": inv.issued_at.isoformat() if inv.issued_at else None,
-                "paid_at": inv.paid_at.isoformat() if inv.paid_at else None,
-            }
-            if inv.visit_id:
-                row.update(_visit_invoice_bill_totals(inv.visit, inv))
-            else:
-                pay_sum = inv.payments.filter(status=Payment.Status.SUCCESSFUL).aggregate(s=Sum("amount"))["s"]
-                pay_sum = pay_sum if pay_sum is not None else Decimal("0")
-                payments_received = (pay_sum + inv.credit_applied_total).quantize(Decimal("0.01"))
-                patient_charge = inv.total_amount.quantize(Decimal("0.01"))
-                remaining_client = (patient_charge - payments_received).quantize(Decimal("0.01"))
-                if remaining_client < Decimal("0"):
-                    remaining_client = Decimal("0.00")
-                row.update(
-                    {
-                        "bill_charges_total": str(inv.subtotal),
-                        "patient_charge_total": str(patient_charge),
-                        "insurance_remaining_total": "0.00",
-                        "payments_received_total": str(payments_received),
-                        "remaining_client_responsibility_total": str(remaining_client),
-                    }
-                )
-            rows.append(row)
-        return Response(rows)
+        )
+        summary = {
+            "total": base.count(),
+            "open": base.filter(
+                status__in=[
+                    Invoice.Status.ISSUED,
+                    Invoice.Status.OVERDUE,
+                    Invoice.Status.DRAFT,
+                ]
+            ).count(),
+            "overdue": base.filter(status=Invoice.Status.OVERDUE).count(),
+            "paid": base.filter(status=Invoice.Status.PAID).count(),
+        }
+
+        qs = base.order_by("-issued_at", "-id")
+        list_filter = (request.query_params.get("list_filter") or "all").strip().lower()
+        if list_filter == "open":
+            qs = qs.filter(
+                status__in=[
+                    Invoice.Status.ISSUED,
+                    Invoice.Status.OVERDUE,
+                    Invoice.Status.DRAFT,
+                ]
+            )
+        elif list_filter == "paid":
+            qs = qs.filter(status=Invoice.Status.PAID)
+        elif list_filter == "overdue":
+            qs = qs.filter(status=Invoice.Status.OVERDUE)
+
+        kind = (request.query_params.get("kind") or "").strip()
+        if kind:
+            qs = qs.filter(kind=kind)
+
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            search_q = (
+                Q(patient__first_name__icontains=search)
+                | Q(patient__last_name__icontains=search)
+                | Q(invoice_number__icontains=search)
+            )
+            if search.isdigit():
+                search_q |= Q(patient_id=int(search))
+            qs = qs.filter(search_q)
+
+        date_from = (request.query_params.get("visit_date_from") or "").strip()
+        if date_from:
+            qs = qs.filter(appointment__appointment_date__gte=date_from)
+        date_to = (request.query_params.get("visit_date_to") or "").strip()
+        if date_to:
+            qs = qs.filter(appointment__appointment_date__lte=date_to)
+
+        if request.query_params.get("insurance_only", "").strip().lower() in ("1", "true", "yes"):
+            qs = qs.filter(visit__rendered_services__charges_patient=False).distinct()
+
+        paginator = StandardPageNumberPagination()
+        page = paginator.paginate_queryset(qs, request)
+        rows = [_serialize_billing_invoice_row(inv) for inv in page]
+        response = paginator.get_paginated_response(rows)
+        response.data["summary"] = summary
+        return response
 
     @action(detail=False, methods=["post"], url_path="patient_credit_topup")
     def patient_credit_topup(self, request):
