@@ -607,7 +607,7 @@ class RecurringBookingPreviewSerializer(serializers.Serializer):
     service_id = serializers.IntegerField()
     provider_id = serializers.IntegerField()
     appointment_date = serializers.DateField()
-    start_time = serializers.TimeField(input_formats=["%I:%M %p", "%H:%M"])
+    start_time = serializers.TimeField(input_formats=["%I:%M %p", "%H:%M", "%H:%M:%S"])
     recurrence = serializers.ChoiceField(choices=["weekly", "biweekly", "monthly"])
     occurrence_count = serializers.IntegerField(min_value=2, max_value=12, default=4)
     phone = serializers.CharField(max_length=20, required=False, allow_blank=True, default="")
@@ -646,7 +646,7 @@ class DeskRecurringBookingPreviewSerializer(serializers.Serializer):
     service_id = serializers.IntegerField()
     provider_id = serializers.IntegerField()
     appointment_date = serializers.DateField()
-    start_time = serializers.TimeField(input_formats=["%I:%M %p", "%H:%M"])
+    start_time = serializers.TimeField(input_formats=["%I:%M %p", "%H:%M", "%H:%M:%S"])
     recurrence = serializers.ChoiceField(choices=["weekly", "biweekly", "monthly"])
     occurrence_count = serializers.IntegerField(min_value=2, max_value=12, default=4)
 

@@ -2119,10 +2119,8 @@ class AppointmentViewSet(viewsets.ModelViewSet):
 
         serializer = RecurringBookingPreviewSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        result = preview_recurring_slots(serializer.validated_data)
-        if not result.get("ok"):
-            return Response({"detail": result.get("detail")}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(result)
+        # Always 200 so the booking UI can read ok/detail/occurrences (avoid generic “could not load” on 400).
+        return Response(preview_recurring_slots(serializer.validated_data))
 
     @action(detail=False, methods=["post"], url_path="book-recurring")
     def book_recurring(self, request):
@@ -2183,10 +2181,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         if not user_may_book_as_provider(request.user, provider):
             return Response({"detail": "You cannot book for that provider."}, status=status.HTTP_403_FORBIDDEN)
 
-        result = preview_recurring_slots_desk(data)
-        if not result.get("ok"):
-            return Response({"detail": result.get("detail")}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(result)
+        return Response(preview_recurring_slots_desk(data))
 
     @action(detail=False, methods=["post"], url_path="book-recurring-from-desk")
     def book_recurring_from_desk(self, request):
