@@ -1188,7 +1188,12 @@ class BookingOptionsViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["get"], url_path="my-appointments")
     def my_appointments(self, request):
-        """List upcoming BOOKED visits for this phone that can be managed online. Public."""
+        """
+        List upcoming visits for this phone. Public.
+
+        purpose=manage (default): BOOKED only, online-bookable services, future start times — reschedule/cancel.
+        purpose=view: also CHECKED_IN / IN_CONSULTATION so patients can see today's visit after kiosk check-in.
+        """
 
         from .patient_phone import patients_matching_phone
 
@@ -1211,14 +1216,25 @@ class BookingOptionsViewSet(viewsets.ViewSet):
 
         patient_ids = [p.id for p in patients]
         shared = len(patients) > 1
+        purpose = (request.query_params.get("purpose") or "manage").strip().lower()
+        view_only = purpose == "view"
 
         now = timezone.now()
         today = now.date()
+        if view_only:
+            status_list = [
+                Appointment.Status.BOOKED,
+                Appointment.Status.CHECKED_IN,
+                Appointment.Status.IN_CONSULTATION,
+            ]
+        else:
+            status_list = [Appointment.Status.BOOKED]
+
         rows = (
             Appointment.objects.filter(
                 patient_id__in=patient_ids,
                 appointment_date__gte=today,
-                status=Appointment.Status.BOOKED,
+                status__in=status_list,
             )
             .select_related("patient", "provider", "booked_service")
             .order_by("appointment_date", "start_time")
@@ -1226,30 +1242,60 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         out = []
         for a in rows:
             svc = a.booked_service
-            if not svc or not svc.is_active or not svc.show_in_public_booking:
-                continue
-            if a.appointment_date == today:
-                try:
-                    start_aware = _appointment_start_aware_in_clinic_tz(a)
-                except Exception:
+            if view_only:
+                if not svc:
+                    service_name = "Scheduled visit"
+                    service_id = 0
+                    service_type = ""
+                    duration_minutes = 0
+                    price = "0"
+                else:
+                    service_name = svc.label_for_public_booking()
+                    service_id = svc.id
+                    service_type = svc.service_type
+                    duration_minutes = svc.duration_minutes
+                    price = str(svc.price)
+            else:
+                if not svc or not svc.is_active or not svc.show_in_public_booking:
                     continue
-                if start_aware <= now:
-                    continue
+                service_name = svc.label_for_public_booking()
+                service_id = svc.id
+                service_type = svc.service_type
+                duration_minutes = svc.duration_minutes
+                price = str(svc.price)
+                if a.appointment_date == today and a.status == Appointment.Status.BOOKED:
+                    try:
+                        start_aware = _appointment_start_aware_in_clinic_tz(a)
+                    except Exception:
+                        continue
+                    if start_aware <= now:
+                        continue
             pn = a.patient
             out.append(
                 {
                     "id": a.id,
                     "appointment_date": str(a.appointment_date),
                     "start_time": format_time_12h(a.start_time),
-                    "service_id": svc.id,
-                    "service_name": svc.label_for_public_booking(),
-                    "service_type": svc.service_type,
+                    "service_id": service_id,
+                    "service_name": service_name,
+                    "service_type": service_type,
                     "provider_id": a.provider_id,
                     "provider_name": str(a.provider),
-                    "duration_minutes": svc.duration_minutes,
-                    "price": str(svc.price),
+                    "duration_minutes": duration_minutes,
+                    "price": price,
                     "patient_name": f"{pn.first_name} {pn.last_name}".strip(),
+                    "status": a.status,
+                    "can_manage_online": a.status == Appointment.Status.BOOKED
+                    and bool(svc and svc.is_active and svc.show_in_public_booking),
                 }
+            )
+        empty_hint = ""
+        if not out:
+            empty_hint = self._my_appointments_empty_hint(
+                patient_ids=patient_ids,
+                today=today,
+                now=now,
+                view_only=view_only,
             )
         one = patients[0]
         return Response(
@@ -1259,7 +1305,94 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                 "email": one.email or "" if not shared else "",
                 "ambiguous_phone": shared,
                 "appointments": out,
+                "empty_hint": empty_hint,
             }
+        )
+
+    def _my_appointments_empty_hint(
+        self,
+        *,
+        patient_ids: list[int],
+        today,
+        now,
+        view_only: bool,
+    ) -> str:
+        """Explain why my-appointments returned no rows when staff/patient expect a visit."""
+        future = (
+            Appointment.objects.filter(
+                patient_id__in=patient_ids,
+                appointment_date__gte=today,
+            )
+            .exclude(
+                status__in=[
+                    Appointment.Status.CANCELLED,
+                    Appointment.Status.NO_SHOW,
+                    Appointment.Status.COMPLETED,
+                ]
+            )
+            .select_related("booked_service")
+        )
+        if not future.exists():
+            if Appointment.objects.filter(
+                patient_id__in=patient_ids,
+                appointment_date__lt=today,
+            ).exclude(status=Appointment.Status.CANCELLED).exists():
+                return (
+                    "We found older visits on this number but nothing scheduled from today onward. "
+                    "If you expected a future visit, call the clinic — the number on file may differ."
+                )
+            return (
+                "We don't see any scheduled visits on or after today for this number. "
+                "Use the same cell number from when you booked, or call the clinic."
+            )
+
+        if not view_only:
+            active = future.filter(
+                status__in=[
+                    Appointment.Status.CHECKED_IN,
+                    Appointment.Status.IN_CONSULTATION,
+                    Appointment.Status.AWAITING_PAYMENT,
+                ]
+            )
+            if active.exists():
+                return (
+                    "You have a visit today that is already checked in or in progress. "
+                    "Only visits still marked Booked (before check-in) can be changed online — call the front desk for help."
+                )
+
+        booked = future.filter(status=Appointment.Status.BOOKED)
+        if booked.exists():
+            hidden_service = False
+            passed_today = False
+            for a in booked:
+                svc = a.booked_service
+                if not svc or not svc.is_active or not svc.show_in_public_booking:
+                    hidden_service = True
+                if (
+                    not view_only
+                    and a.appointment_date == today
+                    and svc
+                    and svc.is_active
+                    and svc.show_in_public_booking
+                ):
+                    try:
+                        if _appointment_start_aware_in_clinic_tz(a) <= now:
+                            passed_today = True
+                    except Exception:
+                        pass
+            if hidden_service:
+                return (
+                    "A visit is on file for this number, but that visit type is not set up for online changes. "
+                    "Please call the clinic."
+                )
+            if passed_today:
+                return (
+                    "Today's visit time has already started or passed for online changes. "
+                    "Call the clinic if you still need to reschedule or cancel."
+                )
+
+        return (
+            "No upcoming visits found for this number that can be shown online. Call the clinic if you need help."
         )
 
     @action(detail=False, methods=["post"], url_path="reschedule")
