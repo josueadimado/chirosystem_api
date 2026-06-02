@@ -860,6 +860,7 @@ class SaveSquareCardSerializer(serializers.Serializer):
 
 class TerminalCheckoutSerializer(serializers.Serializer):
     invoice_id = serializers.IntegerField(min_value=1)
+    include_pending_fees = serializers.BooleanField(required=False, default=False)
 
 
 class TerminalCheckoutStatusSerializer(serializers.Serializer):

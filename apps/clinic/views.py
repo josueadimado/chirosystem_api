@@ -352,6 +352,19 @@ def _invoice_bill_dict(inv: Invoice, *, preview: bool) -> dict:
     }
 
 
+def _doctor_collect_payment_followup(invoice: Invoice, *, try_saved_card: bool) -> dict:
+    """Payment banner payload: Square options plus other open penalty balances."""
+    from .patient_payment_pending import build_doctor_pending_payment_context
+
+    followup = build_invoice_payment_followup_dict(invoice, try_saved_card=try_saved_card)
+    followup.pop("already_paid", None)
+    followup["pending_payment"] = build_doctor_pending_payment_context(
+        invoice.patient_id,
+        current_invoice_id=invoice.id,
+    )
+    return followup
+
+
 def _set_appointment_status_after_invoice_paid(inv: Invoice) -> None:
     appt = inv.appointment
     if inv.kind == Invoice.Kind.NO_SHOW_FEE:
@@ -4249,11 +4262,62 @@ class DoctorViewSet(viewsets.ViewSet):
         inv = Invoice.objects.filter(pk=invoice_id).select_related("appointment").first()
         if not inv:
             return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
+        include_pending = str(request.query_params.get("include_pending_fees", "")).lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if include_pending:
+            from .patient_payment_pending import invoice_ids_for_doctor_bundle
+            from .square_payment import try_reconcile_bundle_terminal_payment, try_reconcile_invoice_from_square
+
+            bundle_ids = list(invoice_ids_for_doctor_bundle(inv, include_pending_fees=True))
+            try_reconcile_bundle_terminal_payment(inv)
+            for bid in bundle_ids:
+                sibling = Invoice.objects.filter(pk=bid).first()
+                if sibling and sibling.status != Invoice.Status.PAID:
+                    try_reconcile_invoice_from_square(sibling)
+            inv.refresh_from_db()
+            statuses = list(Invoice.objects.filter(pk__in=bundle_ids).values_list("status", flat=True))
+            all_paid = bool(statuses) and all(s == Invoice.Status.PAID for s in statuses)
+            return Response(
+                {
+                    "paid": all_paid,
+                    "status": inv.status,
+                    "bundle_invoice_ids": bundle_ids,
+                }
+            )
         if inv.status != Invoice.Status.PAID:
             try_reconcile_invoice_from_square(inv)
             inv.refresh_from_db()
         paid = inv.status == Invoice.Status.PAID
         return Response({"paid": paid, "status": inv.status})
+
+    @action(detail=False, methods=["get"], url_path="patient_pending_payment")
+    def patient_pending_payment(self, request):
+        """Open penalty balances for a patient (consultation + payment UI)."""
+        provider = self._get_provider(request)
+        if not provider:
+            return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
+        raw_pid = request.query_params.get("patient_id")
+        if not raw_pid:
+            return Response({"detail": "patient_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            patient_id = int(raw_pid)
+        except (TypeError, ValueError):
+            return Response({"detail": "Invalid patient_id."}, status=status.HTTP_400_BAD_REQUEST)
+        current_invoice_id = request.query_params.get("current_invoice_id")
+        cur_id: int | None = None
+        if current_invoice_id:
+            try:
+                cur_id = int(current_invoice_id)
+            except (TypeError, ValueError):
+                return Response({"detail": "Invalid current_invoice_id."}, status=status.HTTP_400_BAD_REQUEST)
+        from .patient_payment_pending import build_doctor_pending_payment_context
+
+        return Response(
+            build_doctor_pending_payment_context(patient_id, current_invoice_id=cur_id),
+        )
 
     @action(detail=False, methods=["post"], url_path="sync-invoice-payment")
     def sync_invoice_payment(self, request):
@@ -4452,10 +4516,9 @@ class DoctorViewSet(viewsets.ViewSet):
         visit.appointment.save(update_fields=["status", "completed_at", "updated_at"])
 
         invoice.refresh_from_db()
-        followup = build_invoice_payment_followup_dict(
+        followup = _doctor_collect_payment_followup(
             invoice, try_saved_card=data.get("charge_saved_card_if_present", True)
         )
-        followup.pop("already_paid", None)
         invoice.refresh_from_db()
         if invoice.status != Invoice.Status.PAID:
             terminal_checkout_id = try_push_terminal_checkout_to_kiosk(invoice)
@@ -4566,10 +4629,9 @@ class DoctorViewSet(viewsets.ViewSet):
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         invoice.refresh_from_db()
-        followup = build_invoice_payment_followup_dict(
+        followup = _doctor_collect_payment_followup(
             invoice, try_saved_card=data.get("charge_saved_card_if_present", False)
         )
-        followup.pop("already_paid", None)
         invoice.refresh_from_db()
         if invoice.status != Invoice.Status.PAID:
             terminal_checkout_id = try_push_terminal_checkout_to_kiosk(invoice)
@@ -4627,7 +4689,7 @@ class DoctorViewSet(viewsets.ViewSet):
             )
 
         try_saved_card = bool(request.data.get("try_saved_card", False))
-        followup = build_invoice_payment_followup_dict(inv, try_saved_card=try_saved_card)
+        followup = _doctor_collect_payment_followup(inv, try_saved_card=try_saved_card)
         return Response(followup)
 
     @action(detail=False, methods=["get"], url_path="square_terminal_config")
@@ -4722,13 +4784,14 @@ class DoctorViewSet(viewsets.ViewSet):
             return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
         if inv.appointment.provider_id != provider.id:
             return Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
-        if inv.status != Invoice.Status.ISSUED:
+        if inv.status not in (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT):
             return Response(
                 {"detail": "Invoice is not awaiting payment."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        include_pending = bool(ser.validated_data.get("include_pending_fees"))
         try:
-            out = create_terminal_checkout_for_invoice(inv)
+            out = create_terminal_checkout_for_invoice(inv, include_pending_fees=include_pending)
         except Exception as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
         return Response(out)

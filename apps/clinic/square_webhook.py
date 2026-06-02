@@ -17,6 +17,7 @@ from django.views.decorators.http import require_POST
 from .models import Invoice
 from .square_payment import (
     apply_credit_topup_from_square_payment,
+    invoice_id_from_square_reference,
     invoice_open_for_square_settlement,
     mark_invoice_paid_from_square,
     parse_credit_topup_reference,
@@ -46,15 +47,7 @@ def _verify_square_signature(*, body: bytes, signature_header: str, signature_ke
 
 
 def _invoice_id_from_reference(ref: str | None) -> int | None:
-    if not ref:
-        return None
-    ref = ref.strip()
-    if ref.isdigit():
-        try:
-            return int(ref)
-        except ValueError:
-            return None
-    return None
+    return invoice_id_from_square_reference(ref)
 
 
 def _handle_credit_topup_payment(payment: dict) -> bool:
@@ -118,7 +111,16 @@ def _handle_terminal_checkout_object(checkout: dict) -> None:
     if not inv_id:
         return
     inv = invoice_open_for_square_settlement(inv_id)
-    if inv:
+    if not inv:
+        return
+    ref = (checkout.get("reference_id") or "").strip()
+    if ref.startswith("bundle-"):
+        from .patient_payment_pending import invoice_ids_for_doctor_bundle
+        from .square_payment import mark_invoices_paid_from_square_bundle
+
+        bundle_ids = invoice_ids_for_doctor_bundle(inv, include_pending_fees=True)
+        mark_invoices_paid_from_square_bundle(bundle_ids, pid)
+    else:
         mark_invoice_paid_from_square(inv, pid)
 
 

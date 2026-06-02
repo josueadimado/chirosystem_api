@@ -44,9 +44,12 @@ def appointments_for_doctor_dashboard(provider, request) -> list[Appointment]:
 
 
 def serialize_doctor_dashboard_appointments(appt_list: list[Appointment]) -> list[dict]:
+    from .patient_payment_pending import patient_balance_due_by_id
     from .square_payment import try_reconcile_invoice_from_square
 
     appt_ids = [x.id for x in appt_list]
+    patient_ids = list({a.patient_id for a in appt_list})
+    balance_by_patient = patient_balance_due_by_id(patient_ids)
     visit_by_aid = {
         v.appointment_id: v
         for v in Visit.objects.filter(appointment_id__in=appt_ids).only(
@@ -104,6 +107,7 @@ def serialize_doctor_dashboard_appointments(appt_list: list[Appointment]) -> lis
             "card_last4": a.patient.card_last4 or "",
             "card_brand": a.patient.card_brand or "",
             "patient_payment_profile": (a.patient.payment_profile or "").strip(),
+            "patient_balance_due": balance_by_patient.get(a.patient_id, "0.00"),
         }
         inv = invoice_by_aid.get(a.id)
         if (

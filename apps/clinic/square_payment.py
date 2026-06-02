@@ -27,7 +27,32 @@ logger = logging.getLogger(__name__)
 # Square card payments are typically >= 100 cents in production; keep a small floor for dev.
 _MIN_AMOUNT_CENTS = 100
 _CREDIT_TOPUP_REF_PREFIX = "ct_"
+_BUNDLE_REF_PREFIX = "bundle-"
 _OPEN_INVOICE_STATUSES = (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT)
+
+
+def invoice_id_from_square_reference(ref: str | None) -> int | None:
+    """Parse Square reference_id: plain invoice pk or bundle-{pk} for multi-invoice checkout."""
+    if not ref:
+        return None
+    ref = ref.strip()
+    if ref.startswith(_BUNDLE_REF_PREFIX):
+        tail = ref[len(_BUNDLE_REF_PREFIX) :].strip()
+        if tail.isdigit():
+            try:
+                return int(tail)
+            except ValueError:
+                return None
+    if ref.isdigit():
+        try:
+            return int(ref)
+        except ValueError:
+            return None
+    return None
+
+
+def bundle_reference_id(primary_invoice_id: int) -> str:
+    return f"{_BUNDLE_REF_PREFIX}{primary_invoice_id}"[:40]
 
 
 def invoice_open_for_square_settlement(invoice_id: int) -> Invoice | None:
@@ -39,14 +64,34 @@ def invoice_open_for_square_settlement(invoice_id: int) -> Invoice | None:
     )
 
 
-def mark_invoice_paid_from_square(invoice: Invoice, square_payment_id: str) -> bool:
+def mark_invoices_paid_from_square_bundle(invoice_ids: list[int], square_payment_id: str) -> bool:
+    """Mark each open invoice paid from one Square payment (unique payment_reference per invoice)."""
+    ref_base = (square_payment_id or "").strip()[:120]
+    if not ref_base or not invoice_ids:
+        return False
+    ok = False
+    for inv_id in invoice_ids:
+        inv = Invoice.objects.filter(pk=inv_id).first()
+        if not inv or inv.status == Invoice.Status.PAID:
+            continue
+        if mark_invoice_paid_from_square(inv, ref_base, payment_reference=f"{ref_base}#inv{inv_id}"):
+            ok = True
+    return ok
+
+
+def mark_invoice_paid_from_square(
+    invoice: Invoice,
+    square_payment_id: str,
+    *,
+    payment_reference: str | None = None,
+) -> bool:
     """
     Record a successful Square payment and close the invoice + appointment.
 
     Idempotent: safe if the webhook, Terminal poll, and saved-card charge all run
     for the same Square payment id, or if Square retries the same webhook.
     """
-    ref = (square_payment_id or "").strip()[:120]
+    ref = (payment_reference or square_payment_id or "").strip()[:120]
     if not ref:
         logger.warning("mark_invoice_paid_from_square: empty Square payment id")
         return False
@@ -113,6 +158,13 @@ def _payment_reference_matches_invoice(payment_ref: str | None, invoice_pk: int)
         return True
     if ref.isdigit() and int(ref) == invoice_pk:
         return True
+    if ref.startswith(_BUNDLE_REF_PREFIX):
+        primary = invoice_id_from_square_reference(ref)
+        return primary == invoice_pk
+    if "#inv" in ref:
+        suffix = ref.split("#inv", 1)[-1].strip()
+        if suffix.isdigit() and int(suffix) == invoice_pk:
+            return True
     return False
 
 
@@ -401,6 +453,10 @@ def try_reconcile_invoice_from_square(invoice: Invoice | int) -> bool:
         return False
     if inv.status == Invoice.Status.PAID:
         return True
+    if try_reconcile_bundle_terminal_payment(inv):
+        inv.refresh_from_db()
+        if inv.status == Invoice.Status.PAID:
+            return True
     if not square_configured():
         return False
 
@@ -1003,27 +1059,89 @@ def create_payment_link_for_credit_topup(
     return (pl.url if pl and pl.url else None), reference_id
 
 
-def create_terminal_checkout_for_invoice(invoice: Invoice) -> dict:
+def _terminal_bundle_note(primary: Invoice, extra_invoice_ids: list[int]) -> str:
+    from .patient_payment_pending import combined_total_for_invoice_ids
+
+    inv = _invoice_for_terminal_checkout(primary)
+    base = _terminal_checkout_note(inv)
+    if not extra_invoice_ids:
+        return base
+    extras = list(
+        Invoice.objects.filter(pk__in=extra_invoice_ids)
+        .exclude(pk=primary.pk)
+        .order_by("created_at")
+        .only("invoice_number", "kind")
+    )
+    if not extras:
+        return base
+    labels = ", ".join(f"{i.invoice_number}" for i in extras)
+    total = combined_total_for_invoice_ids([primary.pk, *[e.pk for e in extras]])
+    return f"{base} + prior fees ({labels}) · total ${total}"[:500]
+
+
+def create_terminal_checkout_for_invoice(
+    invoice: Invoice,
+    *,
+    include_pending_fees: bool = False,
+) -> dict:
     """
     Send a card-present payment to the configured Square Terminal device.
-    Returns {"checkout_id": str, "status": str} or raises on error.
+    When include_pending_fees is True, charge visit + open no-show/late-cancel invoices.
+    Returns {"checkout_id": str, "status": str, "bundle_invoice_ids": list[int]} or raises.
     """
+    from .patient_payment_pending import combined_total_for_invoice_ids, invoice_ids_for_doctor_bundle
+
     device_id = get_terminal_device_id()
     if not device_id:
         raise ValueError("SQUARE_DEVICE_ID is not set — pair your Terminal in the Square Dashboard and paste the device id.")
 
-    amount_cents = _money_cents(invoice)
+    inv = _invoice_for_terminal_checkout(invoice)
+    bundle_ids = invoice_ids_for_doctor_bundle(inv, include_pending_fees=include_pending_fees)
+    amount_cents = int((combined_total_for_invoice_ids(bundle_ids) * 100).quantize(Decimal("1")))
     if amount_cents < _MIN_AMOUNT_CENTS:
         raise ValueError("Amount is below the minimum for card processing.")
 
-    inv = _invoice_for_terminal_checkout(invoice)
-    return _send_terminal_checkout(
+    reference_id = bundle_reference_id(inv.pk) if len(bundle_ids) > 1 else str(inv.pk)
+    extra_ids = [i for i in bundle_ids if i != inv.pk]
+    out = _send_terminal_checkout(
         amount_cents=amount_cents,
         device_id=device_id,
-        reference_id=str(invoice.id),
-        note=_terminal_checkout_note(inv),
+        reference_id=reference_id,
+        note=_terminal_bundle_note(inv, extra_ids),
         invoice=inv,
     )
+    out["bundle_invoice_ids"] = bundle_ids
+    out["amount_cents"] = amount_cents
+    return out
+
+
+def try_reconcile_bundle_terminal_payment(invoice: Invoice) -> bool:
+    """If a bundle Terminal checkout completed, mark all bundled invoices paid."""
+    from .patient_payment_pending import combined_total_for_invoice_ids, invoice_ids_for_doctor_bundle
+
+    if not square_configured():
+        return False
+    ref = bundle_reference_id(invoice.pk)
+    client = get_square_client()
+    try:
+        for co in _iter_terminal_checkouts(client, reference_ids=[ref]):
+            if (getattr(co, "status", None) or "").upper() != "COMPLETED":
+                continue
+            payment_ids = getattr(co, "payment_ids", None) or []
+            if not payment_ids:
+                continue
+            bundle_ids = invoice_ids_for_doctor_bundle(invoice, include_pending_fees=True)
+            expected_cents = int((combined_total_for_invoice_ids(bundle_ids) * 100).quantize(Decimal("1")))
+            am = getattr(co, "amount_money", None)
+            paid_cents = int(getattr(am, "amount", 0) or 0) if am else 0
+            if paid_cents and paid_cents < expected_cents:
+                continue
+            if mark_invoices_paid_from_square_bundle(bundle_ids, payment_ids[0]):
+                logger.info("Reconciled bundle payment for invoices %s", bundle_ids)
+                return True
+    except Exception as exc:
+        logger.debug("Bundle terminal reconcile for invoice %s: %s", invoice.pk, exc)
+    return False
 
 
 def try_push_terminal_checkout_to_kiosk(invoice: Invoice) -> str | None:
@@ -1141,11 +1259,19 @@ def get_terminal_checkout_status(checkout_id: str) -> dict:
         pid = co.payment_ids[0]
         out["payment_id"] = pid
         ref = (co.reference_id or "").strip()
-        if ref.isdigit():
-            inv = invoice_open_for_square_settlement(int(ref))
+        inv_pk = invoice_id_from_square_reference(ref)
+        if inv_pk:
+            inv = invoice_open_for_square_settlement(inv_pk)
             if inv:
-                mark_invoice_paid_from_square(inv, pid)
-        else:
+                if ref.startswith(_BUNDLE_REF_PREFIX):
+                    from .patient_payment_pending import invoice_ids_for_doctor_bundle
+
+                    bundle_ids = invoice_ids_for_doctor_bundle(inv, include_pending_fees=True)
+                    mark_invoices_paid_from_square_bundle(bundle_ids, pid)
+                    out["bundle_invoice_ids"] = bundle_ids
+                else:
+                    mark_invoice_paid_from_square(inv, pid)
+        elif not ref.isdigit():
             parsed = parse_credit_topup_reference(ref)
             if parsed:
                 _, expected_cents = parsed
