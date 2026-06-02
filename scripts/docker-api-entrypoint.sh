@@ -20,8 +20,9 @@ if [ -n "${DATABASE_URL:-}" ]; then
 fi
 
 echo "[api] Running migrations…"
-if ! python manage.py migrate --noinput; then
-  echo "[api] ERROR: migrate failed. Common fixes:"
+if ! python manage.py migrate --noinput 2>&1; then
+  echo "[api] ERROR: migrate failed (see traceback above). Common fixes:"
+  echo "[api]   - Duplicate index: redeploy latest code (0044 uses IF NOT EXISTS) or run: migrate clinic 0044_add_db_indexes --fake"
   echo "[api]   - POSTGRES_PASSWORD in .env must match the password used when the database volume was first created."
   echo "[api]   - POSTGRES_USER in .env must match (compose default: chiroflow_user)."
   echo "[api]   - Remove DATABASE_URL from .env if it points at localhost; compose sets host db."

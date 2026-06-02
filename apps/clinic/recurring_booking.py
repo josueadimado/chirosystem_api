@@ -13,7 +13,7 @@ from django.utils import timezone
 from .booking_provider_eligibility import provider_can_offer_service_online
 from .chiropractic_booking_policy import chiropractic_booking_must_use_intake
 from .models import Appointment, AppointmentSeries, Patient, Provider, Service, Visit
-from .patient_phone import get_or_create_patient_for_public_booking, record_patient_sms_consent_from_booking
+from .patient_phone import get_or_create_patient_for_public_booking
 from .online_booking_hours import public_booking_treatment_duration_minutes
 from .public_booking_service import (
     public_online_booking_calendar_span_minutes,
