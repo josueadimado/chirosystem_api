@@ -1,11 +1,11 @@
 from datetime import datetime, timedelta
 from decimal import Decimal
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 from django.conf import settings
+from django.core.cache import cache
 from django.core.signing import TimestampSigner
-from typing import Optional
-
 from django.db import transaction
 from django.db.models import Case, Count, IntegerField, OuterRef, Prefetch, Q, Subquery, Sum, Value, When
 from django.db.models.functions import TruncDate
@@ -163,8 +163,8 @@ def _defer_patient_card_fields(qs, *, patient_prefix: str | None = None):
 
 
 def _clinic_settings_bill_header():
-    """Header fields for printed bills and API responses (single DB row)."""
-    s = ClinicSettings.get_solo()
+    """Header fields for printed bills and API responses (single DB row, served from cache)."""
+    s = ClinicSettings.get_cached()
     return {
         "clinic_name": s.clinic_name,
         "address_line1": s.address_line1,
@@ -228,8 +228,12 @@ def _serialize_billing_invoice_row(inv: Invoice) -> dict:
     if inv.visit_id:
         row.update(_visit_invoice_bill_totals(inv.visit, inv))
     else:
-        pay_sum = inv.payments.filter(status=Payment.Status.SUCCESSFUL).aggregate(s=Sum("amount"))["s"]
-        pay_sum = pay_sum if pay_sum is not None else Decimal("0")
+        cached_payments = getattr(inv, "_successful_payments", None)
+        if cached_payments is not None:
+            pay_sum = sum((p.amount for p in cached_payments), Decimal("0"))
+        else:
+            pay_sum = inv.payments.filter(status=Payment.Status.SUCCESSFUL).aggregate(s=Sum("amount"))["s"]
+            pay_sum = pay_sum if pay_sum is not None else Decimal("0")
         payments_received = (pay_sum + inv.credit_applied_total).quantize(Decimal("0.01"))
         patient_charge = inv.total_amount.quantize(Decimal("0.01"))
         remaining_client = (patient_charge - payments_received).quantize(Decimal("0.01"))
@@ -252,17 +256,26 @@ def _visit_invoice_bill_totals(visit: Visit, inv: Invoice) -> dict:
     Split documented visit charges into patient (Relief Chiropractic) vs insurance-only lines.
     patient_charge_total = invoice total the client pays at the clinic (after discount).
     insurance_remaining_total = services documented for insurance, not charged to the patient.
+
+    Aggregations are computed in Python to reuse any prefetched rendered_services / payments
+    caches, avoiding extra DB queries inside list loops.
     """
-    documented_agg = visit.rendered_services.aggregate(s=Sum("total_price"))
-    documented = documented_agg["s"] if documented_agg["s"] is not None else inv.subtotal
+    all_lines = list(visit.rendered_services.all())
+    documented = sum((rs.total_price for rs in all_lines), Decimal("0")) or inv.subtotal
     documented = documented.quantize(Decimal("0.01"))
 
-    insurance_agg = visit.rendered_services.filter(charges_patient=False).aggregate(s=Sum("total_price"))
-    insurance = insurance_agg["s"] if insurance_agg["s"] is not None else Decimal("0")
+    insurance = sum(
+        (rs.total_price for rs in all_lines if not rs.charges_patient), Decimal("0")
+    )
     insurance = insurance.quantize(Decimal("0.01"))
 
-    pay_sum = inv.payments.filter(status=Payment.Status.SUCCESSFUL).aggregate(s=Sum("amount"))["s"]
-    pay_sum = pay_sum if pay_sum is not None else Decimal("0")
+    # Use prefetch_related to_attr cache when available, otherwise fall back to DB.
+    cached_payments = getattr(inv, "_successful_payments", None)
+    if cached_payments is not None:
+        pay_sum = sum((p.amount for p in cached_payments), Decimal("0"))
+    else:
+        pay_sum = inv.payments.filter(status=Payment.Status.SUCCESSFUL).aggregate(s=Sum("amount"))["s"]
+        pay_sum = pay_sum if pay_sum is not None else Decimal("0")
     payments_received = (pay_sum + inv.credit_applied_total).quantize(Decimal("0.01"))
     patient_charge = inv.total_amount.quantize(Decimal("0.01"))
     remaining_client = (patient_charge - payments_received).quantize(Decimal("0.01"))
@@ -561,7 +574,16 @@ def _serialize_patient_appointment_history(request, appointments, *, force_read_
         "visit_diagnoses",
     )
     visits_by_aid = {v.appointment_id: v for v in visits}
-    invoices_by_aid = {i.appointment_id: i for i in Invoice.objects.filter(appointment_id__in=ids)}
+    invoices_by_aid = {
+        i.appointment_id: i
+        for i in Invoice.objects.filter(appointment_id__in=ids).prefetch_related(
+            Prefetch(
+                "payments",
+                queryset=Payment.objects.filter(status=Payment.Status.SUCCESSFUL),
+                to_attr="_successful_payments",
+            )
+        )
+    }
     out = []
     for a in appt_list:
         v = visits_by_aid.get(a.id)
@@ -581,14 +603,15 @@ def _serialize_patient_appointment_history(request, appointments, *, force_read_
                 )
         visit_payload = None
         if v:
+            diagnoses = serialize_visit_diagnoses(v)
             visit_payload = {
                 "id": v.id,
                 "status": v.status,
                 "reason_for_visit": v.reason_for_visit or "",
                 "doctor_notes": v.doctor_notes or "",
                 "diagnosis": v.diagnosis or "",
-                "diagnoses": serialize_visit_diagnoses(v),
-                "diagnosis_ids": [d["id"] for d in serialize_visit_diagnoses(v) if d.get("id")],
+                "diagnoses": diagnoses,
+                "diagnosis_ids": [d["id"] for d in diagnoses if d.get("id")],
                 "completed_at": v.completed_at.isoformat() if v.completed_at else None,
                 "rendered_services": lines,
             }
@@ -704,6 +727,12 @@ class BookingOptionsViewSet(viewsets.ViewSet):
     permission_classes = [permissions.AllowAny]
 
     def list(self, request):
+        from apps.clinic.cache_utils import CACHE_KEY_BOOKING_OPTIONS, TTL_BOOKING
+
+        cached = cache.get(CACHE_KEY_BOOKING_OPTIONS)
+        if cached is not None:
+            return Response(cached)
+
         bookable_qs = (
             Service.objects.filter(is_active=True, show_in_public_booking=True)
             .annotate(
@@ -716,14 +745,22 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             )
             .order_by("_book_order", "name")
         )
-        bookable_list = list(bookable_qs.prefetch_related("providers"))
+        bookable_list = list(
+            bookable_qs.prefetch_related(
+                Prefetch(
+                    "providers",
+                    queryset=Provider.objects.filter(active=True).select_related("user"),
+                    to_attr="_active_providers",
+                )
+            )
+        )
         services = [
             {
                 "id": s.id,
                 "name": s.label_for_public_booking(),
                 "description": s.description or "",
                 "duration_minutes": s.duration_minutes,
-                "price": s.price,
+                "price": str(s.price),  # ensure JSON-serialisable for cache
                 "service_type": s.service_type,
                 "is_new_client_intake": s.is_new_client_intake,
                 "allow_provider_choice": s.service_type == "massage",
@@ -731,11 +768,13 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             for s in bookable_list
         ]
         providers_by_service = {
-            svc.id: [{"id": p.id, "provider_name": str(p)} for p in svc.providers.filter(active=True)]
+            svc.id: [{"id": p.id, "provider_name": str(p)} for p in svc._active_providers]
             for svc in bookable_list
         }
         apply_intake_chiropractic_provider_fallback(bookable_list, providers_by_service)
-        return Response({"services": services, "providers_by_service": providers_by_service})
+        payload = {"services": services, "providers_by_service": providers_by_service}
+        cache.set(CACHE_KEY_BOOKING_OPTIONS, payload, TTL_BOOKING)
+        return Response(payload)
 
     @action(detail=False, methods=["get"], url_path="availability")
     def availability(self, request):
@@ -1382,9 +1421,19 @@ class PatientViewSet(viewsets.ModelViewSet):
 
 
 class ProviderViewSet(viewsets.ModelViewSet):
-    queryset = Provider.objects.select_related("user").all().order_by("id")
+    queryset = Provider.objects.select_related("user").prefetch_related("services").all().order_by("id")
     serializer_class = ProviderSerializer
     permission_classes = [IsOwnerOrDoctor]
+
+    def list(self, request, *args, **kwargs):
+        from apps.clinic.cache_utils import CACHE_KEY_PROVIDERS, TTL_PROVIDERS
+
+        cached = cache.get(CACHE_KEY_PROVIDERS)
+        if cached is not None:
+            return Response(cached)
+        response = super().list(request, *args, **kwargs)
+        cache.set(CACHE_KEY_PROVIDERS, response.data, TTL_PROVIDERS)
+        return response
 
     def destroy(self, request, *args, **kwargs):
         provider = self.get_object()
@@ -1452,7 +1501,7 @@ class ProviderViewSet(viewsets.ModelViewSet):
 class ProviderUnavailabilityViewSet(viewsets.ModelViewSet):
     """Owner/staff: mark providers unavailable for public online booking (date or time window)."""
 
-    queryset = ProviderUnavailability.objects.select_related("provider").all()
+    queryset = ProviderUnavailability.objects.select_related("provider__user").all()
     serializer_class = ProviderUnavailabilitySerializer
     permission_classes = [IsStaffOrOwnerAdmin]
     http_method_names = ["get", "post", "delete", "head", "options"]
@@ -1582,9 +1631,9 @@ class DiagnosisCodeViewSet(viewsets.ModelViewSet):
 
 class AppointmentViewSet(viewsets.ModelViewSet):
     queryset = _defer_patient_card_fields(
-        Appointment.objects.select_related("patient", "provider", "booked_service", "visit").all().order_by(
-            "appointment_date", "start_time"
-        ),
+        Appointment.objects.select_related(
+            "patient", "provider__user", "booked_service", "visit"
+        ).all().order_by("appointment_date", "start_time"),
         patient_prefix="patient",
     )
     serializer_class = AppointmentSerializer
@@ -2475,6 +2524,7 @@ class VisitViewSet(viewsets.ModelViewSet):
     queryset = Visit.objects.prefetch_related("rendered_services").all().order_by("-updated_at")
     serializer_class = VisitSerializer
     permission_classes = [IsOwnerOrDoctor]
+    pagination_class = StandardPageNumberPagination
 
     @action(detail=True, methods=["post"])
     def complete(self, request, pk=None):
@@ -2492,6 +2542,7 @@ class InvoiceViewSet(viewsets.ModelViewSet):
     )
     serializer_class = InvoiceSerializer
     permission_classes = [IsOwnerOrDoctor]
+    pagination_class = StandardPageNumberPagination
 
     @action(detail=True, methods=["post"])
     def pay(self, request, pk=None):
@@ -2589,6 +2640,7 @@ class PaymentViewSet(viewsets.ReadOnlyModelViewSet):
     )
     serializer_class = PaymentSerializer
     permission_classes = [IsOwnerOrDoctor]
+    pagination_class = StandardPageNumberPagination
 
 
 class AdminViewSet(viewsets.ViewSet):
@@ -2610,7 +2662,7 @@ class AdminViewSet(viewsets.ViewSet):
         today = timezone.localdate()
         all_today = _defer_patient_card_fields(
             Appointment.objects.filter(appointment_date=today)
-            .select_related("patient", "provider", "booked_service")
+            .select_related("patient", "provider__user", "booked_service", "invoice")
             .order_by("start_time"),
             patient_prefix="patient",
         )
@@ -2765,7 +2817,7 @@ class AdminViewSet(viewsets.ViewSet):
     @action(detail=False, methods=["get", "patch"], url_path="clinic_profile")
     def clinic_profile(self, request):
         """Clinic name, address, phone, hours, and bill POS code (admin Settings); persisted in DB."""
-        solo = ClinicSettings.get_solo()
+        solo = ClinicSettings.get_cached() if request.method == "GET" else ClinicSettings.get_solo()
         if request.method == "GET":
             h = _clinic_settings_bill_header()
             return Response({
@@ -3001,7 +3053,17 @@ class AdminViewSet(viewsets.ViewSet):
 
         base = _defer_patient_card_fields(
             Invoice.objects.select_related("patient", "appointment", "appointment__booked_service", "visit")
-            .prefetch_related("visit__rendered_services"),
+            .prefetch_related(
+                Prefetch(
+                    "visit__rendered_services",
+                    queryset=VisitRenderedService.objects.select_related("service"),
+                ),
+                Prefetch(
+                    "payments",
+                    queryset=Payment.objects.filter(status=Payment.Status.SUCCESSFUL),
+                    to_attr="_successful_payments",
+                ),
+            ),
             patient_prefix="patient",
         )
         summary = {
@@ -3434,7 +3496,7 @@ class AdminViewSet(viewsets.ViewSet):
             return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
         appointments = (
             Appointment.objects.filter(patient=patient)
-            .select_related("booked_service", "provider")
+            .select_related("booked_service", "provider__user")
             .order_by("-appointment_date", "-start_time")[:100]
         )
         return Response(
@@ -3728,7 +3790,7 @@ class DoctorViewSet(viewsets.ViewSet):
         access = clinical_access_level(provider, patient)
         appointments = (
             Appointment.objects.filter(patient=patient)
-            .select_related("booked_service", "provider", "patient")
+            .select_related("booked_service", "provider__user", "patient")
             .order_by("-appointment_date", "-start_time")[:100]
         )
         return Response(

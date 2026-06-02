@@ -136,6 +136,10 @@ class PatientDocument(TimeStampedModel):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            # Document list for a patient ordered by upload date
+            models.Index(fields=["patient_id", "created_at"], name="patient_doc_patient_date_idx"),
+        ]
 
     def __str__(self) -> str:
         return f"{self.label} — {self.patient}"
@@ -313,6 +317,16 @@ class Appointment(TimeStampedModel):
     def __str__(self) -> str:
         return f"{self.appointment_date} {self.start_time} ({self.status})"
 
+    class Meta:
+        indexes = [
+            # Schedule grid: appointments for a provider on a given date (availability, day view)
+            models.Index(fields=["provider_id", "appointment_date"], name="appt_provider_date_idx"),
+            # Patient chart / kiosk / my-appointments: all visits for a patient ordered by date
+            models.Index(fields=["patient_id", "appointment_date"], name="appt_patient_date_idx"),
+            # Dashboard counts and status-filtered list queries (e.g. today's checked-in / completed)
+            models.Index(fields=["appointment_date", "status"], name="appt_date_status_idx"),
+        ]
+
 
 class ProviderUnavailability(TimeStampedModel):
     """
@@ -330,6 +344,10 @@ class ProviderUnavailability(TimeStampedModel):
         ordering = ["-block_date", "start_time"]
         verbose_name = "Provider online booking block"
         verbose_name_plural = "Provider online booking blocks"
+        indexes = [
+            # Combined filter: unavailability blocks for a provider within a date range
+            models.Index(fields=["provider_id", "block_date"], name="unavail_provider_date_idx"),
+        ]
 
     def __str__(self) -> str:
         if self.all_day:
@@ -354,6 +372,14 @@ class Visit(TimeStampedModel):
         help_text="Formatted diagnosis lines for bills and chart (synced from visit_diagnoses when using the catalog).",
     )
     completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            # Doctor patient list: completed visits for a provider sorted by date
+            models.Index(fields=["provider_id", "status", "completed_at"], name="visit_provider_status_completed_idx"),
+            # Patient chart: completed visits for a patient sorted by date
+            models.Index(fields=["patient_id", "status", "completed_at"], name="visit_patient_status_completed_idx"),
+        ]
 
 
 class DiagnosisCode(TimeStampedModel):
@@ -405,6 +431,12 @@ class VisitRenderedService(TimeStampedModel):
         help_text="If False, this line is shown on the printed bill for insurance but not included in patient invoice totals.",
     )
 
+    class Meta:
+        indexes = [
+            # Insurance-only billing filter: rendered services for a visit that don't charge the patient
+            models.Index(fields=["visit_id", "charges_patient"], name="rendered_svc_visit_charges_idx"),
+        ]
+
 
 class Invoice(TimeStampedModel):
     class Status(models.TextChoices):
@@ -447,6 +479,16 @@ class Invoice(TimeStampedModel):
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.ISSUED)
     issued_at = models.DateTimeField(auto_now_add=True)
     paid_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            # Billing list filtering and tab counts (open / overdue / paid), ordered by issued date
+            models.Index(fields=["status", "issued_at"], name="invoice_status_issued_idx"),
+            # Daily revenue query: paid invoices filtered and summed by paid date
+            models.Index(fields=["status", "paid_at"], name="invoice_status_paid_idx"),
+            # Penalty invoice filter (no-show fee / late cancellation fee)
+            models.Index(fields=["kind", "status"], name="invoice_kind_status_idx"),
+        ]
 
 
 class StaffNotification(TimeStampedModel):
@@ -507,6 +549,12 @@ class PatientCreditTransaction(TimeStampedModel):
         blank=True,
         related_name="created_credit_transactions",
     )
+
+    class Meta:
+        indexes = [
+            # Credit ledger for a patient ordered by transaction date
+            models.Index(fields=["patient_id", "created_at"], name="credit_txn_patient_date_idx"),
+        ]
 
 
 class VoiceCallLog(TimeStampedModel):
@@ -569,6 +617,14 @@ class Payment(TimeStampedModel):
     payment_reference = models.CharField(max_length=120, blank=True)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
     paid_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            # Per-invoice payment sum: filter successful payments for a given invoice
+            models.Index(fields=["invoice_id", "status"], name="payment_invoice_status_idx"),
+            # Dashboard recent payments: filter and order by payment date
+            models.Index(fields=["paid_at"], name="payment_paid_at_idx"),
+        ]
 
 
 # Defaults for the single clinic settings row (bills + admin Settings page)
@@ -665,3 +721,14 @@ class ClinicSettings(TimeStampedModel):
             obj.business_hours = list(_DEFAULT_CLINIC_BUSINESS_HOURS)
             obj.save(update_fields=["business_hours", "updated_at"])
         return obj
+
+    @classmethod
+    def get_cached(cls):
+        """Return the singleton ClinicSettings row from Redis cache (3-min TTL).
+
+        Use this instead of get_solo() on read paths where a slightly stale
+        value is acceptable.  The cache is invalidated automatically whenever
+        ClinicSettings.save() fires (via post_save signal in signals.py).
+        """
+        from apps.clinic.cache_utils import get_clinic_settings_cached
+        return get_clinic_settings_cached()

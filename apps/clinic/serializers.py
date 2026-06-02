@@ -30,7 +30,35 @@ User = get_user_model()
 class PatientSerializer(serializers.ModelSerializer):
     class Meta:
         model = Patient
-        fields = "__all__"
+        # Exclude internal Square payment-processor IDs (square_customer_id, square_card_id)
+        # — they are never read or written by the frontend; exposing them over the API is
+        # unnecessary and slightly increases response size.
+        fields = (
+            "id",
+            "first_name",
+            "last_name",
+            "phone",
+            "email",
+            "date_of_birth",
+            "date_established",
+            "address_line1",
+            "address_line2",
+            "city_state_zip",
+            "emergency_contact_name",
+            "emergency_contact_phone",
+            "marital_status",
+            "card_brand",
+            "card_last4",
+            "sms_consent",
+            "sms_consent_at",
+            "notify_booking",
+            "notify_reminders",
+            "notify_bills",
+            "online_chiro_intake_waived",
+            "credit_balance",
+            "created_at",
+            "updated_at",
+        )
 
     def validate_phone(self, value):
         valid, result = validate_phone(value or "")
@@ -238,13 +266,30 @@ class ProviderSerializer(serializers.ModelSerializer):
 class ServiceSerializer(serializers.ModelSerializer):
     class Meta:
         model = Service
-        fields = "__all__"
+        # Explicit list: `created_at` / `updated_at` are not used by any frontend list or edit view.
+        fields = (
+            "id",
+            "name",
+            "public_booking_name",
+            "description",
+            "duration_minutes",
+            "price",
+            "billing_code",
+            "is_active",
+            "show_in_public_booking",
+            "visible_to_chiropractic_staff",
+            "visible_to_massage_staff",
+            "service_type",
+            "is_new_client_intake",
+            "charges_patient",
+        )
 
 
 class DiagnosisCodeSerializer(serializers.ModelSerializer):
     class Meta:
         model = DiagnosisCode
-        fields = "__all__"
+        # `created_at` / `updated_at` are not used by the diagnoses management page or billing modals.
+        fields = ("id", "code", "description", "is_active")
 
 
 class StaffNotificationSerializer(serializers.ModelSerializer):
@@ -552,7 +597,16 @@ class PublicCancelSerializer(serializers.Serializer):
 class VisitRenderedServiceSerializer(serializers.ModelSerializer):
     class Meta:
         model = VisitRenderedService
-        fields = "__all__"
+        # `created_at` / `updated_at` are not used by the billing or visit-completion UI.
+        fields = (
+            "id",
+            "visit",
+            "service",
+            "quantity",
+            "unit_price",
+            "total_price",
+            "charges_patient",
+        )
 
 
 class VisitSerializer(serializers.ModelSerializer):
@@ -560,7 +614,19 @@ class VisitSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Visit
-        fields = "__all__"
+        # `created_at` / `updated_at` are not needed by any visit list or detail view in the frontend.
+        fields = (
+            "id",
+            "appointment",
+            "patient",
+            "provider",
+            "status",
+            "reason_for_visit",
+            "doctor_notes",
+            "diagnosis",
+            "completed_at",
+            "rendered_services",
+        )
 
 
 class VisitCompleteSerializer(serializers.Serializer):
@@ -571,13 +637,40 @@ class VisitCompleteSerializer(serializers.Serializer):
 class InvoiceSerializer(serializers.ModelSerializer):
     class Meta:
         model = Invoice
-        fields = "__all__"
+        # `created_at` / `updated_at` are not used by the billing UI or any invoice detail view.
+        fields = (
+            "id",
+            "patient",
+            "appointment",
+            "visit",
+            "kind",
+            "invoice_number",
+            "subtotal",
+            "tax",
+            "discount",
+            "credit_applied_total",
+            "professional_discount_reason",
+            "total_amount",
+            "status",
+            "issued_at",
+            "paid_at",
+        )
 
 
 class PaymentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Payment
-        fields = "__all__"
+        # `created_at` / `updated_at` are not used by any payment view in the frontend.
+        fields = (
+            "id",
+            "invoice",
+            "patient",
+            "amount",
+            "payment_method",
+            "payment_reference",
+            "status",
+            "paid_at",
+        )
 
 
 class PaymentCompleteSerializer(serializers.Serializer):
@@ -799,7 +892,18 @@ class InvoiceApplyCreditSerializer(serializers.Serializer):
 class PatientCreditTransactionSerializer(serializers.ModelSerializer):
     class Meta:
         model = PatientCreditTransaction
-        fields = "__all__"
+        # `updated_at` is not used by the credit ledger view in the frontend.
+        fields = (
+            "id",
+            "patient",
+            "invoice",
+            "kind",
+            "amount",
+            "balance_after",
+            "note",
+            "created_by",
+            "created_at",
+        )
 
 
 def complete_visit_with_services(visit: Visit, payload: dict) -> Invoice:

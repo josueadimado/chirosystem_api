@@ -243,7 +243,7 @@ def twilio_voice_incoming(request):
     frm = (request.POST.get("From") or "").strip()
     upsert_voice_call_log(call_sid=sid, from_number=frm, outcome=VoiceCallLog.Outcome.PROMPTED)
 
-    clinic = ClinicSettings.get_solo()
+    clinic = ClinicSettings.get_cached()
     clinic_name = clinic.clinic_name
     greeting = _voice_greeting_for_caller(frm, clinic_name)
 

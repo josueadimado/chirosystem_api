@@ -18,7 +18,7 @@ _PENALTY_KINDS = frozenset({Invoice.Kind.NO_SHOW_FEE, Invoice.Kind.LATE_CANCEL_F
 
 
 def get_no_show_fee_amount() -> Decimal:
-    return ClinicSettings.get_solo().no_show_fee or Decimal("0")
+    return ClinicSettings.get_cached().no_show_fee or Decimal("0")
 
 
 def compute_no_show_fee_for_appointment(appointment: Appointment) -> Decimal:

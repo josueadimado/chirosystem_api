@@ -49,7 +49,7 @@ def _hard_policy_open_close_minutes(appt_date: date, service: Service) -> tuple[
 def _clinic_minutes_for_date(appt_date: date) -> tuple[int, int] | None:
     """Business hours from ClinicSettings for that weekday. None if closed. Fallback 9–6 if not listed."""
     day_name = appt_date.strftime("%A")
-    clinic = ClinicSettings.get_solo()
+    clinic = ClinicSettings.get_cached()
     bh_list = clinic.business_hours or []
     default = (9 * 60, 18 * 60)
     for entry in bh_list:

@@ -15,7 +15,7 @@ def get_clinic_tz_name() -> str:
     try:
         from apps.clinic.models import ClinicSettings
 
-        clinic = ClinicSettings.get_solo()
+        clinic = ClinicSettings.get_cached()
         if clinic.timezone:
             return clinic.timezone
     except Exception:

@@ -32,7 +32,7 @@ def send_no_show_patient_notice(
     Returns counts/flags for logging.
     """
     patient = appointment.patient
-    solo = ClinicSettings.get_solo()
+    solo = ClinicSettings.get_cached()
     clinic_phone = (solo.phone or "269-408-0303").strip()
     service_name = (
         appointment.booked_service.label_for_public_booking()

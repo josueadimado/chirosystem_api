@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import os
 from datetime import date
+from typing import TYPE_CHECKING
 
+from django.core.cache import cache
 from django.utils import timezone
 
 from .models import Appointment, Patient, Service
+
+if TYPE_CHECKING:
+    pass
 
 _DEFAULT_GAP_DAYS = 730  # ~2 years
 
@@ -34,13 +39,28 @@ def last_completed_chiropractic_visit_date(patient: Patient) -> date | None:
     return d
 
 
-def public_new_client_intake_services():
-    return Service.objects.filter(
-        is_active=True,
-        show_in_public_booking=True,
-        service_type=Service.ServiceType.CHIROPRACTIC,
-        is_new_client_intake=True,
-    ).order_by("name")
+def public_new_client_intake_services() -> list:
+    """Return intake-eligible chiropractic services as a list (cached, 5-min TTL).
+
+    Returns a plain list so callers can iterate and test truthiness without
+    hitting the database.  The cache is invalidated whenever a Service is
+    saved or deleted (via post_save / post_delete signals in signals.py).
+    """
+    from apps.clinic.cache_utils import CACHE_KEY_INTAKE_SERVICES, TTL_BOOKING
+
+    cached = cache.get(CACHE_KEY_INTAKE_SERVICES)
+    if cached is not None:
+        return cached
+    result = list(
+        Service.objects.filter(
+            is_active=True,
+            show_in_public_booking=True,
+            service_type=Service.ServiceType.CHIROPRACTIC,
+            is_new_client_intake=True,
+        ).order_by("name")
+    )
+    cache.set(CACHE_KEY_INTAKE_SERVICES, result, TTL_BOOKING)
+    return result
 
 
 def chiropractic_booking_must_use_intake(patient: Patient, service: Service) -> str | None:
@@ -57,10 +77,10 @@ def chiropractic_booking_must_use_intake(patient: Patient, service: Service) -> 
         return None
     if patient.online_chiro_intake_waived:
         return None
-    intake_qs = public_new_client_intake_services()
-    if not intake_qs.exists():
+    intake_services = public_new_client_intake_services()
+    if not intake_services:
         return None
-    names = ", ".join(s.label_for_public_booking() for s in intake_qs[:8])
+    names = ", ".join(s.label_for_public_booking() for s in intake_services[:8])
 
     last = last_completed_chiropractic_visit_date(patient)
     if last is None:
@@ -82,8 +102,8 @@ def chiropractic_booking_must_use_intake(patient: Patient, service: Service) -> 
 
 def chiropractic_intake_context_for_new_phone_lookup() -> dict:
     """Patient-lookup JSON when the phone number is not in the system yet (treat as new to the practice)."""
-    intake_qs = public_new_client_intake_services()
-    intake_list = [{"id": s.id, "name": s.label_for_public_booking()} for s in intake_qs]
+    intake_services = public_new_client_intake_services()
+    intake_list = [{"id": s.id, "name": s.label_for_public_booking()} for s in intake_services]
     gap = chiro_returning_gap_days()
     new_requires = bool(intake_list)
     return {
@@ -100,8 +120,8 @@ def chiropractic_intake_context_for_new_phone_lookup() -> dict:
 def chiropractic_intake_context_for_patient(patient: Patient) -> dict:
     """Fields merged into public patient-lookup JSON for booking UI (existing patient)."""
     last = last_completed_chiropractic_visit_date(patient)
-    intake_qs = public_new_client_intake_services()
-    intake_list = [{"id": s.id, "name": s.label_for_public_booking()} for s in intake_qs]
+    intake_services = public_new_client_intake_services()
+    intake_list = [{"id": s.id, "name": s.label_for_public_booking()} for s in intake_services]
     gap = chiro_returning_gap_days()
     if patient.online_chiro_intake_waived:
         return {

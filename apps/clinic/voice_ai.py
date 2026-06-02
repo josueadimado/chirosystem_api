@@ -28,13 +28,28 @@ logger = logging.getLogger(__name__)
 # ─── Catalog ───────────────────────────────────────────────────────────
 
 def _booking_catalog_json() -> dict[str, Any]:
-    """Same shape as /api/v1/booking-options/ (minimal fields for the model)."""
+    """Same shape as /api/v1/booking-options/ (minimal fields for the model), cached."""
+    from django.core.cache import cache
+    from django.db.models import Prefetch
+
     from .booking_provider_eligibility import apply_intake_chiropractic_provider_fallback
+    from .cache_utils import CACHE_KEY_VOICE_CATALOG, TTL_BOOKING
+    from .models import Provider
+
+    cached = cache.get(CACHE_KEY_VOICE_CATALOG)
+    if cached is not None:
+        return cached
 
     bookable = list(
         Service.objects.filter(is_active=True, show_in_public_booking=True)
         .order_by("name")
-        .prefetch_related("providers")
+        .prefetch_related(
+            Prefetch(
+                "providers",
+                queryset=Provider.objects.filter(active=True).select_related("user"),
+                to_attr="_active_providers",
+            )
+        )
     )
     services = []
     providers_by_service: dict[int, list[dict]] = {}
@@ -52,10 +67,12 @@ def _booking_catalog_json() -> dict[str, Any]:
         )
         providers_by_service[svc.id] = [
             {"id": p.id, "provider_name": str(p)}
-            for p in svc.providers.filter(active=True)
+            for p in svc._active_providers
         ]
     apply_intake_chiropractic_provider_fallback(bookable, providers_by_service)
-    return {"services": services, "providers_by_service": providers_by_service}
+    result = {"services": services, "providers_by_service": providers_by_service}
+    cache.set(CACHE_KEY_VOICE_CATALOG, result, TTL_BOOKING)
+    return result
 
 
 # ─── Name extraction (no AI) ──────────────────────────────────────────

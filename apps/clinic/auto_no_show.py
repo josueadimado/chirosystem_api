@@ -31,7 +31,7 @@ _ACTIVE_STATUSES = frozenset(
 
 
 def _grace_timedelta() -> timedelta:
-    solo = ClinicSettings.get_solo()
+    solo = ClinicSettings.get_cached()
     minutes = max(15, int(solo.auto_no_show_grace_minutes or 60))
     return timedelta(minutes=minutes)
 
@@ -48,7 +48,7 @@ def process_auto_no_show_appointments() -> dict:
     Find eligible appointments and mark each as no-show once.
     Safe to run repeatedly (idempotent via auto_no_show_processed_at).
     """
-    solo = ClinicSettings.get_solo()
+    solo = ClinicSettings.get_cached()
     if not solo.auto_no_show_enabled:
         return {"enabled": False, "processed": 0, "skipped": 0, "errors": 0}
 
