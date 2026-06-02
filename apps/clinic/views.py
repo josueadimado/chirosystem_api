@@ -4580,29 +4580,146 @@ class KioskViewSet(viewsets.ViewSet):
             .exclude(
                 status__in=[Appointment.Status.CANCELLED, Appointment.Status.NO_SHOW],
             )
-            .select_related("patient", "provider")
+            .select_related("patient", "provider", "booked_service")
             .order_by("appointment_date", "start_time")
         )
 
     @classmethod
-    def _kiosk_appt_choice(
-        cls,
-        appt: Appointment,
-        *,
-        can_checkin: bool,
-        earliest_local: datetime | None = None,
-    ) -> dict:
-        payload = {
+    def _today_booked_by_patient(cls, open_today: list[Appointment]) -> dict[int, list[Appointment]]:
+        """Group today's booked kiosk visits by patient (one check-in can cover all)."""
+        by_pid: dict[int, list[Appointment]] = {}
+        for appt in open_today:
+            by_pid.setdefault(appt.patient_id, []).append(appt)
+        for pid in by_pid:
+            by_pid[pid].sort(key=lambda a: (a.start_time, a.pk))
+        return by_pid
+
+    @classmethod
+    def _kiosk_visit_line(cls, appt: Appointment) -> dict:
+        service_name = ""
+        if appt.booked_service_id and appt.booked_service:
+            service_name = (appt.booked_service.name or "").strip()
+        return {
             "appointment_id": appt.id,
-            "patient": f"{appt.patient.first_name} {appt.patient.last_name}",
-            "provider": str(appt.provider),
             "start_time_display": format_time_12h(appt.start_time),
-            "can_checkin": can_checkin,
+            "provider": str(appt.provider),
+            "service_name": service_name,
+        }
+
+    @classmethod
+    def _kiosk_patient_day_choice(cls, appts: list[Appointment]) -> dict:
+        """One kiosk row per patient — may include massage + chiropractic the same day."""
+        appts = sorted(appts, key=lambda a: (a.start_time, a.pk))
+        patient = appts[0].patient
+        patient_name = f"{patient.first_name} {patient.last_name}".strip()
+        visits = [cls._kiosk_visit_line(a) for a in appts]
+        can_any = False
+        earliest_locals: list[datetime] = []
+        for appt in appts:
+            allowed, _, earliest_local = cls._can_kiosk_checkin_now(appt)
+            if allowed:
+                can_any = True
+            if earliest_local is not None:
+                earliest_locals.append(earliest_local)
+        earliest_local = min(earliest_locals) if earliest_locals else None
+        times = [v["start_time_display"] for v in visits]
+        if len(times) == 1:
+            times_summary = times[0]
+        elif len(times) == 2:
+            times_summary = f"{times[0]} and {times[1]}"
+        else:
+            times_summary = f"{', '.join(times[:-1])}, and {times[-1]}"
+        providers = list(dict.fromkeys(v["provider"] for v in visits))
+        provider_summary = providers[0] if len(providers) == 1 else "Multiple providers"
+        payload = {
+            "appointment_id": appts[0].id,
+            "appointment_ids": [a.id for a in appts],
+            "patient": patient_name,
+            "provider": provider_summary,
+            "start_time_display": times_summary,
+            "visit_count": len(appts),
+            "visits_today": visits,
+            "can_checkin": can_any,
             "early_checkin_minutes_before": cls._kiosk_minutes_before(),
         }
-        if not can_checkin and earliest_local is not None:
+        if not can_any and earliest_local is not None:
             payload["earliest_checkin_display"] = format_time_12h(earliest_local.time())
         return payload
+
+    @classmethod
+    def _kiosk_same_day_booked_siblings(cls, appt: Appointment) -> list[Appointment]:
+        """All booked visits today for this patient (check in together at the kiosk)."""
+        from apps.clinic.timezone_utils import today_clinic
+
+        today = today_clinic()
+        if appt.appointment_date != today:
+            return [appt]
+        return list(
+            Appointment.objects.filter(
+                patient_id=appt.patient_id,
+                appointment_date=today,
+                status=Appointment.Status.BOOKED,
+            )
+            .select_related("patient", "provider", "booked_service")
+            .order_by("start_time", "pk")
+        )
+
+    @classmethod
+    def _kiosk_resolve_checkin_targets(
+        cls,
+        primary: Appointment,
+        *,
+        requested_ids: list[int] | None,
+        bypass_early: bool,
+    ) -> tuple[list[Appointment], str | None]:
+        """
+        Visits to mark checked-in. When any same-day booked visit is in the kiosk window,
+        include all of that patient's booked visits for today.
+        """
+        if requested_ids:
+            qs = list(
+                Appointment.objects.filter(pk__in=requested_ids).select_related(
+                    "patient", "provider", "booked_service"
+                )
+            )
+            if len(qs) != len(set(requested_ids)):
+                return [], "One or more appointments were not found."
+            if len({a.patient_id for a in qs}) > 1:
+                return [], "All appointments must be for the same patient."
+            if any(a.appointment_date != primary.appointment_date for a in qs):
+                return [], "All appointments must be on the same day."
+            if any(a.patient_id != primary.patient_id for a in qs):
+                return [], "Appointments do not match this patient."
+            targets = sorted(qs, key=lambda a: (a.start_time, a.pk))
+        else:
+            targets = cls._kiosk_same_day_booked_siblings(primary)
+            if not targets:
+                targets = [primary]
+
+        booked = [a for a in targets if a.status == Appointment.Status.BOOKED]
+        if not booked:
+            return [], "Check-in is already done or these visits are in progress."
+
+        if not bypass_early and not any(cls._can_kiosk_checkin_now(a)[0] for a in booked):
+            minutes = cls._kiosk_minutes_before()
+            _, _, earliest_local = cls._can_kiosk_checkin_now(booked[0])
+            for a in booked[1:]:
+                _, _, el = cls._can_kiosk_checkin_now(a)
+                if el and (earliest_local is None or el < earliest_local):
+                    earliest_local = el
+            earliest_disp = format_time_12h(earliest_local.time()) if earliest_local else ""
+            return [], (
+                f"It is too early for kiosk check-in. You can check in up to {minutes} minutes "
+                f"before your appointment"
+                + (f" (opens around {earliest_disp})" if earliest_disp else "")
+                + ", or ask the front desk."
+            )
+
+        if bypass_early or any(cls._can_kiosk_checkin_now(a)[0] for a in booked):
+            siblings = cls._kiosk_same_day_booked_siblings(primary)
+            return siblings if siblings else booked
+
+        return booked
 
     @classmethod
     def _kiosk_minutes_before(cls) -> int:
@@ -4680,19 +4797,15 @@ class KioskViewSet(viewsets.ViewSet):
 
         open_today = [a for a in today_appts if a.status == Appointment.Status.BOOKED]
         if open_today:
-            choices: list[dict] = []
-            for appt in open_today:
-                allowed, _, earliest_local = self._can_kiosk_checkin_now(appt)
-                choices.append(
-                    self._kiosk_appt_choice(appt, can_checkin=allowed, earliest_local=earliest_local)
-                )
+            by_patient = self._today_booked_by_patient(open_today)
+            choices = [self._kiosk_patient_day_choice(appts) for appts in by_patient.values()]
 
             if len(choices) > 1:
                 return Response(
                     {
                         "result": "choose_patient",
                         "message": (
-                            "We found more than one appointment for this phone number today. "
+                            "We found more than one person with appointments on this phone number today. "
                             "Please tap the name of the person checking in."
                         ),
                         "choices": choices,
@@ -4701,34 +4814,50 @@ class KioskViewSet(viewsets.ViewSet):
 
             choice = choices[0]
             appt = open_today[0]
+            visit_count = choice.get("visit_count") or 1
             if choice["can_checkin"]:
-                return Response(
-                    {
-                        "result": "ready",
-                        "appointment_id": appt.id,
-                        "patient": choice["patient"],
-                        "provider": choice["provider"],
-                        "time": str(appt.start_time),
-                        "start_time_display": choice["start_time_display"],
-                        "status": appt.status,
-                    }
-                )
-            minutes = self._kiosk_minutes_before()
-            return Response(
-                {
-                    "result": "too_early",
-                    "message": (
-                        f"You are here before your check-in window. Kiosk check-in opens up to "
-                        f"{minutes} minutes before your appointment, or ask the front desk if you need help."
-                    ),
-                    "appointment_id": appt.id,
+                ready = {
+                    "result": "ready",
+                    "appointment_id": choice["appointment_id"],
+                    "appointment_ids": choice["appointment_ids"],
                     "patient": choice["patient"],
                     "provider": choice["provider"],
+                    "time": str(appt.start_time),
                     "start_time_display": choice["start_time_display"],
-                    "earliest_checkin_display": choice.get("earliest_checkin_display", ""),
-                    "early_checkin_minutes_before": minutes,
+                    "status": appt.status,
+                    "visit_count": visit_count,
+                    "visits_today": choice.get("visits_today") or [],
                 }
-            )
+                if visit_count > 1:
+                    ready["message"] = (
+                        f"You have {visit_count} visits scheduled today. "
+                        "One check-in will cover all of them."
+                    )
+                return Response(ready)
+            minutes = self._kiosk_minutes_before()
+            too_early = {
+                "result": "too_early",
+                "message": (
+                    f"You are here before your check-in window. Kiosk check-in opens up to "
+                    f"{minutes} minutes before your first appointment today, or ask the front desk if you need help."
+                ),
+                "appointment_id": choice["appointment_id"],
+                "appointment_ids": choice["appointment_ids"],
+                "patient": choice["patient"],
+                "provider": choice["provider"],
+                "start_time_display": choice["start_time_display"],
+                "earliest_checkin_display": choice.get("earliest_checkin_display", ""),
+                "early_checkin_minutes_before": minutes,
+                "visit_count": visit_count,
+                "visits_today": choice.get("visits_today") or [],
+            }
+            if visit_count > 1:
+                too_early["message"] = (
+                    f"You are here before check-in opens for your {visit_count} visits today. "
+                    f"Kiosk check-in opens up to {minutes} minutes before your first appointment, "
+                    "or ask the front desk if you need help."
+                )
+            return Response(too_early)
 
         in_progress_today = [
             a
@@ -4806,9 +4935,52 @@ class KioskViewSet(viewsets.ViewSet):
         from apps.clinic.timezone_utils import today_clinic
 
         appointment_id = request.data.get("appointment_id")
-        if appointment_id is None:
-            return Response({"detail": "appointment_id is required."}, status=status.HTTP_400_BAD_REQUEST)
-        appt = get_object_or_404(Appointment.objects.select_related("patient"), pk=appointment_id)
+        raw_ids = request.data.get("appointment_ids")
+        if appointment_id is None and not raw_ids:
+            return Response(
+                {"detail": "appointment_id or appointment_ids is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if appointment_id is None and raw_ids:
+            try:
+                appointment_id = int(raw_ids[0])
+            except (TypeError, ValueError, IndexError):
+                return Response(
+                    {"detail": "appointment_ids must be a non-empty list of numbers."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        try:
+            primary_id = int(appointment_id)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "appointment_id must be a number."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        requested_ids: list[int] | None = None
+        if raw_ids is not None:
+            if not isinstance(raw_ids, (list, tuple)):
+                return Response(
+                    {"detail": "appointment_ids must be a list."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            try:
+                requested_ids = [int(x) for x in raw_ids]
+            except (TypeError, ValueError):
+                return Response(
+                    {"detail": "appointment_ids must be a list of numbers."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if not requested_ids:
+                return Response(
+                    {"detail": "appointment_ids cannot be empty."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        appt = get_object_or_404(
+            Appointment.objects.select_related("patient", "provider", "booked_service"),
+            pk=primary_id,
+        )
         phone = request.data.get("phone")
         if phone:
             valid, msg = validate_phone(phone)
@@ -4825,53 +4997,68 @@ class KioskViewSet(viewsets.ViewSet):
                 {"detail": "Check-in is only available on the day of your appointment."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if appt.status in (
-            Appointment.Status.CANCELLED,
-            Appointment.Status.NO_SHOW,
-            Appointment.Status.COMPLETED,
-        ):
-            return Response(
-                {"detail": "Check-in is not available for this appointment."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        if appt.status != Appointment.Status.BOOKED:
+        bypass_early = not phone and self._desk_can_bypass_kiosk_early_window(request)
+
+        targets, err = self._kiosk_resolve_checkin_targets(
+            appt,
+            requested_ids=requested_ids,
+            bypass_early=bypass_early,
+        )
+        if err:
+            return Response({"detail": err}, status=status.HTTP_400_BAD_REQUEST)
+
+        now = timezone.now()
+        checked_ids: list[int] = []
+        for visit in targets:
+            if visit.status in (
+                Appointment.Status.CANCELLED,
+                Appointment.Status.NO_SHOW,
+                Appointment.Status.COMPLETED,
+            ):
+                continue
+            if visit.status != Appointment.Status.BOOKED:
+                continue
+            visit.status = Appointment.Status.CHECKED_IN
+            visit.checked_in_at = now
+            visit.save(update_fields=["status", "checked_in_at", "updated_at"])
+            checked_ids.append(visit.id)
+
+        if not checked_ids:
             return Response(
                 {"detail": "Check-in is already done or this visit is in progress."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        allowed, _, earliest_local = self._can_kiosk_checkin_now(appt)
-        if not allowed and not (
-            not phone and self._desk_can_bypass_kiosk_early_window(request)
-        ):
-            minutes = self._kiosk_minutes_before()
-            earliest_disp = format_time_12h(earliest_local.time()) if earliest_local else ""
-            return Response(
-                {
-                    "detail": (
-                        f"It is too early for kiosk check-in. You can check in up to {minutes} minutes "
-                        f"before your appointment"
-                        + (f" (opens around {earliest_disp})" if earliest_disp else "")
-                        + ", or ask the front desk."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
+
+        for aid in checked_ids:
+
+            def queue_doctor_alert(aid=aid):
+                from apps.notifications.tasks import notify_provider_patient_checked_in_task
+
+                notify_provider_patient_checked_in_task.delay(aid)
+
+            def queue_in_app(aid=aid):
+                from apps.clinic.in_app_notify import create_checkin_in_app_notification
+
+                create_checkin_in_app_notification(aid)
+
+            transaction.on_commit(queue_doctor_alert)
+            transaction.on_commit(queue_in_app)
+
+        count = len(checked_ids)
+        patient_name = f"{appt.patient.first_name} {appt.patient.last_name}".strip()
+        if count > 1:
+            detail = (
+                f"Checked in for all {count} visits today"
+                + (f" for {patient_name}" if patient_name else "")
+                + "."
             )
-
-        appt.status = Appointment.Status.CHECKED_IN
-        appt.checked_in_at = timezone.now()
-        appt.save(update_fields=["status", "checked_in_at", "updated_at"])
-        aid = appt.id
-
-        def queue_doctor_alert():
-            from apps.notifications.tasks import notify_provider_patient_checked_in_task
-
-            notify_provider_patient_checked_in_task.delay(aid)
-
-        def queue_in_app():
-            from apps.clinic.in_app_notify import create_checkin_in_app_notification
-
-            create_checkin_in_app_notification(aid)
-
-        transaction.on_commit(queue_doctor_alert)
-        transaction.on_commit(queue_in_app)
-        return Response({"detail": "Checked in", "status": appt.status})
+        else:
+            detail = "Checked in"
+        return Response(
+            {
+                "detail": detail,
+                "status": Appointment.Status.CHECKED_IN,
+                "checked_in_count": count,
+                "appointment_ids": checked_ids,
+            }
+        )
