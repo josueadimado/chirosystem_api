@@ -5082,8 +5082,7 @@ class KioskViewSet(viewsets.ViewSet):
         valid, msg = validate_phone(phone or "")
         if not valid:
             return Response(
-                {"result": "invalid_phone", "message": msg},
-                status=status.HTTP_400_BAD_REQUEST,
+                {"result": "invalid_phone", "message": msg or "Invalid phone."},
             )
         norm = normalize_phone(phone)
         patients, today_appts, all_appts = self._today_appointments_for_phone(norm)

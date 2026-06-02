@@ -365,8 +365,13 @@ except OSError:
 if not DEBUG:
     SECURE_SSL_REDIRECT = True
     # Docker / load balancer health probes hit Gunicorn over plain HTTP inside the container.
-    # Paths are matched after lstrip("/") — see SecurityMiddleware in Django.
-    SECURE_REDIRECT_EXEMPT = [r"^health/?$"]
+    # Next.js rewrites and internal Docker calls also use plain HTTP without X-Forwarded-Proto.
+    # Exempt /api/v1/ so POST (kiosk check-in, booking, etc.) is not turned into a 301 that
+    # drops the request body in the browser. Paths are matched after lstrip("/").
+    SECURE_REDIRECT_EXEMPT = [
+        r"^health/?$",
+        r"^api/v1/",
+    ]
     SECURE_HSTS_SECONDS = 31536000  # 1 year
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     SECURE_HSTS_PRELOAD = True
