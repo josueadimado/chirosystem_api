@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import mimetypes
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional
@@ -11,7 +12,7 @@ from django.core.signing import TimestampSigner
 from django.db import transaction
 from django.db.models import Case, Count, IntegerField, OuterRef, Prefetch, Q, Subquery, Sum, Value, When
 from django.db.models.functions import TruncDate
-from django.http import HttpResponseRedirect
+from django.http import FileResponse, Http404, HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import mixins, permissions, status, viewsets
@@ -560,19 +561,55 @@ def _confirm_invoice_paid_api_response(request) -> Response:
     )
 
 
-def _serialize_patient_document(doc: "PatientDocument", request) -> dict:
-    """Serialize a PatientDocument instance to a JSON-safe dict."""
+def _patient_document_file_path(files_base: str, doc_id: int) -> str:
+    """Authenticated API path (under /api/v1) — use instead of public /media/ URLs."""
+    return f"{files_base}/patient_document_file/?doc_id={doc_id}"
+
+
+def _serve_patient_document_file(doc: "PatientDocument", *, as_download: bool) -> FileResponse:
+    """Stream an uploaded patient document (requires authenticated API access)."""
+    if not doc.file:
+        raise Http404("File not found.")
     try:
-        url = request.build_absolute_uri(doc.file.url) if doc.file else None
-    except Exception:
-        url = None
+        file_handle = doc.file.open("rb")
+    except OSError as exc:
+        raise Http404("File not found.") from exc
+    name = doc.original_filename or doc.file.name
+    content_type, _ = mimetypes.guess_type(name)
+    if not content_type:
+        content_type = "application/octet-stream"
+    response = FileResponse(file_handle, content_type=content_type)
+    disposition = "attachment" if as_download else "inline"
+    safe_name = name.replace('"', "'").replace("\n", " ").replace("\r", " ")
+    response["Content-Disposition"] = f'{disposition}; filename="{safe_name}"'
+    return response
+
+
+def _patient_document_file_response(request) -> FileResponse | Response:
+    doc_id = request.query_params.get("doc_id")
+    if not doc_id:
+        return Response({"detail": "doc_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+    doc = PatientDocument.objects.filter(pk=doc_id).first()
+    if not doc:
+        return Response({"detail": "Document not found."}, status=status.HTTP_404_NOT_FOUND)
+    as_download = str(request.query_params.get("download", "")).lower() in ("1", "true", "yes")
+    try:
+        return _serve_patient_document_file(doc, as_download=as_download)
+    except Http404:
+        return Response({"detail": "File not found on server."}, status=status.HTTP_404_NOT_FOUND)
+
+
+def _serialize_patient_document(doc: "PatientDocument", request, *, files_base: str) -> dict:
+    """Serialize a PatientDocument instance to a JSON-safe dict."""
+    file_path = _patient_document_file_path(files_base, doc.id) if doc.file else None
     return {
         "id": doc.id,
         "label": doc.label,
         "doc_type": doc.doc_type,
         "doc_type_display": dict(PatientDocument.DOC_TYPES).get(doc.doc_type, doc.doc_type),
         "original_filename": doc.original_filename,
-        "file_url": url,
+        "file_path": file_path,
+        "file_url": request.build_absolute_uri(f"/api/v1{file_path}") if file_path else None,
         "uploaded_by": doc.uploaded_by.get_full_name() or doc.uploaded_by.username if doc.uploaded_by else None,
         "created_at": doc.created_at.isoformat(),
     }
@@ -3905,7 +3942,12 @@ class AdminViewSet(viewsets.ViewSet):
         if not patient:
             return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
         docs = PatientDocument.objects.filter(patient=patient).select_related("uploaded_by")
-        return Response([_serialize_patient_document(d, request) for d in docs])
+        return Response([_serialize_patient_document(d, request, files_base="/admin") for d in docs])
+
+    @action(detail=False, methods=["get"], url_path="patient_document_file")
+    def patient_document_file(self, request):
+        """Download or inline-preview a patient document (authenticated)."""
+        return _patient_document_file_response(request)
 
     @action(
         detail=False,
@@ -3939,7 +3981,7 @@ class AdminViewSet(viewsets.ViewSet):
             label=label,
             doc_type=doc_type,
         )
-        return Response(_serialize_patient_document(doc, request), status=status.HTTP_201_CREATED)
+        return Response(_serialize_patient_document(doc, request, files_base="/admin"), status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=["delete"], url_path="patient_document_delete")
     def patient_document_delete(self, request):
@@ -4201,7 +4243,12 @@ class DoctorViewSet(viewsets.ViewSet):
         if not patient:
             return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
         docs = PatientDocument.objects.filter(patient=patient).select_related("uploaded_by")
-        return Response([_serialize_patient_document(d, request) for d in docs])
+        return Response([_serialize_patient_document(d, request, files_base="/doctor") for d in docs])
+
+    @action(detail=False, methods=["get"], url_path="patient_document_file")
+    def patient_document_file(self, request):
+        """Download or inline-preview a patient document (authenticated)."""
+        return _patient_document_file_response(request)
 
     @action(
         detail=False,
@@ -4235,7 +4282,7 @@ class DoctorViewSet(viewsets.ViewSet):
             label=label,
             doc_type=doc_type,
         )
-        return Response(_serialize_patient_document(doc, request), status=status.HTTP_201_CREATED)
+        return Response(_serialize_patient_document(doc, request, files_base="/doctor"), status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=["delete"], url_path="patient_document_delete")
     def patient_document_delete(self, request):
