@@ -601,6 +601,76 @@ class PublicCancelSerializer(serializers.Serializer):
         return attrs
 
 
+class RecurringBookingPreviewSerializer(serializers.Serializer):
+    """Preview recurring dates/slots without creating appointments."""
+
+    service_id = serializers.IntegerField()
+    provider_id = serializers.IntegerField()
+    appointment_date = serializers.DateField()
+    start_time = serializers.TimeField(input_formats=["%I:%M %p", "%H:%M"])
+    recurrence = serializers.ChoiceField(choices=["weekly", "biweekly", "monthly"])
+    occurrence_count = serializers.IntegerField(min_value=2, max_value=12, default=4)
+    phone = serializers.CharField(max_length=20, required=False, allow_blank=True, default="")
+
+    def validate(self, attrs):
+        phone = (attrs.get("phone") or "").strip()
+        if phone:
+            valid, msg = validate_phone(phone)
+            if not valid:
+                raise serializers.ValidationError({"phone": msg})
+        svc = Service.objects.filter(
+            pk=attrs["service_id"],
+            is_active=True,
+            show_in_public_booking=True,
+        ).first()
+        if not svc:
+            raise serializers.ValidationError(
+                {"service_id": "Invalid or inactive service for online booking."}
+            )
+        if not Provider.objects.filter(pk=attrs["provider_id"], active=True).exists():
+            raise serializers.ValidationError({"provider_id": "Invalid or inactive provider."})
+        return attrs
+
+
+class RecurringBookingSerializer(PublicBookingSerializer):
+    """Book a recurring series (same service, provider, and time each visit)."""
+
+    recurrence = serializers.ChoiceField(choices=["weekly", "biweekly", "monthly"])
+    occurrence_count = serializers.IntegerField(min_value=2, max_value=12, default=4)
+
+
+class DeskRecurringBookingPreviewSerializer(serializers.Serializer):
+    """Staff desk: preview recurring visits for an existing patient."""
+
+    patient_id = serializers.IntegerField(min_value=1)
+    service_id = serializers.IntegerField()
+    provider_id = serializers.IntegerField()
+    appointment_date = serializers.DateField()
+    start_time = serializers.TimeField(input_formats=["%I:%M %p", "%H:%M"])
+    recurrence = serializers.ChoiceField(choices=["weekly", "biweekly", "monthly"])
+    occurrence_count = serializers.IntegerField(min_value=2, max_value=12, default=4)
+
+    def validate(self, attrs):
+        svc = Service.objects.filter(
+            pk=attrs["service_id"],
+            is_active=True,
+            show_in_public_booking=True,
+        ).first()
+        if not svc:
+            raise serializers.ValidationError(
+                {"service_id": "Invalid or inactive service for booking."}
+            )
+        if not Provider.objects.filter(pk=attrs["provider_id"], active=True).exists():
+            raise serializers.ValidationError({"provider_id": "Invalid or inactive provider."})
+        if not Patient.objects.filter(pk=attrs["patient_id"]).exists():
+            raise serializers.ValidationError({"patient_id": "Patient not found."})
+        return attrs
+
+
+class DeskRecurringBookingSerializer(DeskRecurringBookingPreviewSerializer):
+    """Staff desk: book a recurring series for an existing patient."""
+
+
 class VisitRenderedServiceSerializer(serializers.ModelSerializer):
     class Meta:
         model = VisitRenderedService

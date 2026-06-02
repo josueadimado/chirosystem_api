@@ -275,6 +275,30 @@ class Service(TimeStampedModel):
         return alt if alt else self.name
 
 
+class AppointmentSeries(TimeStampedModel):
+    """Recurring online booking — multiple appointments share one series."""
+
+    class Recurrence(models.TextChoices):
+        WEEKLY = "weekly", "Weekly"
+        BIWEEKLY = "biweekly", "Every 2 weeks"
+        MONTHLY = "monthly", "Monthly"
+
+    patient = models.ForeignKey(Patient, on_delete=models.CASCADE, related_name="appointment_series")
+    provider = models.ForeignKey(Provider, on_delete=models.CASCADE)
+    booked_service = models.ForeignKey(Service, on_delete=models.SET_NULL, null=True)
+    start_time = models.TimeField(help_text="Shared start time for each occurrence.")
+    recurrence = models.CharField(max_length=20, choices=Recurrence.choices)
+    first_appointment_date = models.DateField()
+    last_appointment_date = models.DateField()
+    occurrence_count = models.PositiveSmallIntegerField(default=1)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"Series #{self.pk} ({self.recurrence}, {self.occurrence_count} visits)"
+
+
 class Appointment(TimeStampedModel):
     class Status(models.TextChoices):
         BOOKED = "booked", "Booked"
@@ -288,6 +312,13 @@ class Appointment(TimeStampedModel):
     patient = models.ForeignKey(Patient, on_delete=models.CASCADE)
     provider = models.ForeignKey(Provider, on_delete=models.CASCADE)
     booked_service = models.ForeignKey(Service, on_delete=models.SET_NULL, null=True)
+    series = models.ForeignKey(
+        AppointmentSeries,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="appointments",
+    )
     appointment_date = models.DateField()
     start_time = models.TimeField()
     end_time = models.TimeField()

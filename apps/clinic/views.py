@@ -64,6 +64,10 @@ from .serializers import (
     PaymentCompleteSerializer,
     PaymentSerializer,
     PublicBookingSerializer,
+    RecurringBookingPreviewSerializer,
+    RecurringBookingSerializer,
+    DeskRecurringBookingPreviewSerializer,
+    DeskRecurringBookingSerializer,
     PublicCancelSerializer,
     PublicRescheduleSerializer,
     ProviderSerializer,
@@ -1674,7 +1678,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         return qs
 
     def get_permissions(self):
-        if self.action == "book":
+        if self.action in ("book", "recurring_preview", "book_recurring"):
             return [permissions.AllowAny()]
         return super().get_permissions()
 
@@ -2104,6 +2108,117 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                 "appointment_date": str(appointment.appointment_date),
                 "start_time": appointment.start_time.strftime("%I:%M %p"),
                 "total_amount": str(service.price),
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=False, methods=["post"], url_path="recurring-preview")
+    def recurring_preview(self, request):
+        """Preview recurring visit dates and whether each slot is still open."""
+        from .recurring_booking import preview_recurring_slots
+
+        serializer = RecurringBookingPreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        result = preview_recurring_slots(serializer.validated_data)
+        if not result.get("ok"):
+            return Response({"detail": result.get("detail")}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result)
+
+    @action(detail=False, methods=["post"], url_path="book-recurring")
+    def book_recurring(self, request):
+        """Book multiple visits on a recurring schedule (one combined confirmation)."""
+        from .recurring_booking import book_recurring_from_public
+
+        serializer = RecurringBookingSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        appointments, err = book_recurring_from_public(serializer.validated_data)
+        if err:
+            code = (
+                status.HTTP_409_CONFLICT
+                if "slot" in err.lower() or "not available" in err.lower() or "time is not open" in err.lower()
+                else status.HTTP_400_BAD_REQUEST
+            )
+            return Response({"detail": err}, status=code)
+
+        series = appointments[0].series
+        rows = []
+        for appointment in appointments:
+            patient = appointment.patient
+            service = appointment.booked_service
+            provider = appointment.provider
+            rows.append(
+                {
+                    "appointment_id": appointment.id,
+                    "status": appointment.status,
+                    "patient": f"{patient.first_name} {patient.last_name}",
+                    "provider": str(provider),
+                    "service": service.label_for_public_booking() if service else "",
+                    "service_type": service.service_type if service else "",
+                    "appointment_date": str(appointment.appointment_date),
+                    "start_time": appointment.start_time.strftime("%I:%M %p"),
+                    "total_amount": str(service.price) if service else "0",
+                }
+            )
+        return Response(
+            {
+                "series_id": series.id if series else None,
+                "occurrence_count": len(rows),
+                "appointments": rows,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=False, methods=["post"], url_path="recurring-preview-desk")
+    def recurring_preview_desk(self, request):
+        """Staff desk: preview recurring visit dates for an existing patient."""
+        from .provider_self_schedule import user_may_book_as_provider
+        from .recurring_booking import preview_recurring_slots_desk
+
+        serializer = DeskRecurringBookingPreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        provider = Provider.objects.filter(pk=data["provider_id"], active=True).first()
+        if not provider:
+            return Response({"detail": "Invalid or inactive provider."}, status=status.HTTP_400_BAD_REQUEST)
+        if not user_may_book_as_provider(request.user, provider):
+            return Response({"detail": "You cannot book for that provider."}, status=status.HTTP_403_FORBIDDEN)
+
+        result = preview_recurring_slots_desk(data)
+        if not result.get("ok"):
+            return Response({"detail": result.get("detail")}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result)
+
+    @action(detail=False, methods=["post"], url_path="book-recurring-from-desk")
+    def book_recurring_from_desk(self, request):
+        """Staff desk: book recurring visits for an existing patient (one combined confirmation)."""
+        from .provider_self_schedule import user_may_book_as_provider
+        from .recurring_booking import book_recurring_from_desk
+
+        serializer = DeskRecurringBookingSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        provider = Provider.objects.filter(pk=data["provider_id"], active=True).first()
+        if not provider:
+            return Response({"detail": "Invalid or inactive provider."}, status=status.HTTP_400_BAD_REQUEST)
+        if not user_may_book_as_provider(request.user, provider):
+            return Response({"detail": "You cannot book for that provider."}, status=status.HTTP_403_FORBIDDEN)
+
+        appointments, err = book_recurring_from_desk(data)
+        if err:
+            code = (
+                status.HTTP_409_CONFLICT
+                if "slot" in err.lower() or "not available" in err.lower()
+                else status.HTTP_400_BAD_REQUEST
+            )
+            return Response({"detail": err}, status=code)
+
+        series = appointments[0].series if appointments else None
+        return Response(
+            {
+                "detail": f"{len(appointments)} recurring visits booked.",
+                "series_id": series.id if series else None,
+                "occurrence_count": len(appointments),
+                "appointment_ids": [a.id for a in appointments],
             },
             status=status.HTTP_201_CREATED,
         )

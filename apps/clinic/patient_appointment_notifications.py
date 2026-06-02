@@ -69,6 +69,46 @@ def queue_patient_booking_confirmations(
     _dispatch_patient_notification_tasks(specs, appointment_id, context="booking")
 
 
+def queue_series_booking_confirmations(series_id: int, appointment_ids: list[int]) -> None:
+    """Recurring online booking — one combined SMS/email; per-visit day-before reminders unchanged."""
+    from apps.notifications.tasks import (
+        send_series_booking_confirmation_email_task,
+        send_series_booking_confirmation_sms_task,
+    )
+
+    if not appointment_ids:
+        return
+
+    def _run_sms():
+        try:
+            send_series_booking_confirmation_sms_task.delay(series_id, appointment_ids)
+        except Exception:
+            logger.warning(
+                "Celery dispatch failed for series booking SMS (series %s), running synchronously",
+                series_id,
+            )
+            try:
+                send_series_booking_confirmation_sms_task(series_id, appointment_ids)
+            except Exception:
+                logger.exception("Sync fallback failed for series booking SMS series %s", series_id)
+
+    def _run_email():
+        try:
+            send_series_booking_confirmation_email_task.delay(series_id, appointment_ids)
+        except Exception:
+            logger.warning(
+                "Celery dispatch failed for series booking email (series %s), running synchronously",
+                series_id,
+            )
+            try:
+                send_series_booking_confirmation_email_task(series_id, appointment_ids)
+            except Exception:
+                logger.exception("Sync fallback failed for series booking email series %s", series_id)
+
+    _run_sms()
+    _run_email()
+
+
 def queue_patient_cancel_confirmations(
     appointment_id: int,
     *,

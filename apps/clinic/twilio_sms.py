@@ -143,6 +143,25 @@ def booking_confirmation_body(
     )
 
 
+def series_booking_confirmation_body(
+    *,
+    first_name: str,
+    service_name: str,
+    time_display: str,
+    provider_display: str,
+    date_lines: list[str],
+    estimated_payment: str = "",
+) -> str:
+    """One SMS listing all dates in a recurring online booking."""
+    dates_text = "; ".join(date_lines)
+    pay = f" Est. {estimated_payment} due at each visit." if estimated_payment else ""
+    return (
+        f"Relief Chiropractic: Hi {first_name}, your {len(date_lines)} {service_name} visits with "
+        f"{provider_display} are confirmed at {time_display}: {dates_text}.{pay} "
+        f"We'll text you a reminder the day before each visit.{sms_footer()}"
+    )
+
+
 def appointment_reminder_body(
     *,
     first_name: str,

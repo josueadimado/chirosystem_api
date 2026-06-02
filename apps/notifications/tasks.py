@@ -158,6 +158,142 @@ def send_booking_confirmation_email_task(appointment_id: int) -> str:
 
 
 @shared_task
+def send_series_booking_confirmation_sms_task(series_id: int, appointment_ids: list[int]) -> str:
+    """One SMS after recurring online booking (lists all visit dates)."""
+    from apps.clinic.models import Appointment, AppointmentSeries
+    from apps.clinic.twilio_sms import send_sms, series_booking_confirmation_body, twilio_configured
+
+    if not twilio_configured():
+        return "twilio_disabled"
+
+    series = (
+        AppointmentSeries.objects.select_related("patient", "provider", "booked_service")
+        .filter(pk=series_id)
+        .first()
+    )
+    if not series:
+        return "series_missing"
+
+    appts = list(
+        Appointment.objects.filter(pk__in=appointment_ids)
+        .select_related("booked_service")
+        .order_by("appointment_date")
+    )
+    if not appts:
+        return "appointments_missing"
+
+    patient = series.patient
+    from apps.clinic.patient_communication_prefs import patient_wants_booking_sms
+
+    if not patient_wants_booking_sms(patient):
+        return "patient_pref_no_sms"
+
+    to = (patient.phone or "").strip()
+    if not to:
+        return "no_phone"
+
+    service = series.booked_service
+    service_name = service.label_for_public_booking() if service else "appointment"
+    time_disp = format_time_12h(series.start_time)
+    est_pay = format_usd_plain(service.price) if service else ""
+    date_lines = [a.appointment_date.strftime("%a %b %d") for a in appts]
+    body = series_booking_confirmation_body(
+        first_name=patient.first_name.strip() or "there",
+        service_name=service_name,
+        time_display=time_disp,
+        provider_display=str(series.provider),
+        date_lines=date_lines,
+        estimated_payment=est_pay,
+    )
+    sid = send_sms(to_e164=to, body=body)
+    logger.info("Series booking SMS: series=%s to=%s sid=%s", series_id, to, sid)
+    return sid or "send_failed"
+
+
+@shared_task
+def send_series_booking_confirmation_email_task(series_id: int, appointment_ids: list[int]) -> str:
+    """One email after recurring online booking (lists all visit dates)."""
+    from django.conf import settings as django_settings
+    from django.core.mail import send_mail
+
+    from apps.clinic.models import Appointment, AppointmentSeries
+
+    if not _smtp_configured():
+        return "email_not_configured"
+
+    series = (
+        AppointmentSeries.objects.select_related("patient", "provider", "booked_service")
+        .filter(pk=series_id)
+        .first()
+    )
+    if not series:
+        return "series_missing"
+
+    appts = list(
+        Appointment.objects.filter(pk__in=appointment_ids)
+        .select_related("booked_service")
+        .order_by("appointment_date")
+    )
+    if not appts:
+        return "appointments_missing"
+
+    patient = series.patient
+    from apps.clinic.patient_communication_prefs import patient_wants_booking_email
+
+    if not patient_wants_booking_email(patient):
+        return "patient_pref_no_email"
+
+    email = (patient.email or "").strip()
+    if not email:
+        return "no_email"
+
+    service = series.booked_service
+    service_name = service.label_for_public_booking() if service else "appointment"
+    time_disp = format_time_12h(series.start_time)
+    est_pay = format_usd_plain(service.price) if service else ""
+    first_name = patient.first_name.strip() or "there"
+    visit_lines = "\n".join(
+        f"  • {a.appointment_date.strftime('%A, %B %d, %Y')} at {time_disp}"
+        for a in appts
+    )
+    est_block = ""
+    if est_pay:
+        est_block = (
+            f"\n  Expected amount at each visit: {est_pay}\n"
+            f"    (Estimate for this booked service; add-on services may change your final balance.)\n"
+        )
+
+    subject = f"Recurring visits confirmed — {len(appts)} {service_name} appointments"
+    body = (
+        f"Hi {first_name},\n\n"
+        f"Your recurring appointments at Relief Chiropractic are confirmed!\n\n"
+        f"  Service: {service_name}\n"
+        f"  Provider: {series.provider}\n"
+        f"  Time: {time_disp} (same time for each visit)\n\n"
+        f"Scheduled visits:\n{visit_lines}\n"
+        f"{est_block}\n"
+        f"We'll send a reminder the day before each visit using the contact preferences on your chart.\n\n"
+        f"If you need to reschedule or cancel, please call us or visit our website.\n\n"
+        f"Thank you for choosing Relief Chiropractic!\n"
+        f"— Relief Chiropractic Team"
+    )
+
+    try:
+        send_mail(
+            subject=subject,
+            message=body,
+            from_email=django_settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email],
+            fail_silently=False,
+        )
+        logger.info("Series booking email sent: series=%s to=%s", series_id, email)
+        return "sent"
+    except Exception:
+        logger.exception("Series booking email failed: series=%s to=%s", series_id, email)
+        return "send_failed"
+
+
+@shared_task
 def send_daily_appointment_reminders() -> dict:
     """
     Celery Beat (default daily 9:00 in CLINIC_TIMEZONE): day-before **SMS and email**
