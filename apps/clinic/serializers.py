@@ -578,7 +578,7 @@ class PublicRescheduleSerializer(serializers.Serializer):
     phone = serializers.CharField(max_length=20)
     appointment_id = serializers.IntegerField(min_value=1)
     appointment_date = serializers.DateField()
-    start_time = serializers.TimeField(input_formats=["%I:%M %p", "%H:%M"])
+    start_time = serializers.TimeField(input_formats=["%I:%M %p", "%H:%M", "%H:%M:%S"])
     sms_consent = serializers.BooleanField(required=False, default=False)
 
     def validate(self, attrs):

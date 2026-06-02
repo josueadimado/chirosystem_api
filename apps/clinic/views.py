@@ -1244,6 +1244,14 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         out = []
         for a in rows:
             svc = a.booked_service
+            if not view_only and a.status == Appointment.Status.BOOKED:
+                if a.appointment_date == today:
+                    try:
+                        if _appointment_start_aware_in_clinic_tz(a) <= now:
+                            continue
+                    except Exception:
+                        continue
+
             if view_only:
                 if not svc:
                     service_name = "Scheduled visit"
@@ -1258,20 +1266,23 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                     duration_minutes = svc.duration_minutes
                     price = str(svc.price)
             else:
-                if not svc or not svc.is_active or not svc.show_in_public_booking:
-                    continue
-                service_name = svc.label_for_public_booking()
-                service_id = svc.id
-                service_type = svc.service_type
-                duration_minutes = svc.duration_minutes
-                price = str(svc.price)
-                if a.appointment_date == today and a.status == Appointment.Status.BOOKED:
-                    try:
-                        start_aware = _appointment_start_aware_in_clinic_tz(a)
-                    except Exception:
-                        continue
-                    if start_aware <= now:
-                        continue
+                if not svc:
+                    service_name = "Scheduled visit"
+                    service_id = 0
+                    service_type = ""
+                    duration_minutes = 0
+                    price = "0"
+                else:
+                    service_name = svc.label_for_public_booking()
+                    service_id = svc.id
+                    service_type = svc.service_type
+                    duration_minutes = svc.duration_minutes
+                    price = str(svc.price)
+
+            can_cancel_online = a.status == Appointment.Status.BOOKED
+            can_reschedule_online = can_cancel_online and bool(
+                svc and svc.is_active and svc.show_in_public_booking
+            )
             pn = a.patient
             out.append(
                 {
@@ -1287,8 +1298,10 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                     "price": price,
                     "patient_name": f"{pn.first_name} {pn.last_name}".strip(),
                     "status": a.status,
-                    "can_manage_online": a.status == Appointment.Status.BOOKED
-                    and bool(svc and svc.is_active and svc.show_in_public_booking),
+                    "can_cancel_online": can_cancel_online,
+                    "can_reschedule_online": can_reschedule_online,
+                    # Backward-compatible: true when cancel or reschedule is allowed online.
+                    "can_manage_online": can_cancel_online or can_reschedule_online,
                 }
             )
         empty_hint = ""
@@ -1384,8 +1397,8 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                         pass
             if hidden_service:
                 return (
-                    "A visit is on file for this number, but that visit type is not set up for online changes. "
-                    "Please call the clinic."
+                    "A visit is on file for this number. You can cancel it online after you look up your number "
+                    "under Reschedule or cancel; moving the time online may require calling the clinic."
                 )
             if passed_today:
                 return (
