@@ -376,9 +376,9 @@ class Visit(TimeStampedModel):
     class Meta:
         indexes = [
             # Doctor patient list: completed visits for a provider sorted by date
-            models.Index(fields=["provider_id", "status", "completed_at"], name="visit_provider_status_completed_idx"),
+            models.Index(fields=["provider_id", "status", "completed_at"], name="visit_prov_stat_done_idx"),
             # Patient chart: completed visits for a patient sorted by date
-            models.Index(fields=["patient_id", "status", "completed_at"], name="visit_patient_status_completed_idx"),
+            models.Index(fields=["patient_id", "status", "completed_at"], name="visit_pat_stat_done_idx"),
         ]
 
 

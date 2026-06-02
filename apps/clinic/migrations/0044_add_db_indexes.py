@@ -43,14 +43,14 @@ class Migration(migrations.Migration):
             model_name="visit",
             index=models.Index(
                 fields=["provider_id", "status", "completed_at"],
-                name="visit_provider_status_completed_idx",
+                name="visit_prov_stat_done_idx",
             ),
         ),
         migrations.AddIndex(
             model_name="visit",
             index=models.Index(
                 fields=["patient_id", "status", "completed_at"],
-                name="visit_patient_status_completed_idx",
+                name="visit_pat_stat_done_idx",
             ),
         ),
         # ── VisitRenderedService ───────────────────────────────────────────────
