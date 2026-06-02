@@ -146,9 +146,10 @@ except OSError:
     pass
 
 # Media files — uploaded patient documents, insurance cards, images, etc.
-# In production, point MEDIA_ROOT at a volume and serve via nginx (or switch to S3 with django-storages).
+# In production, mount a persistent volume at MEDIA_ROOT (see apps/api/docker-compose.prod.yml).
 MEDIA_URL = "/media/"
-MEDIA_ROOT = BASE_DIR / "media"
+_MEDIA_ROOT_ENV = os.getenv("MEDIA_ROOT", "").strip()
+MEDIA_ROOT = Path(_MEDIA_ROOT_ENV) if _MEDIA_ROOT_ENV else BASE_DIR / "media"
 try:
     MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 except OSError:

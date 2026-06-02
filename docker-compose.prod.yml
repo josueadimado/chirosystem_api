@@ -69,6 +69,9 @@ services:
       retries: 8
       start_period: 180s
     stop_grace_period: 30s
+    volumes:
+      # Patient document uploads (insurance cards, etc.) — without this, files are lost on container rebuild.
+      - chiroflow_media_data:/app/media
     networks:
       - default
       - web
@@ -203,6 +206,7 @@ services:
 volumes:
   chiroflow_postgres_data:
   chiroflow_redis_data:
+  chiroflow_media_data:
 
 networks:
   web:

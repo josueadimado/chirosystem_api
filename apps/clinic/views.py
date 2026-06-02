@@ -566,6 +566,16 @@ def _patient_document_file_path(files_base: str, doc_id: int) -> str:
     return f"{files_base}/patient_document_file/?doc_id={doc_id}"
 
 
+def _patient_document_file_on_disk(doc: "PatientDocument") -> bool:
+    """True when the DB row has a file field and the bytes exist on disk (or storage backend)."""
+    if not doc.file or not doc.file.name:
+        return False
+    try:
+        return bool(doc.file.storage.exists(doc.file.name))
+    except Exception:
+        return False
+
+
 def _serve_patient_document_file(doc: "PatientDocument", *, as_download: bool) -> FileResponse:
     """Stream an uploaded patient document (requires authenticated API access)."""
     if not doc.file:
@@ -596,23 +606,77 @@ def _patient_document_file_response(request) -> FileResponse | Response:
     try:
         return _serve_patient_document_file(doc, as_download=as_download)
     except Http404:
-        return Response({"detail": "File not found on server."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            {
+                "detail": (
+                    "File not found on server. The upload may have been lost after a deploy — "
+                    "please upload the document again."
+                ),
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )
 
 
 def _serialize_patient_document(doc: "PatientDocument", request, *, files_base: str) -> dict:
     """Serialize a PatientDocument instance to a JSON-safe dict."""
-    file_path = _patient_document_file_path(files_base, doc.id) if doc.file else None
+    file_ok = _patient_document_file_on_disk(doc)
+    file_path = _patient_document_file_path(files_base, doc.id) if file_ok else None
     return {
         "id": doc.id,
         "label": doc.label,
         "doc_type": doc.doc_type,
         "doc_type_display": dict(PatientDocument.DOC_TYPES).get(doc.doc_type, doc.doc_type),
         "original_filename": doc.original_filename,
+        "file_available": file_ok,
         "file_path": file_path,
         "file_url": request.build_absolute_uri(f"/api/v1{file_path}") if file_path else None,
         "uploaded_by": doc.uploaded_by.get_full_name() or doc.uploaded_by.username if doc.uploaded_by else None,
         "created_at": doc.created_at.isoformat(),
     }
+
+
+def _patient_document_upload_response(request, *, files_base: str) -> Response:
+    """Shared upload handler for admin and doctor portals."""
+    patient_id = request.data.get("patient_id")
+    if not patient_id:
+        return Response({"detail": "patient_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+    patient = Patient.objects.filter(pk=patient_id).first()
+    if not patient:
+        return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
+    file = request.FILES.get("file")
+    if not file:
+        return Response({"detail": "No file was uploaded."}, status=status.HTTP_400_BAD_REQUEST)
+    label = (request.data.get("label") or "").strip()
+    if not label:
+        label = file.name
+    doc_type = request.data.get("doc_type") or "other"
+    valid_types = {k for k, _ in PatientDocument.DOC_TYPES}
+    if doc_type not in valid_types:
+        doc_type = "other"
+    doc = PatientDocument.objects.create(
+        patient=patient,
+        uploaded_by=request.user,
+        file=file,
+        original_filename=file.name,
+        label=label,
+        doc_type=doc_type,
+    )
+    if not _patient_document_file_on_disk(doc):
+        doc.file.delete(save=False)
+        doc.delete()
+        return Response(
+            {
+                "detail": (
+                    "Upload failed: the server could not save the file. "
+                    "Ask your administrator to enable persistent storage for patient documents (MEDIA volume)."
+                ),
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+    return Response(
+        _serialize_patient_document(doc, request, files_base=files_base),
+        status=status.HTTP_201_CREATED,
+    )
 
 
 def _serialize_patient_appointment_history(request, appointments, *, force_read_only: bool = False):
@@ -3957,31 +4021,7 @@ class AdminViewSet(viewsets.ViewSet):
     )
     def patient_document_upload(self, request):
         """Upload a new document to a patient's record (multipart/form-data)."""
-        patient_id = request.data.get("patient_id")
-        if not patient_id:
-            return Response({"detail": "patient_id is required."}, status=status.HTTP_400_BAD_REQUEST)
-        patient = Patient.objects.filter(pk=patient_id).first()
-        if not patient:
-            return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
-        file = request.FILES.get("file")
-        if not file:
-            return Response({"detail": "No file was uploaded."}, status=status.HTTP_400_BAD_REQUEST)
-        label = (request.data.get("label") or "").strip()
-        if not label:
-            label = file.name
-        doc_type = request.data.get("doc_type") or "other"
-        valid_types = {k for k, _ in PatientDocument.DOC_TYPES}
-        if doc_type not in valid_types:
-            doc_type = "other"
-        doc = PatientDocument.objects.create(
-            patient=patient,
-            uploaded_by=request.user,
-            file=file,
-            original_filename=file.name,
-            label=label,
-            doc_type=doc_type,
-        )
-        return Response(_serialize_patient_document(doc, request, files_base="/admin"), status=status.HTTP_201_CREATED)
+        return _patient_document_upload_response(request, files_base="/admin")
 
     @action(detail=False, methods=["delete"], url_path="patient_document_delete")
     def patient_document_delete(self, request):
@@ -4258,31 +4298,7 @@ class DoctorViewSet(viewsets.ViewSet):
     )
     def patient_document_upload(self, request):
         """Upload a new document to a patient's record (multipart/form-data)."""
-        patient_id = request.data.get("patient_id")
-        if not patient_id:
-            return Response({"detail": "patient_id is required."}, status=status.HTTP_400_BAD_REQUEST)
-        patient = Patient.objects.filter(pk=patient_id).first()
-        if not patient:
-            return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
-        file = request.FILES.get("file")
-        if not file:
-            return Response({"detail": "No file was uploaded."}, status=status.HTTP_400_BAD_REQUEST)
-        label = (request.data.get("label") or "").strip()
-        if not label:
-            label = file.name
-        doc_type = request.data.get("doc_type") or "other"
-        valid_types = {k for k, _ in PatientDocument.DOC_TYPES}
-        if doc_type not in valid_types:
-            doc_type = "other"
-        doc = PatientDocument.objects.create(
-            patient=patient,
-            uploaded_by=request.user,
-            file=file,
-            original_filename=file.name,
-            label=label,
-            doc_type=doc_type,
-        )
-        return Response(_serialize_patient_document(doc, request, files_base="/doctor"), status=status.HTTP_201_CREATED)
+        return _patient_document_upload_response(request, files_base="/doctor")
 
     @action(detail=False, methods=["delete"], url_path="patient_document_delete")
     def patient_document_delete(self, request):
