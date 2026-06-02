@@ -97,6 +97,19 @@ class Patient(TimeStampedModel):
         default=Decimal("0"),
         help_text="In-house prepaid credit available to apply to future invoices.",
     )
+    # Schedule / desk: insurance vs cash pay (set by staff; shown next to name on calendar).
+    class PaymentProfile(models.TextChoices):
+        UNSET = "", "Not set"
+        INSURANCE = "insurance", "Insurance"
+        CASH = "cash", "Cash / self-pay"
+
+    payment_profile = models.CharField(
+        max_length=20,
+        choices=PaymentProfile.choices,
+        blank=True,
+        default="",
+        help_text="Shown on the schedule: insurance (eye icon) or cash. Set by staff during a visit.",
+    )
 
     def __str__(self) -> str:
         return f"{self.first_name} {self.last_name}"

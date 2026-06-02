@@ -55,6 +55,7 @@ class PatientSerializer(serializers.ModelSerializer):
             "notify_reminders",
             "notify_bills",
             "online_chiro_intake_waived",
+            "payment_profile",
             "credit_balance",
             "created_at",
             "updated_at",
@@ -125,6 +126,7 @@ class PatientListSerializer(serializers.ModelSerializer):
             "phone",
             "email",
             "date_of_birth",
+            "payment_profile",
             "no_show_count",
             "visit_count",
             "last_visit",
@@ -459,6 +461,7 @@ class AppointmentListSerializer(serializers.ModelSerializer):
     end_time_display = serializers.SerializerMethodField()
     reason_for_visit = serializers.SerializerMethodField()
     patient_date_of_birth = serializers.SerializerMethodField()
+    patient_payment_profile = serializers.SerializerMethodField()
     invoice_kind = serializers.SerializerMethodField()
     display_status = serializers.SerializerMethodField()
     auto_no_show_processed_at = serializers.DateTimeField(read_only=True)
@@ -470,6 +473,7 @@ class AppointmentListSerializer(serializers.ModelSerializer):
             "patient",
             "patient_name",
             "patient_date_of_birth",
+            "patient_payment_profile",
             "provider",
             "provider_name",
             "booked_service",
@@ -511,6 +515,9 @@ class AppointmentListSerializer(serializers.ModelSerializer):
     def get_patient_date_of_birth(self, obj):
         dob = obj.patient.date_of_birth
         return str(dob) if dob else None
+
+    def get_patient_payment_profile(self, obj):
+        return (obj.patient.payment_profile or "").strip()
 
     def get_invoice_kind(self, obj):
         try:
@@ -833,6 +840,11 @@ class PatientIntakeUpdateSerializer(serializers.Serializer):
     notify_booking = serializers.ChoiceField(choices=["sms", "email", "both"], required=False)
     notify_reminders = serializers.ChoiceField(choices=["sms", "email", "both"], required=False)
     notify_bills = serializers.ChoiceField(choices=["sms", "email", "both"], required=False)
+    payment_profile = serializers.ChoiceField(
+        choices=["", "insurance", "cash"],
+        required=False,
+        allow_blank=True,
+    )
 
 
 class ClinicProfileUpdateSerializer(serializers.Serializer):

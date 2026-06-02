@@ -103,6 +103,7 @@ def serialize_doctor_dashboard_appointments(appt_list: list[Appointment]) -> lis
             "visit_id": v.id if v else None,
             "card_last4": a.patient.card_last4 or "",
             "card_brand": a.patient.card_brand or "",
+            "patient_payment_profile": (a.patient.payment_profile or "").strip(),
         }
         inv = invoice_by_aid.get(a.id)
         if (

@@ -209,6 +209,7 @@ def _serialize_billing_invoice_row(inv: Invoice) -> dict:
         "invoice_number": inv.invoice_number,
         "patient_id": inv.patient_id,
         "patient_name": f"{inv.patient.first_name} {inv.patient.last_name}",
+        "patient_payment_profile": (inv.patient.payment_profile or "").strip(),
         "patient_credit_balance": str(inv.patient.credit_balance),
         "status": inv.status,
         "kind": inv.kind,
@@ -319,6 +320,7 @@ def _invoice_bill_dict(inv: Invoice, *, preview: bool) -> dict:
         "billing_date_display": _format_bill_display_date(billing_anchor),
         "statement_date_display": _format_bill_display_date(timezone.localdate()),
         "patient_name": f"{pat.first_name} {pat.last_name}",
+        "patient_payment_profile": (pat.payment_profile or "").strip(),
         "patient_address": addr_display,
         "diagnosis": (visit.diagnosis or "").strip() or "\u2014",
         "provider_name": str(inv.appointment.provider) if inv.appointment and inv.appointment.provider else "",
@@ -2689,6 +2691,7 @@ class AdminViewSet(viewsets.ViewSet):
             today_schedule.append({
                 "id": a.id,
                 "patient_name": f"{a.patient.first_name} {a.patient.last_name}",
+                "patient_payment_profile": (a.patient.payment_profile or "").strip(),
                 "provider_name": str(a.provider),
                 "start_time": a.start_time.strftime("%I:%M %p"),
                 "status": ui_status,
@@ -3478,6 +3481,7 @@ class AdminViewSet(viewsets.ViewSet):
                 "balance_no_show_fee": str(bal_no_show.quantize(Decimal("0.01"))),
                 "balance_late_cancel_fee": str(bal_late_cancel.quantize(Decimal("0.01"))),
                 "has_overdue": bool(getattr(p, "has_overdue_invoice", False)),
+                "payment_profile": (p.payment_profile or "").strip(),
             })
         return Response(data)
 
@@ -3516,6 +3520,7 @@ class AdminViewSet(viewsets.ViewSet):
                 "card_last4": patient.card_last4 or "",
                 "has_saved_card": bool(patient.card_last4),
                 "online_chiro_intake_waived": patient.online_chiro_intake_waived,
+                "payment_profile": (patient.payment_profile or "").strip(),
                 "sms_consent": patient.sms_consent,
                 "sms_consent_at": patient.sms_consent_at.isoformat() if patient.sms_consent_at else None,
                 **patient_communication_prefs_payload(patient),
@@ -3810,6 +3815,7 @@ class DoctorViewSet(viewsets.ViewSet):
                 "card_last4": patient.card_last4 or "",
                 "has_saved_card": bool(patient.card_last4),
                 "online_chiro_intake_waived": patient.online_chiro_intake_waived,
+                "payment_profile": (patient.payment_profile or "").strip(),
                 "sms_consent": patient.sms_consent,
                 "sms_consent_at": patient.sms_consent_at.isoformat() if patient.sms_consent_at else None,
                 **patient_communication_prefs_payload(patient),
@@ -4023,6 +4029,7 @@ class DoctorViewSet(viewsets.ViewSet):
                 "invoice_id": inv.id,
                 "invoice_number": inv.invoice_number,
                 "patient_name": f"{inv.patient.first_name} {inv.patient.last_name}",
+                "patient_payment_profile": (inv.patient.payment_profile or "").strip(),
                 "date_of_service": str(inv.appointment.appointment_date),
                 "total_amount": str(inv.total_amount),
                 "status": inv.status,

@@ -216,6 +216,7 @@ def patient_demographics_summary(patient: Patient) -> dict:
     return {
         "marital_status": (patient.marital_status or "").strip(),
         "age": _patient_age_years(patient.date_of_birth),
+        "payment_profile": (patient.payment_profile or "").strip(),
         "date_established": str(effective) if effective else None,
         "date_established_override": str(manual) if manual else None,
         "first_appointment_date": str(first_date) if first_date else None,
@@ -283,6 +284,11 @@ def apply_patient_intake_validated_data(
         elif not new_consent:
             patient.sms_consent_at = None
         patient.sms_consent = new_consent
+
+    if "payment_profile" in data:
+        profile = (data.get("payment_profile") or "").strip().lower()
+        if profile in ("", "insurance", "cash"):
+            patient.payment_profile = profile
 
     if allow_communication_prefs:
         from apps.clinic.patient_communication_prefs import (

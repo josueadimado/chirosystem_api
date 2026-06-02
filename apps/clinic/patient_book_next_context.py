@@ -25,6 +25,7 @@ def book_next_context_for_appointment(appt: Appointment) -> dict:
     return {
         "patient_id": appt.patient_id,
         "patient_name": f"{appt.patient.first_name} {appt.patient.last_name}".strip(),
+        "patient_payment_profile": (appt.patient.payment_profile or "").strip(),
         "appointment_id": appt.id,
         "appointment_date": appt.appointment_date.isoformat(),
         "start_time_display": appt.start_time.strftime("%I:%M %p").lstrip("0"),
