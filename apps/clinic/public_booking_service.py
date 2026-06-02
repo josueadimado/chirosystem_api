@@ -241,7 +241,7 @@ def reschedule_appointment_public(
         return None, "Only upcoming scheduled visits can be rescheduled online. Please call the clinic."
 
     service = appt.booked_service
-    if not service or not service.is_active or not service.show_in_public_booking:
+    if not service or not service.is_active:
         return None, "This visit type cannot be rescheduled online. Please call the clinic."
 
     from apps.clinic.clinic_time import clinic_localdate, slot_start_is_in_past

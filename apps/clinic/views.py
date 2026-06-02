@@ -793,6 +793,8 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         """
         from datetime import datetime
 
+        from .patient_phone import patient_matches_phone_normalized
+
         date_str = request.query_params.get("date")
         provider_id = request.query_params.get("provider_id")
         service_id = request.query_params.get("service_id")
@@ -806,11 +808,58 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         except ValueError:
             return Response({"detail": "Invalid date format. Use YYYY-MM-DD."}, status=status.HTTP_400_BAD_REQUEST)
         provider = Provider.objects.filter(pk=provider_id, active=True).first()
-        service = Service.objects.filter(pk=service_id, is_active=True, show_in_public_booking=True).first()
-        if not provider or not service:
+        if not provider:
             return Response({"detail": "Invalid provider or service."}, status=status.HTTP_400_BAD_REQUEST)
-        if not provider_can_offer_service_online(provider, service):
-            return Response({"detail": "Provider does not offer this service."}, status=status.HTTP_400_BAD_REQUEST)
+
+        exclude_raw = (request.query_params.get("exclude_appointment_id") or "").strip()
+        phone_for_exclude = (request.query_params.get("phone") or "").strip()
+        reschedule_self_service = False
+        ex_appt_for_reschedule = None
+        if exclude_raw and phone_for_exclude:
+            valid_ex, msg_ex = validate_phone(phone_for_exclude)
+            if not valid_ex:
+                return Response({"detail": msg_ex or "Invalid phone."}, status=status.HTTP_400_BAD_REQUEST)
+            norm_ex = normalize_phone(phone_for_exclude)
+            try:
+                exclude_pk = int(exclude_raw)
+            except ValueError:
+                return Response(
+                    {"detail": "exclude_appointment_id must be a number."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            ex_appt_for_reschedule = (
+                Appointment.objects.select_related("patient", "booked_service")
+                .filter(pk=exclude_pk, status=Appointment.Status.BOOKED)
+                .first()
+            )
+            if (
+                ex_appt_for_reschedule
+                and patient_matches_phone_normalized(ex_appt_for_reschedule.patient, norm_ex)
+                and ex_appt_for_reschedule.provider_id == provider.pk
+            ):
+                reschedule_self_service = True
+
+        if reschedule_self_service and ex_appt_for_reschedule:
+            service = ex_appt_for_reschedule.booked_service
+            if not service or not service.is_active:
+                return Response({"detail": "Invalid provider or service."}, status=status.HTTP_400_BAD_REQUEST)
+            try:
+                if int(service_id) != service.pk:
+                    return Response(
+                        {"detail": "That visit does not match this service."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            except (TypeError, ValueError):
+                return Response({"detail": "Invalid service_id."}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            service = Service.objects.filter(pk=service_id, is_active=True, show_in_public_booking=True).first()
+            if not service:
+                return Response({"detail": "Invalid provider or service."}, status=status.HTTP_400_BAD_REQUEST)
+            if not provider_can_offer_service_online(provider, service):
+                return Response(
+                    {"detail": "Provider does not offer this service."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         from datetime import time as time_cls
 
@@ -822,7 +871,6 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             public_booking_last_slot_start_minute,
             public_booking_treatment_duration_minutes,
         )
-        from .patient_phone import patient_matches_phone_normalized
 
         desk_mode = (request.query_params.get("desk") or "").strip().lower() in ("1", "true", "yes")
         if desk_mode:
@@ -865,9 +913,9 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             )
             .select_related("booked_service")
         )
-        exclude_raw = (request.query_params.get("exclude_appointment_id") or "").strip()
-        phone_for_exclude = (request.query_params.get("phone") or "").strip()
-        if exclude_raw:
+        if reschedule_self_service and ex_appt_for_reschedule:
+            busy_qs = busy_qs.exclude(pk=ex_appt_for_reschedule.pk)
+        elif exclude_raw:
             if phone_for_exclude:
                 valid_ex, msg_ex = validate_phone(phone_for_exclude)
                 if not valid_ex:
@@ -1280,9 +1328,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                     price = str(svc.price)
 
             can_cancel_online = a.status == Appointment.Status.BOOKED
-            can_reschedule_online = can_cancel_online and bool(
-                svc and svc.is_active and svc.show_in_public_booking
-            )
+            can_reschedule_online = can_cancel_online and bool(svc and svc.is_active)
             pn = a.patient
             out.append(
                 {
@@ -1397,8 +1443,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                         pass
             if hidden_service:
                 return (
-                    "A visit is on file for this number. You can cancel it online after you look up your number "
-                    "under Reschedule or cancel; moving the time online may require calling the clinic."
+                    "A visit is on file for this number. Look it up under View / reschedule or cancel appointment."
                 )
             if passed_today:
                 return (
