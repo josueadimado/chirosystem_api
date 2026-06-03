@@ -5146,9 +5146,9 @@ class KioskViewSet(viewsets.ViewSet):
 
         if bypass_early or any(cls._can_kiosk_checkin_now(a)[0] for a in booked):
             siblings = cls._kiosk_same_day_booked_siblings(primary)
-            return siblings if siblings else booked
+            return (siblings if siblings else booked), None
 
-        return booked
+        return booked, None
 
     @classmethod
     def _kiosk_minutes_before(cls) -> int:
@@ -5457,20 +5457,32 @@ class KioskViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        for aid in checked_ids:
+        import logging
 
-            def queue_doctor_alert(aid=aid):
+        checkin_logger = logging.getLogger(__name__)
+
+        def after_checkin_side_effects(appointment_id: int) -> None:
+            try:
                 from apps.notifications.tasks import notify_provider_patient_checked_in_task
 
-                notify_provider_patient_checked_in_task.delay(aid)
-
-            def queue_in_app(aid=aid):
+                notify_provider_patient_checked_in_task.delay(appointment_id)
+            except Exception:
+                checkin_logger.exception(
+                    "check-in: failed to queue provider SMS for appointment %s",
+                    appointment_id,
+                )
+            try:
                 from apps.clinic.in_app_notify import create_checkin_in_app_notification
 
-                create_checkin_in_app_notification(aid)
+                create_checkin_in_app_notification(appointment_id)
+            except Exception:
+                checkin_logger.exception(
+                    "check-in: failed in-app notification for appointment %s",
+                    appointment_id,
+                )
 
-            transaction.on_commit(queue_doctor_alert)
-            transaction.on_commit(queue_in_app)
+        for aid in checked_ids:
+            transaction.on_commit(lambda aid=aid: after_checkin_side_effects(aid))
 
         count = len(checked_ids)
         patient_name = f"{appt.patient.first_name} {appt.patient.last_name}".strip()
