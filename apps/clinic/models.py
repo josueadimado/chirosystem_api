@@ -52,7 +52,7 @@ class Patient(TimeStampedModel):
     )
     # How to reach this patient for automated messages (staff/doctor can override per patient).
     _notify_channel_help = (
-        "sms = text only, email = email only, both = send on both channels when contact info exists."
+        "sms = text only, email = email only, both = both channels, none = no automated messages."
     )
     notify_booking = models.CharField(
         max_length=10,
@@ -60,6 +60,7 @@ class Patient(TimeStampedModel):
             ("sms", "Text (SMS) only"),
             ("email", "Email only"),
             ("both", "Text and email"),
+            ("none", "None"),
         ],
         default="sms",
         help_text="Booking / reschedule / cancel confirmations. " + _notify_channel_help,
@@ -70,6 +71,7 @@ class Patient(TimeStampedModel):
             ("sms", "Text (SMS) only"),
             ("email", "Email only"),
             ("both", "Text and email"),
+            ("none", "None"),
         ],
         default="sms",
         help_text="Day-before and same-day appointment reminders. SMS also requires SMS consent. "
@@ -81,6 +83,7 @@ class Patient(TimeStampedModel):
             ("sms", "Text (SMS) only"),
             ("email", "Email only"),
             ("both", "Text and email"),
+            ("none", "None"),
         ],
         default="email",
         help_text="Paid receipt / patient bill email from the portal. " + _notify_channel_help,
@@ -345,6 +348,10 @@ class Appointment(TimeStampedModel):
         null=True,
         blank=True,
         help_text="Set when the system automatically marked this visit as no-show.",
+    )
+    auto_no_show_exempt = models.BooleanField(
+        default=False,
+        help_text="When true, this visit is skipped by automatic no-show (staff can still mark no-show manually).",
     )
     no_show_notice_sms_at = models.DateTimeField(null=True, blank=True)
     no_show_notice_email_at = models.DateTimeField(null=True, blank=True)

@@ -43,6 +43,63 @@ def appointment_start_passed_grace(appt: Appointment, *, now=None) -> bool:
     return now >= start + _grace_timedelta()
 
 
+def auto_no_show_deadline(appt: Appointment):
+    """Clinic-local datetime when auto no-show would fire (start + grace)."""
+    return aware_appointment_start(appt.appointment_date, appt.start_time) + _grace_timedelta()
+
+
+def auto_no_show_countdown_for_appointment(appt: Appointment, *, now=None) -> dict | None:
+    """
+    Countdown for staff UI: minutes left before automatic no-show, or None if not applicable today.
+    """
+    from apps.clinic.clinic_time import clinic_localdate
+    from apps.clinic.utils import format_time_12h
+
+    solo = ClinicSettings.get_cached()
+    grace_min = int(_grace_timedelta().total_seconds() // 60)
+    now = now or clinic_now()
+
+    base = {
+        "enabled": bool(solo.auto_no_show_enabled),
+        "grace_minutes": grace_min,
+        "exempt": bool(appt.auto_no_show_exempt),
+    }
+
+    if not solo.auto_no_show_enabled:
+        return {**base, "applies": False, "minutes_remaining": None, "past_deadline": False}
+
+    if appt.auto_no_show_exempt:
+        return {**base, "applies": False, "minutes_remaining": None, "past_deadline": False}
+
+    if appt.auto_no_show_processed_at is not None:
+        return None
+
+    if appt.status not in _ACTIVE_STATUSES:
+        return None
+
+    if appt.appointment_date != clinic_localdate():
+        return None
+
+    deadline = auto_no_show_deadline(appt)
+    if now >= deadline:
+        return {
+            **base,
+            "applies": True,
+            "minutes_remaining": 0,
+            "past_deadline": True,
+            "deadline_display": format_time_12h(deadline.time()),
+        }
+
+    remaining = max(0, int((deadline - now).total_seconds() // 60))
+    return {
+        **base,
+        "applies": True,
+        "minutes_remaining": remaining,
+        "past_deadline": False,
+        "deadline_display": format_time_12h(deadline.time()),
+    }
+
+
 def process_auto_no_show_appointments() -> dict:
     """
     Find eligible appointments and mark each as no-show once.
@@ -166,6 +223,8 @@ def _process_one_appointment(appointment_id: int) -> dict:
             return {"status": "skipped", "reason": "already_processed"}
         if locked.status not in _ACTIVE_STATUSES:
             return {"status": "skipped", "reason": "status_changed"}
+        if locked.auto_no_show_exempt:
+            return {"status": "skipped", "reason": "exempt"}
 
         if not appointment_start_passed_grace(locked):
             return {"status": "skipped", "reason": "grace_not_elapsed"}

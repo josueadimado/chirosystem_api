@@ -74,3 +74,21 @@ class KioskResolveCheckinTargetsTest(SimpleTestCase):
         self.assertEqual(targets, [])
         self.assertIsInstance(err, str)
         self.assertIn("too early", err.lower())
+
+class AutoNoShowCountdownTest(SimpleTestCase):
+    @patch("apps.clinic.auto_no_show.ClinicSettings.get_cached")
+    def test_exempt_visit_not_at_risk(self, mock_settings):
+        from apps.clinic.auto_no_show import auto_no_show_countdown_for_appointment
+        from apps.clinic.models import Appointment
+
+        mock_settings.return_value = MagicMock(auto_no_show_enabled=True, auto_no_show_grace_minutes=60)
+
+        appt = MagicMock(spec=Appointment)
+        appt.status = Appointment.Status.BOOKED
+        appt.auto_no_show_exempt = True
+        appt.auto_no_show_processed_at = None
+
+        out = auto_no_show_countdown_for_appointment(appt)
+        self.assertIsNotNone(out)
+        self.assertTrue(out["exempt"])
+        self.assertFalse(out["applies"])

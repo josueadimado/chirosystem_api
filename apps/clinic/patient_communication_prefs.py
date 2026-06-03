@@ -8,11 +8,13 @@ from apps.clinic.models import Patient
 NOTIFY_SMS = "sms"
 NOTIFY_EMAIL = "email"
 NOTIFY_BOTH = "both"
+NOTIFY_NONE = "none"
 
 NOTIFY_CHANNEL_CHOICES = [
     (NOTIFY_SMS, "Text (SMS) only"),
     (NOTIFY_EMAIL, "Email only"),
     (NOTIFY_BOTH, "Text and email"),
+    (NOTIFY_NONE, "None"),
 ]
 
 DEFAULT_NOTIFY_BOOKING = NOTIFY_SMS
@@ -22,7 +24,7 @@ DEFAULT_NOTIFY_BILLS = NOTIFY_EMAIL
 
 def normalize_notify_channel(value: str | None, *, default: str) -> str:
     v = (value or "").strip().lower()
-    if v in (NOTIFY_SMS, NOTIFY_EMAIL, NOTIFY_BOTH):
+    if v in (NOTIFY_SMS, NOTIFY_EMAIL, NOTIFY_BOTH, NOTIFY_NONE):
         return v
     return default
 

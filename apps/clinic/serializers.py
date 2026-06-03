@@ -465,6 +465,8 @@ class AppointmentListSerializer(serializers.ModelSerializer):
     invoice_kind = serializers.SerializerMethodField()
     display_status = serializers.SerializerMethodField()
     auto_no_show_processed_at = serializers.DateTimeField(read_only=True)
+    auto_no_show_exempt = serializers.BooleanField(required=False)
+    auto_no_show_countdown = serializers.SerializerMethodField()
 
     class Meta:
         model = Appointment
@@ -488,6 +490,8 @@ class AppointmentListSerializer(serializers.ModelSerializer):
             "display_status",
             "invoice_kind",
             "auto_no_show_processed_at",
+            "auto_no_show_exempt",
+            "auto_no_show_countdown",
             "reason_for_visit",
         )
 
@@ -529,6 +533,11 @@ class AppointmentListSerializer(serializers.ModelSerializer):
         from apps.clinic.appointment_display import appointment_ui_status
 
         return appointment_ui_status(obj)
+
+    def get_auto_no_show_countdown(self, obj):
+        from apps.clinic.auto_no_show import auto_no_show_countdown_for_appointment
+
+        return auto_no_show_countdown_for_appointment(obj)
 
 
 class PublicBookingSerializer(serializers.Serializer):
@@ -908,9 +917,13 @@ class PatientIntakeUpdateSerializer(serializers.Serializer):
     # Only owner_admin/staff may persist this (see AdminViewSet.patient_intake); doctors’ PATCH ignores it.
     online_chiro_intake_waived = serializers.BooleanField(required=False)
     sms_consent = serializers.BooleanField(required=False)
-    notify_booking = serializers.ChoiceField(choices=["sms", "email", "both"], required=False)
-    notify_reminders = serializers.ChoiceField(choices=["sms", "email", "both"], required=False)
-    notify_bills = serializers.ChoiceField(choices=["sms", "email", "both"], required=False)
+    notify_booking = serializers.ChoiceField(
+        choices=["sms", "email", "both", "none"], required=False
+    )
+    notify_reminders = serializers.ChoiceField(
+        choices=["sms", "email", "both", "none"], required=False
+    )
+    notify_bills = serializers.ChoiceField(choices=["sms", "email", "both", "none"], required=False)
     payment_profile = serializers.ChoiceField(
         choices=["", "insurance", "cash"],
         required=False,
