@@ -801,40 +801,65 @@ def _save_appointment_handoff_notes(request):
     })
 
 
-def _save_appointment_soap_notes(request):
-    ser = AppointmentSoapNotesSerializer(data=request.data)
-    ser.is_valid(raise_exception=True)
-    aid = ser.validated_data["appointment_id"]
-    notes = ser.validated_data["doctor_notes"]
-    appt = Appointment.objects.filter(pk=aid).select_related("provider", "patient").first()
-    if not appt:
-        return Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
-    if appt.status != Appointment.Status.IN_CONSULTATION:
-        return Response(
-            {"detail": "SOAP notes can only be saved while the visit is in consultation."},
+_SOAP_NOTES_EDITABLE_APPOINTMENT_STATUSES = frozenset(
+    {
+        Appointment.Status.IN_CONSULTATION,
+        Appointment.Status.AWAITING_PAYMENT,
+        Appointment.Status.COMPLETED,
+    }
+)
+
+
+def _soap_notes_edit_context(request, appointment: Appointment | None):
+    """
+    Validate appointment + permissions for reading or saving consultation SOAP notes.
+    Returns (visit, error_response).
+    """
+    if not appointment:
+        return None, Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
+    if appointment.status not in _SOAP_NOTES_EDITABLE_APPOINTMENT_STATUSES:
+        return None, Response(
+            {
+                "detail": (
+                    "SOAP notes can only be edited during consultation, while awaiting payment, "
+                    "or after the visit is completed."
+                ),
+            },
             status=status.HTTP_400_BAD_REQUEST,
         )
     prov = provider_for_doctor_user(request.user)
-    if prov and clinical_access_level(prov, appt.patient) != "full":
-        return Response(
+    if prov and clinical_access_level(prov, appointment.patient) != "full":
+        return None, Response(
             {
                 "detail": "This patient is outside your care type (chiropractic vs massage). "
                 "You can view their chart but cannot edit consultation notes."
             },
             status=status.HTTP_403_FORBIDDEN,
         )
-    if not _can_edit_handoff_notes(request, appt):
-        return Response(
+    if not _can_edit_handoff_notes(request, appointment):
+        return None, Response(
             {"detail": "You cannot edit consultation notes on this appointment."},
             status=status.HTTP_403_FORBIDDEN,
         )
     try:
-        visit = appt.visit
+        visit = appointment.visit
     except Visit.DoesNotExist:
-        return Response(
-            {"detail": "Start the visit before saving consultation notes."},
+        return None, Response(
+            {"detail": "No visit record for this appointment yet."},
             status=status.HTTP_400_BAD_REQUEST,
         )
+    return visit, None
+
+
+def _save_appointment_soap_notes(request):
+    ser = AppointmentSoapNotesSerializer(data=request.data)
+    ser.is_valid(raise_exception=True)
+    aid = ser.validated_data["appointment_id"]
+    notes = ser.validated_data["doctor_notes"]
+    appt = Appointment.objects.filter(pk=aid).select_related("provider", "patient").first()
+    visit, err = _soap_notes_edit_context(request, appt)
+    if err:
+        return err
     visit.doctor_notes = notes
     visit.save(update_fields=["doctor_notes", "updated_at"])
     return Response({
@@ -4492,8 +4517,20 @@ class DoctorViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["patch"], url_path="appointment_soap_notes")
     def appointment_soap_notes(self, request):
-        """Save consultation (SOAP) notes while the visit is in progress."""
+        """Save consultation (SOAP) notes during or after the visit (not billing)."""
         return _save_appointment_soap_notes(request)
+
+    @action(detail=True, methods=["get"], url_path="visit_soap_notes")
+    def visit_soap_notes(self, request, pk=None):
+        """Load saved SOAP notes for edit after complete visit or while awaiting payment."""
+        provider = self._get_provider(request)
+        if not provider:
+            return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
+        appointment = Appointment.objects.filter(pk=pk, provider=provider).first()
+        visit, err = _soap_notes_edit_context(request, appointment)
+        if err:
+            return err
+        return Response({"doctor_notes": visit.doctor_notes or ""})
 
     @action(detail=True, methods=["post"])
     def start_visit(self, request, pk=None):
