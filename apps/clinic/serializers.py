@@ -765,27 +765,63 @@ class PaymentCompleteSerializer(serializers.Serializer):
     payment_reference = serializers.CharField(required=False, allow_blank=True)
 
     def save(self, *, invoice: Invoice):
-        if invoice.status not in (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT):
-            raise serializers.ValidationError("This invoice cannot be paid in its current state.")
-        payment = Payment.objects.create(
-            invoice=invoice,
-            patient=invoice.patient,
-            amount=self.validated_data["amount"],
-            payment_method=self.validated_data["payment_method"],
-            payment_reference=self.validated_data.get("payment_reference", ""),
-            status=Payment.Status.SUCCESSFUL,
-            paid_at=timezone.now(),
-        )
-        invoice.status = Invoice.Status.PAID
-        invoice.paid_at = timezone.now()
-        invoice.save(update_fields=["status", "paid_at", "updated_at"])
+        from django.db import transaction
 
-        appointment = invoice.appointment
-        if appointment.status != Appointment.Status.COMPLETED:
-            appointment.status = Appointment.Status.COMPLETED
-            appointment.completed_at = timezone.now()
-            appointment.save(update_fields=["status", "completed_at", "updated_at"])
-        return payment
+        from apps.clinic.invoice_collection import invoice_amount_due, set_appointment_status_after_invoice_paid
+
+        amount = Decimal(self.validated_data["amount"]).quantize(Decimal("0.01"))
+        if amount <= Decimal("0"):
+            raise serializers.ValidationError({"amount": "Amount must be greater than zero."})
+
+        with transaction.atomic():
+            inv = Invoice.objects.select_for_update().select_related("appointment", "patient").get(pk=invoice.pk)
+            if inv.status not in (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT):
+                raise serializers.ValidationError("This invoice cannot be paid in its current state.")
+
+            due_before = invoice_amount_due(inv)
+            if due_before <= Decimal("0"):
+                raise serializers.ValidationError("This invoice is already paid in full.")
+
+            if amount > due_before:
+                raise serializers.ValidationError(
+                    {
+                        "amount": (
+                            f"Amount cannot exceed ${due_before} still due on this invoice "
+                            f"(invoice total ${inv.total_amount})."
+                        ),
+                    }
+                )
+
+            payment = Payment.objects.create(
+                invoice=inv,
+                patient=inv.patient,
+                amount=amount,
+                payment_method=self.validated_data["payment_method"],
+                payment_reference=self.validated_data.get("payment_reference", ""),
+                status=Payment.Status.SUCCESSFUL,
+                paid_at=timezone.now(),
+            )
+
+            due_after = invoice_amount_due(inv)
+            if due_after <= Decimal("0"):
+                inv.status = Invoice.Status.PAID
+                inv.paid_at = timezone.now()
+                inv.save(update_fields=["status", "paid_at", "updated_at"])
+                set_appointment_status_after_invoice_paid(inv)
+            else:
+                inv.save(update_fields=["updated_at"])
+
+            self._result_invoice = inv
+            self._remaining_due = due_after
+            return payment
+
+    @property
+    def remaining_due(self) -> Decimal:
+        return getattr(self, "_remaining_due", Decimal("0"))
+
+    @property
+    def result_invoice(self) -> Invoice:
+        return getattr(self, "_result_invoice")
 
 
 class DoctorRenderedLineSerializer(serializers.Serializer):

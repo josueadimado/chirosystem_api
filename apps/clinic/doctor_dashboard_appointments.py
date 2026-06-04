@@ -44,6 +44,7 @@ def appointments_for_doctor_dashboard(provider, request) -> list[Appointment]:
 
 
 def serialize_doctor_dashboard_appointments(appt_list: list[Appointment]) -> list[dict]:
+    from .invoice_collection import open_invoice_for_appointment_payment
     from .patient_payment_pending import patient_balance_due_by_id
     from .square_payment import try_reconcile_invoice_from_square
 
@@ -109,14 +110,12 @@ def serialize_doctor_dashboard_appointments(appt_list: list[Appointment]) -> lis
             "patient_payment_profile": (a.patient.payment_profile or "").strip(),
             "patient_balance_due": balance_by_patient.get(a.patient_id, "0.00"),
         }
-        inv = invoice_by_aid.get(a.id)
-        if (
-            a.status == Appointment.Status.AWAITING_PAYMENT
-            and inv
-            and inv.status in (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT)
-        ):
-            row["invoice_id"] = inv.id
-            row["invoice_number"] = inv.invoice_number
-            row["invoice_total"] = str(inv.total_amount)
+        collectible = open_invoice_for_appointment_payment(a)
+        if collectible:
+            from .invoice_collection import invoice_payment_summary
+
+            row["invoice_id"] = collectible.id
+            row["invoice_number"] = collectible.invoice_number
+            row.update(invoice_payment_summary(collectible))
         data.append(row)
     return data

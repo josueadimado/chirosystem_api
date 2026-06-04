@@ -367,20 +367,9 @@ def _doctor_collect_payment_followup(invoice: Invoice, *, try_saved_card: bool) 
 
 
 def _set_appointment_status_after_invoice_paid(inv: Invoice) -> None:
-    appt = inv.appointment
-    if inv.kind == Invoice.Kind.NO_SHOW_FEE:
-        target_status = Appointment.Status.NO_SHOW
-    elif inv.kind == Invoice.Kind.LATE_CANCEL_FEE:
-        target_status = Appointment.Status.CANCELLED
-    else:
-        target_status = Appointment.Status.COMPLETED
-    if appt.status != target_status:
-        appt.status = target_status
-        if target_status == Appointment.Status.CANCELLED:
-            appt.completed_at = None
-        elif not appt.completed_at:
-            appt.completed_at = timezone.now()
-        appt.save(update_fields=["status", "completed_at", "updated_at"])
+    from apps.clinic.invoice_collection import set_appointment_status_after_invoice_paid
+
+    set_appointment_status_after_invoice_paid(inv)
 
 
 def _invoice_bill_access_ok_for_preview(inv: Invoice) -> bool:
@@ -2994,7 +2983,19 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         serializer = PaymentCompleteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         payment = serializer.save(invoice=invoice)
-        return Response(PaymentSerializer(payment).data, status=status.HTTP_201_CREATED)
+        inv = serializer.result_invoice
+        from apps.clinic.invoice_collection import invoice_payment_summary
+
+        return Response(
+            {
+                **PaymentSerializer(payment).data,
+                "invoice_id": inv.id,
+                "invoice_status": inv.status,
+                "fully_paid": inv.status == Invoice.Status.PAID,
+                **invoice_payment_summary(inv),
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
     @action(detail=True, methods=["post"], url_path="apply_credit")
     def apply_credit(self, request, pk=None):
@@ -3326,6 +3327,60 @@ class AdminViewSet(viewsets.ViewSet):
         from .square_helpers import get_square_payment_status_for_admin
 
         return Response(get_square_payment_status_for_admin())
+
+    @action(detail=False, methods=["post"], url_path="terminal_checkout")
+    def terminal_checkout(self, request):
+        """Owner/staff: send an open invoice total to the Square Terminal (visit or no-show / late-cancel fee)."""
+        denied = self._admin_staff_only(request)
+        if denied:
+            return denied
+        if not square_configured():
+            return Response({"detail": "Square is not configured."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        ser = TerminalCheckoutSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        inv = Invoice.objects.filter(pk=ser.validated_data["invoice_id"]).select_related("appointment").first()
+        if not inv:
+            return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
+        if inv.status not in (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT):
+            return Response(
+                {"detail": "Invoice is not awaiting payment."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        include_pending = bool(ser.validated_data.get("include_pending_fees"))
+        try:
+            out = create_terminal_checkout_for_invoice(inv, include_pending_fees=include_pending)
+        except Exception as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response(out)
+
+    @action(detail=False, methods=["get"], url_path="visit_open_invoice")
+    def visit_open_invoice(self, request):
+        """Owner/staff: invoice id + total for an appointment with an unpaid visit or penalty bill."""
+        denied = self._admin_staff_only(request)
+        if denied:
+            return denied
+        aid, err = self._admin_parse_appointment_id(request, source="query")
+        if err:
+            return err
+        appointment = Appointment.objects.filter(pk=aid).first()
+        if not appointment:
+            return Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
+        from .invoice_collection import open_invoice_for_appointment_payment
+
+        inv = open_invoice_for_appointment_payment(appointment)
+        if not inv:
+            return Response({"detail": "No unpaid invoice for this appointment."}, status=status.HTTP_404_NOT_FOUND)
+        from .invoice_collection import invoice_payment_summary
+
+        return Response(
+            {
+                "invoice_id": inv.id,
+                "invoice_number": inv.invoice_number,
+                "total_amount": str(inv.total_amount),
+                "kind": inv.kind,
+                **invoice_payment_summary(inv),
+            }
+        )
 
     @action(detail=False, methods=["post"], url_path="terminal_checkout_test")
     def terminal_checkout_test(self, request):
@@ -3689,6 +3744,8 @@ class AdminViewSet(viewsets.ViewSet):
                 })
         inv_payload = None
         if inv:
+            from .invoice_collection import invoice_payment_summary
+
             inv_payload = {
                 "id": inv.id,
                 "invoice_number": inv.invoice_number,
@@ -3698,6 +3755,7 @@ class AdminViewSet(viewsets.ViewSet):
                 "professional_discount_reason": inv.professional_discount_reason or "",
                 "total_amount": str(inv.total_amount),
                 "status": inv.status,
+                **invoice_payment_summary(inv),
             }
         return Response({
             "appointment_id": appt.id,
@@ -4756,14 +4814,20 @@ class DoctorViewSet(viewsets.ViewSet):
         appt = Appointment.objects.filter(pk=appointment_id, provider=provider).first()
         if not appt:
             return Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
-        if appt.status != Appointment.Status.AWAITING_PAYMENT:
+        from .invoice_collection import open_invoice_for_appointment_payment
+
+        inv = open_invoice_for_appointment_payment(appt)
+        if not inv:
             return Response(
-                {"detail": "Only visits waiting on payment can use this action."},
+                {
+                    "detail": (
+                        "No unpaid invoice on file for this visit. "
+                        "If this was a no-show, confirm a fee was applied in Admin → Settings."
+                    ),
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        inv = Invoice.objects.filter(appointment=appt).select_related("patient").first()
-        if not inv:
-            return Response({"detail": "No invoice for this visit."}, status=status.HTTP_404_NOT_FOUND)
+        inv = Invoice.objects.filter(pk=inv.pk).select_related("patient").first()
 
         if inv.status != Invoice.Status.PAID:
             try_reconcile_invoice_from_square(inv)

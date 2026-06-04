@@ -1297,6 +1297,7 @@ def get_frontend_base_url() -> str:
 
 
 def build_invoice_payment_followup_dict(invoice: Invoice, *, try_saved_card: bool) -> dict:
+    from .invoice_collection import invoice_payment_summary
     from .square_helpers import square_configured
 
     invoice.refresh_from_db()
@@ -1373,4 +1374,5 @@ def build_invoice_payment_followup_dict(invoice: Invoice, *, try_saved_card: boo
         "patient_credit_balance": str(invoice.patient.credit_balance),
         "already_paid": False,
         "payment": payment,
+        **invoice_payment_summary(invoice),
     }
