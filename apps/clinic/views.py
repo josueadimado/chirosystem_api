@@ -1975,7 +1975,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         qs = super().get_queryset()
         if self.action != "list":
             return qs
-        qs = qs.select_related("invoice")
+        qs = qs.select_related("invoice").prefetch_related("invoice__payments")
         params = self.request.query_params
         if params.get("date_from"):
             try:

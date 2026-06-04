@@ -467,6 +467,10 @@ class AppointmentListSerializer(serializers.ModelSerializer):
     auto_no_show_processed_at = serializers.DateTimeField(read_only=True)
     auto_no_show_exempt = serializers.BooleanField(required=False)
     auto_no_show_countdown = serializers.SerializerMethodField()
+    invoice_id = serializers.SerializerMethodField()
+    invoice_total = serializers.SerializerMethodField()
+    amount_paid = serializers.SerializerMethodField()
+    amount_due = serializers.SerializerMethodField()
 
     class Meta:
         model = Appointment
@@ -489,6 +493,10 @@ class AppointmentListSerializer(serializers.ModelSerializer):
             "status",
             "display_status",
             "invoice_kind",
+            "invoice_id",
+            "invoice_total",
+            "amount_paid",
+            "amount_due",
             "auto_no_show_processed_at",
             "auto_no_show_exempt",
             "auto_no_show_countdown",
@@ -538,6 +546,35 @@ class AppointmentListSerializer(serializers.ModelSerializer):
         from apps.clinic.auto_no_show import auto_no_show_countdown_for_appointment
 
         return auto_no_show_countdown_for_appointment(obj)
+
+    def _collectible_invoice(self, obj):
+        from apps.clinic.invoice_collection import open_invoice_for_appointment_payment
+
+        return open_invoice_for_appointment_payment(obj)
+
+    def get_invoice_id(self, obj):
+        inv = self._collectible_invoice(obj)
+        return inv.id if inv else None
+
+    def get_invoice_total(self, obj):
+        inv = self._collectible_invoice(obj)
+        return str(inv.total_amount) if inv else None
+
+    def get_amount_paid(self, obj):
+        from apps.clinic.invoice_collection import invoice_payment_summary
+
+        inv = self._collectible_invoice(obj)
+        if not inv:
+            return None
+        return invoice_payment_summary(inv).get("amount_paid")
+
+    def get_amount_due(self, obj):
+        from apps.clinic.invoice_collection import invoice_payment_summary
+
+        inv = self._collectible_invoice(obj)
+        if not inv:
+            return None
+        return invoice_payment_summary(inv).get("amount_due")
 
 
 class PublicBookingSerializer(serializers.Serializer):
