@@ -638,6 +638,15 @@ def _complete_visit_payload_from_validated(data: dict, rendered_payload: list) -
     return payload
 
 
+def _truthy_request_flag(value) -> bool:
+    """Parse JSON booleans or string flags like ``"true"`` / ``"1"`` from request bodies."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes")
+
+
 def _parse_invoice_id_from_body(request) -> tuple[int | None, Response | None]:
     raw = request.data.get("invoice_id")
     if raw is None:
@@ -3075,11 +3084,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         if lapse_msg:
             return Response({"detail": lapse_msg}, status=status.HTTP_400_BAD_REQUEST)
 
-        allow_double_book = (request.data.get("allow_double_book") or "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        )
+        allow_double_book = _truthy_request_flag(request.data.get("allow_double_book"))
         if allow_double_book and getattr(request.user, "role", None) not in ("owner_admin", "staff"):
             return Response(
                 {"detail": "Only admin or desk staff may double-book a time slot."},
