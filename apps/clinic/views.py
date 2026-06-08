@@ -84,6 +84,7 @@ from .serializers import (
     VoiceCallLogSerializer,
     complete_visit_with_services,
     revise_unpaid_visit_billing,
+    revise_visit_billing_admin,
 )
 from .analytics import build_admin_analytics_payload, parse_analytics_months
 from .doctor_analytics import build_doctor_my_analytics_payload, parse_analytics_weeks
@@ -479,6 +480,75 @@ def _visit_billing_diagnosis_payload(visit: Visit) -> dict:
     }
 
 
+def _visit_billing_for_edit_payload(appointment: Appointment, *, provider_id: int | None = None):
+    """Load visit + invoice for billing editor; optional provider_id scopes to that doctor's appointments."""
+    from .invoice_collection import invoice_payment_summary
+
+    if provider_id is not None and appointment.provider_id != provider_id:
+        return None, Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
+    if appointment.status not in (
+        Appointment.Status.AWAITING_PAYMENT,
+        Appointment.Status.COMPLETED,
+    ):
+        return None, Response(
+            {"detail": "Billing can only be edited for completed visits or visits awaiting payment."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    visit = (
+        Visit.objects.filter(appointment=appointment)
+        .prefetch_related(
+            Prefetch(
+                "rendered_services",
+                queryset=VisitRenderedService.objects.select_related("service").order_by("id"),
+            ),
+            "visit_diagnoses",
+        )
+        .first()
+    )
+    if not visit:
+        return None, Response({"detail": "Visit not found."}, status=status.HTTP_404_NOT_FOUND)
+    invoice = Invoice.objects.filter(appointment=appointment, visit=visit).first()
+    if not invoice:
+        return None, Response({"detail": "No invoice for this visit."}, status=status.HTTP_404_NOT_FOUND)
+    if invoice.kind != Invoice.Kind.VISIT:
+        return None, Response(
+            {"detail": "Only normal visit invoices can be revised here."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if invoice.status == Invoice.Status.VOID:
+        return None, Response({"detail": "This invoice is void."}, status=status.HTTP_400_BAD_REQUEST)
+    if invoice.status not in (
+        Invoice.Status.ISSUED,
+        Invoice.Status.OVERDUE,
+        Invoice.Status.DRAFT,
+        Invoice.Status.PAID,
+    ):
+        return None, Response(
+            {"detail": "Cannot edit billing for this invoice in its current state."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    rendered = [
+        {
+            "service_id": rs.service_id,
+            "quantity": rs.quantity,
+            "unit_price": str(rs.unit_price),
+        }
+        for rs in visit.rendered_services.all()
+    ]
+    return {
+        "doctor_notes": visit.doctor_notes or "",
+        **_visit_billing_diagnosis_payload(visit),
+        "rendered_services": rendered,
+        "invoice_id": invoice.id,
+        "invoice_number": invoice.invoice_number,
+        "invoice_status": invoice.status,
+        "discount": str(invoice.discount),
+        "professional_discount_reason": invoice.professional_discount_reason or "",
+        "total_amount": str(invoice.total_amount),
+        **invoice_payment_summary(invoice),
+    }, None
+
+
 def _complete_visit_payload_from_validated(data: dict, rendered_payload: list) -> dict:
     payload = {
         "doctor_notes": data.get("doctor_notes", ""),
@@ -741,6 +811,27 @@ def _serialize_patient_appointment_history(request, appointments, *, force_read_
             }
             if v:
                 inv_payload.update(_visit_invoice_bill_totals(v, inv))
+            else:
+                cached_payments = getattr(inv, "_successful_payments", None)
+                if cached_payments is not None:
+                    pay_sum = sum((p.amount for p in cached_payments), Decimal("0"))
+                else:
+                    pay_sum = inv.payments.filter(status=Payment.Status.SUCCESSFUL).aggregate(s=Sum("amount"))["s"]
+                    pay_sum = pay_sum if pay_sum is not None else Decimal("0")
+                payments_received = (pay_sum + inv.credit_applied_total).quantize(Decimal("0.01"))
+                patient_charge = inv.total_amount.quantize(Decimal("0.01"))
+                remaining_client = (patient_charge - payments_received).quantize(Decimal("0.01"))
+                if remaining_client < Decimal("0"):
+                    remaining_client = Decimal("0.00")
+                inv_payload.update(
+                    {
+                        "bill_charges_total": str(inv.subtotal),
+                        "patient_charge_total": str(patient_charge),
+                        "insurance_remaining_total": "0.00",
+                        "payments_received_total": str(payments_received),
+                        "remaining_client_responsibility_total": str(remaining_client),
+                    }
+                )
         out.append(
             {
                 "id": a.id,
@@ -748,6 +839,7 @@ def _serialize_patient_appointment_history(request, appointments, *, force_read_
                 "start_time": a.start_time.strftime("%I:%M %p"),
                 "end_time": a.end_time.strftime("%I:%M %p"),
                 "service": a.booked_service.name if a.booked_service else None,
+                "booked_service_id": a.booked_service_id,
                 "provider": str(a.provider) if a.provider else None,
                 "provider_id": a.provider_id,
                 "status": a.status,
@@ -1001,6 +1093,20 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         )
 
         desk_mode = (request.query_params.get("desk") or "").strip().lower() in ("1", "true", "yes")
+        double_book_mode = (request.query_params.get("double_book") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if double_book_mode:
+            if not request.user.is_authenticated or getattr(request.user, "role", None) not in (
+                "owner_admin",
+                "staff",
+            ):
+                return Response(
+                    {"detail": "Double-book availability requires admin or desk staff sign-in."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
         if desk_mode:
             if not request.user.is_authenticated or getattr(request.user, "role", None) not in (
                 "owner_admin",
@@ -1186,7 +1292,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             free = not any(cursor <= t < cursor + required_span for t in taken)
             not_blocked = (
                 fits_close
-                and free
+                and (free or double_book_mode)
                 and not provider_interval_blocked_online(
                     provider.pk,
                     appt_date,
@@ -2800,7 +2906,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["post"], url_path="book-from-desk")
     def book_from_desk(self, request):
-        """Owner/staff/doctor: book an existing patient into a slot (same rules as public online booking)."""
+        """Owner/staff/doctor: book an existing patient into a slot (desk hours; admin/staff may double-book)."""
         import logging
 
         from .chiropractic_booking_policy import chiropractic_booking_must_use_intake
@@ -2857,12 +2963,24 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         if lapse_msg:
             return Response({"detail": lapse_msg}, status=status.HTTP_400_BAD_REQUEST)
 
+        allow_double_book = (request.data.get("allow_double_book") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if allow_double_book and getattr(request.user, "role", None) not in ("owner_admin", "staff"):
+            return Response(
+                {"detail": "Only admin or desk staff may double-book a time slot."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         err, is_conflict = validate_slot_for_desk_booking_rules(
             provider=provider,
             service=service,
             appt_date=appt_date,
             start_time=start_t,
             exclude_appointment_id=None,
+            allow_double_book=allow_double_book,
         )
         if err:
             code = status.HTTP_409_CONFLICT if is_conflict else status.HTTP_400_BAD_REQUEST
@@ -2877,6 +2995,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                 appt_date=appt_date,
                 start_time=start_t,
                 exclude_appointment_id=None,
+                allow_double_book=allow_double_book,
             )
             if err2:
                 code = status.HTTP_409_CONFLICT if is_conflict2 else status.HTTP_400_BAD_REQUEST
@@ -3749,6 +3868,7 @@ class AdminViewSet(viewsets.ViewSet):
             inv_payload = {
                 "id": inv.id,
                 "invoice_number": inv.invoice_number,
+                "kind": inv.kind,
                 "subtotal": str(inv.subtotal),
                 "discount": str(inv.discount),
                 "credit_applied_total": str(inv.credit_applied_total),
@@ -3777,68 +3897,30 @@ class AdminViewSet(viewsets.ViewSet):
             "invoice": inv_payload,
         })
 
+    def _admin_visit_billing_for_edit_context(self, appointment_id: int):
+        """Load visit + invoice for admin billing editor; return (payload dict) or (None, Response)."""
+        appointment = Appointment.objects.filter(pk=appointment_id).first()
+        if not appointment:
+            return None, Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
+        return _visit_billing_for_edit_payload(appointment)
+
     @action(detail=False, methods=["get"], url_path="visit_billing_for_edit")
     def visit_billing_for_edit(self, request):
-        """Owner/staff: same payload as doctor billing_for_edit for awaiting-payment visits."""
+        """Owner/staff: load visit lines for billing editor (awaiting payment or completed visits)."""
         denied = self._admin_staff_only(request)
         if denied:
             return denied
         aid, err = self._admin_parse_appointment_id(request, source="query")
         if err:
             return err
-        appointment = Appointment.objects.filter(pk=aid).first()
-        if not appointment:
-            return Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
-        if appointment.status != Appointment.Status.AWAITING_PAYMENT:
-            return Response(
-                {"detail": "You can only edit billing when the visit is awaiting payment."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        visit = (
-            Visit.objects.filter(appointment=appointment)
-            .prefetch_related(
-                Prefetch(
-                    "rendered_services",
-                    queryset=VisitRenderedService.objects.select_related("service").order_by("id"),
-                ),
-                "visit_diagnoses",
-            )
-            .first()
-        )
-        if not visit:
-            return Response({"detail": "Visit not found."}, status=status.HTTP_404_NOT_FOUND)
-        invoice = Invoice.objects.filter(appointment=appointment, visit=visit).first()
-        if not invoice:
-            return Response({"detail": "No invoice for this visit."}, status=status.HTTP_404_NOT_FOUND)
-        if invoice.status == Invoice.Status.PAID:
-            return Response({"detail": "This invoice is already paid."}, status=status.HTTP_400_BAD_REQUEST)
-        if invoice.status not in (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT):
-            return Response(
-                {"detail": "Cannot edit billing for this invoice in its current state."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        rendered = [
-            {
-                "service_id": rs.service_id,
-                "quantity": rs.quantity,
-                "unit_price": str(rs.unit_price),
-            }
-            for rs in visit.rendered_services.all()
-        ]
-        return Response({
-            "doctor_notes": visit.doctor_notes or "",
-            **_visit_billing_diagnosis_payload(visit),
-            "rendered_services": rendered,
-            "invoice_id": invoice.id,
-            "invoice_number": invoice.invoice_number,
-            "discount": str(invoice.discount),
-            "professional_discount_reason": invoice.professional_discount_reason or "",
-            "total_amount": str(invoice.total_amount),
-        })
+        payload, resp = self._admin_visit_billing_for_edit_context(aid)
+        if resp:
+            return resp
+        return Response(payload)
 
     @action(detail=False, methods=["post"], url_path="revise_visit_billing")
     def admin_revise_visit_billing(self, request):
-        """Owner/staff: update visit lines and unpaid invoice (awaiting payment)."""
+        """Owner/staff: update visit lines and invoice (awaiting payment or after visit completed)."""
         denied = self._admin_staff_only(request)
         if denied:
             return denied
@@ -3853,11 +3935,6 @@ class AdminViewSet(viewsets.ViewSet):
         visit = Visit.objects.filter(appointment_id=aid).select_related("appointment", "provider").first()
         if not visit:
             return Response({"detail": "Visit not found."}, status=status.HTTP_404_NOT_FOUND)
-        if visit.appointment.status != Appointment.Status.AWAITING_PAYMENT:
-            return Response(
-                {"detail": "You can only revise billing while awaiting payment."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
         ser = DoctorCompleteVisitSerializer(data=body)
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
@@ -3885,7 +3962,7 @@ class AdminViewSet(viewsets.ViewSet):
             )
         payload = _complete_visit_payload_from_validated(data, rendered_payload)
         try:
-            invoice = revise_unpaid_visit_billing(visit, payload)
+            invoice = revise_visit_billing_admin(visit, payload)
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -4686,76 +4763,27 @@ class DoctorViewSet(viewsets.ViewSet):
 
     @action(detail=True, methods=["get"], url_path="billing_for_edit")
     def billing_for_edit(self, request, pk=None):
-        """Load current chart + line items for a visit awaiting payment so the doctor can revise billing."""
+        """Load current chart + line items so the doctor can revise billing (awaiting payment or completed)."""
         provider = self._get_provider(request)
         if not provider:
             return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
         appointment = Appointment.objects.filter(pk=pk, provider=provider).first()
         if not appointment:
             return Response({"detail": "Appointment not found."}, status=status.HTTP_404_NOT_FOUND)
-        if appointment.status != Appointment.Status.AWAITING_PAYMENT:
-            return Response(
-                {"detail": "You can only edit billing when the visit is awaiting payment."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        visit = (
-            Visit.objects.filter(appointment=appointment, provider=provider)
-            .prefetch_related(
-                Prefetch(
-                    "rendered_services",
-                    queryset=VisitRenderedService.objects.select_related("service").order_by("id"),
-                ),
-                "visit_diagnoses",
-            )
-            .first()
-        )
-        if not visit:
-            return Response({"detail": "Visit not found."}, status=status.HTTP_404_NOT_FOUND)
-        invoice = Invoice.objects.filter(appointment=appointment, visit=visit).first()
-        if not invoice:
-            return Response({"detail": "No invoice for this visit."}, status=status.HTTP_404_NOT_FOUND)
-        if invoice.status == Invoice.Status.PAID:
-            return Response({"detail": "This invoice is already paid."}, status=status.HTTP_400_BAD_REQUEST)
-        if invoice.status not in (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT):
-            return Response(
-                {"detail": "Cannot edit billing for this invoice in its current state."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        rendered = [
-            {
-                "service_id": rs.service_id,
-                "quantity": rs.quantity,
-                "unit_price": str(rs.unit_price),
-            }
-            for rs in visit.rendered_services.all()
-        ]
-        return Response(
-            {
-                "doctor_notes": visit.doctor_notes or "",
-                **_visit_billing_diagnosis_payload(visit),
-                "rendered_services": rendered,
-                "invoice_id": invoice.id,
-                "invoice_number": invoice.invoice_number,
-                "discount": str(invoice.discount),
-                "professional_discount_reason": invoice.professional_discount_reason or "",
-                "total_amount": str(invoice.total_amount),
-            }
-        )
+        payload, resp = _visit_billing_for_edit_payload(appointment, provider_id=provider.id)
+        if resp:
+            return resp
+        return Response(payload)
 
     @action(detail=True, methods=["post"], url_path="revise_visit_billing")
     def revise_visit_billing(self, request, pk=None):
-        """Update visit lines and unpaid invoice while appointment is awaiting payment."""
+        """Update visit lines and invoice while awaiting payment or after visit completed."""
         provider = self._get_provider(request)
         if not provider:
             return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
         visit = Visit.objects.filter(appointment_id=pk, provider=provider).select_related("appointment").first()
         if not visit:
             return Response({"detail": "Visit not found."}, status=status.HTTP_404_NOT_FOUND)
-        if visit.appointment.status != Appointment.Status.AWAITING_PAYMENT:
-            return Response(
-                {"detail": "You can only revise billing while awaiting payment."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
         ser = DoctorCompleteVisitSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
@@ -4782,7 +4810,7 @@ class DoctorViewSet(viewsets.ViewSet):
             )
         payload = _complete_visit_payload_from_validated(data, rendered_payload)
         try:
-            invoice = revise_unpaid_visit_billing(visit, payload)
+            invoice = revise_visit_billing_admin(visit, payload)
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 

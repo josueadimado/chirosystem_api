@@ -141,6 +141,7 @@ def validate_slot_for_desk_booking_rules(
     appt_date,
     start_time,
     exclude_appointment_id: int | None,
+    allow_double_book: bool = False,
 ) -> tuple[str | None, bool]:
     """
     Front desk / provider dashboard: same conflict and block rules as public booking,
@@ -174,23 +175,24 @@ def validate_slot_for_desk_booking_rules(
     ):
         return "That time is not open for booking with this provider. Please pick another slot.", False
 
-    overlapping = Appointment.objects.filter(
-        provider=provider,
-        appointment_date=appt_date,
-        start_time__lt=en_t,
-        end_time__gt=st_t,
-    ).exclude(
-        status__in=[
-            Appointment.Status.CANCELLED,
-            Appointment.Status.NO_SHOW,
-            Appointment.Status.COMPLETED,
-        ]
-    )
-    if exclude_appointment_id:
-        overlapping = overlapping.exclude(pk=exclude_appointment_id)
+    if not allow_double_book:
+        overlapping = Appointment.objects.filter(
+            provider=provider,
+            appointment_date=appt_date,
+            start_time__lt=en_t,
+            end_time__gt=st_t,
+        ).exclude(
+            status__in=[
+                Appointment.Status.CANCELLED,
+                Appointment.Status.NO_SHOW,
+                Appointment.Status.COMPLETED,
+            ]
+        )
+        if exclude_appointment_id:
+            overlapping = overlapping.exclude(pk=exclude_appointment_id)
 
-    if overlapping.exists():
-        return "That time slot is no longer available. Please choose another time.", True
+        if overlapping.exists():
+            return "That time slot is no longer available. Please choose another time.", True
 
     return None, False
 

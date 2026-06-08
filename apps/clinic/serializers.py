@@ -1134,30 +1134,19 @@ def complete_visit_with_services(visit: Visit, payload: dict) -> Invoice:
     return invoice
 
 
-def revise_unpaid_visit_billing(visit: Visit, payload: dict) -> Invoice:
-    """Update visit chart lines and invoice totals while appointment is awaiting payment (invoice not paid)."""
-    appt = visit.appointment
-    if appt.status != Appointment.Status.AWAITING_PAYMENT:
-        raise ValueError("You can only edit billing while the visit is awaiting payment.")
-    if visit.status != Visit.Status.COMPLETED:
-        # Rare inconsistent rows: invoice exists but visit never flipped to completed — repair and continue.
-        if visit.status in (Visit.Status.IN_PROGRESS, Visit.Status.OPEN):
-            visit.status = Visit.Status.COMPLETED
-            visit.completed_at = visit.completed_at or timezone.now()
-            visit.save(update_fields=["status", "completed_at", "updated_at"])
-        else:
-            raise ValueError("Visit must be completed before revising billing.")
+def _ensure_visit_completed_for_billing_revision(visit: Visit) -> None:
+    if visit.status == Visit.Status.COMPLETED:
+        return
+    if visit.status in (Visit.Status.IN_PROGRESS, Visit.Status.OPEN):
+        visit.status = Visit.Status.COMPLETED
+        visit.completed_at = visit.completed_at or timezone.now()
+        visit.save(update_fields=["status", "completed_at", "updated_at"])
+        return
+    raise ValueError("Visit must be completed before revising billing.")
 
-    try:
-        invoice = Invoice.objects.get(visit=visit)
-    except Invoice.DoesNotExist as exc:
-        raise ValueError("No invoice found for this visit.") from exc
 
-    if invoice.status == Invoice.Status.PAID:
-        raise ValueError("This invoice is already paid — billing cannot be changed here.")
-    if invoice.status not in (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT):
-        raise ValueError("This invoice cannot be revised in its current state.")
-
+def _apply_visit_billing_revision(visit: Visit, invoice: Invoice, payload: dict) -> Invoice:
+    """Persist chart notes, diagnoses, rendered lines, and invoice totals."""
     with transaction.atomic():
         visit.doctor_notes = payload.get("doctor_notes", "")
         update_fields = ["doctor_notes", "updated_at"]
@@ -1211,4 +1200,80 @@ def revise_unpaid_visit_billing(visit: Visit, payload: dict) -> Invoice:
             ]
         )
 
+    return invoice
+
+
+def _reconcile_invoice_status_after_admin_revision(invoice: Invoice) -> None:
+    """After admin changes totals, reopen invoice / appointment when money is still owed."""
+    from apps.clinic.invoice_collection import invoice_amount_due, set_appointment_status_after_invoice_paid
+
+    due = invoice_amount_due(invoice)
+    appt = invoice.appointment
+    if due <= Decimal("0"):
+        if invoice.status != Invoice.Status.PAID:
+            invoice.status = Invoice.Status.PAID
+            invoice.paid_at = invoice.paid_at or timezone.now()
+            invoice.save(update_fields=["status", "paid_at", "updated_at"])
+        set_appointment_status_after_invoice_paid(invoice)
+        return
+
+    changed: list[str] = []
+    if invoice.status == Invoice.Status.PAID:
+        invoice.status = Invoice.Status.ISSUED
+        changed.extend(["status"])
+    if changed:
+        changed.append("updated_at")
+        invoice.save(update_fields=changed)
+    if appt.status == Appointment.Status.COMPLETED:
+        appt.status = Appointment.Status.AWAITING_PAYMENT
+        appt.save(update_fields=["status", "updated_at"])
+
+
+def revise_unpaid_visit_billing(visit: Visit, payload: dict) -> Invoice:
+    """Update visit chart lines and invoice totals while appointment is awaiting payment (invoice not paid)."""
+    appt = visit.appointment
+    if appt.status != Appointment.Status.AWAITING_PAYMENT:
+        raise ValueError("You can only edit billing while the visit is awaiting payment.")
+    _ensure_visit_completed_for_billing_revision(visit)
+
+    try:
+        invoice = Invoice.objects.get(visit=visit)
+    except Invoice.DoesNotExist as exc:
+        raise ValueError("No invoice found for this visit.") from exc
+
+    if invoice.status == Invoice.Status.PAID:
+        raise ValueError("This invoice is already paid — billing cannot be changed here.")
+    if invoice.status not in (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT):
+        raise ValueError("This invoice cannot be revised in its current state.")
+
+    return _apply_visit_billing_revision(visit, invoice, payload)
+
+
+def revise_visit_billing_admin(visit: Visit, payload: dict) -> Invoice:
+    """Owner/staff: revise visit invoice after completion (including correcting paid invoices)."""
+    appt = visit.appointment
+    if appt.status not in (Appointment.Status.AWAITING_PAYMENT, Appointment.Status.COMPLETED):
+        raise ValueError("Billing can only be edited for completed visits or visits awaiting payment.")
+    _ensure_visit_completed_for_billing_revision(visit)
+
+    try:
+        invoice = Invoice.objects.get(visit=visit)
+    except Invoice.DoesNotExist as exc:
+        raise ValueError("No invoice found for this visit.") from exc
+
+    if invoice.kind != Invoice.Kind.VISIT:
+        raise ValueError("Only normal visit invoices can be revised here.")
+    if invoice.status == Invoice.Status.VOID:
+        raise ValueError("This invoice is void and cannot be changed.")
+    if invoice.status not in (
+        Invoice.Status.ISSUED,
+        Invoice.Status.OVERDUE,
+        Invoice.Status.DRAFT,
+        Invoice.Status.PAID,
+    ):
+        raise ValueError("This invoice cannot be revised in its current state.")
+
+    invoice = _apply_visit_billing_revision(visit, invoice, payload)
+    _reconcile_invoice_status_after_admin_revision(invoice)
+    invoice.refresh_from_db()
     return invoice
