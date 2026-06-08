@@ -3365,14 +3365,18 @@ class AdminViewSet(viewsets.ViewSet):
         unpaid_invoices = Invoice.objects.filter(status=Invoice.Status.ISSUED).count()
 
         today_schedule = []
-        for a in all_today.exclude(status=Appointment.Status.CANCELLED)[:25]:
+        for a in all_today:
             ui_status = appointment_ui_status(a)
+            svc = a.booked_service
             today_schedule.append({
                 "id": a.id,
                 "patient_name": f"{a.patient.first_name} {a.patient.last_name}",
                 "patient_payment_profile": (a.patient.payment_profile or "").strip(),
                 "provider_name": str(a.provider),
-                "start_time": a.start_time.strftime("%I:%M %p"),
+                "service_name": svc.name if svc else "",
+                "start_time": a.start_time.strftime("%I:%M %p").lstrip("0"),
+                "end_time": a.end_time.strftime("%I:%M %p").lstrip("0"),
+                "start_minutes": a.start_time.hour * 60 + a.start_time.minute,
                 "status": ui_status,
                 "auto_no_show": bool(a.auto_no_show_processed_at),
             })
