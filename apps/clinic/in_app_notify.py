@@ -38,13 +38,16 @@ def create_new_booking_in_app_notification(appointment_id: int) -> None:
     )
     if not appt:
         return
+    recipient_id = getattr(appt.provider, "user_id", None)
+    if not recipient_id:
+        return
     patient = f"{appt.patient.first_name} {appt.patient.last_name}".strip() or "A patient"
     service_name = appt.booked_service.name if appt.booked_service else "appointment"
     date_disp = appt.appointment_date.strftime("%a %b %d, %Y")
     time_disp = format_time_12h(appt.start_time)
     msg = f"New booking: {patient}, {service_name}, {date_disp} at {time_disp}."
     StaffNotification.objects.create(
-        recipient_id=appt.provider.user_id,
+        recipient_id=recipient_id,
         kind=StaffNotification.Kind.NEW_BOOKING,
         message=msg,
         appointment=appt,
