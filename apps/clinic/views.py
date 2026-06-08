@@ -549,6 +549,81 @@ def _visit_billing_for_edit_payload(appointment: Appointment, *, provider_id: in
     }, None
 
 
+def _prepare_admin_uncancel_cancelled_appointment(appointment: Appointment) -> None:
+    """Validate and prepare a cancelled appointment to be restored to booked (staff only)."""
+    from apps.clinic.clinic_time import slot_start_is_in_past
+    from apps.clinic.invoice_collection import invoice_payment_summary
+
+    if slot_start_is_in_past(appointment.appointment_date, appointment.start_time):
+        raise ValidationError(
+            {
+                "detail": (
+                    "This appointment time has already passed. Book a new visit instead of restoring this one."
+                )
+            }
+        )
+
+    overlapping = (
+        Appointment.objects.filter(
+            provider_id=appointment.provider_id,
+            appointment_date=appointment.appointment_date,
+            start_time__lt=appointment.end_time,
+            end_time__gt=appointment.start_time,
+        )
+        .exclude(pk=appointment.pk)
+        .exclude(
+            status__in=[
+                Appointment.Status.CANCELLED,
+                Appointment.Status.NO_SHOW,
+                Appointment.Status.COMPLETED,
+            ]
+        )
+        .exists()
+    )
+    if overlapping:
+        raise ValidationError(
+            {
+                "detail": (
+                    "That time slot is already booked for this provider. "
+                    "Free the slot or reschedule before restoring this visit."
+                )
+            }
+        )
+
+    inv = (
+        Invoice.objects.filter(
+            appointment=appointment,
+            kind=Invoice.Kind.LATE_CANCEL_FEE,
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    if not inv:
+        return
+    if inv.status == Invoice.Status.PAID:
+        raise ValidationError(
+            {
+                "detail": (
+                    "A late cancellation fee was already paid for this visit. "
+                    "Book a new appointment instead of restoring this one."
+                )
+            }
+        )
+    paid = Decimal(str(invoice_payment_summary(inv).get("amount_paid", "0") or "0"))
+    if paid > Decimal("0.01"):
+        raise ValidationError(
+            {
+                "detail": (
+                    "Payments were recorded on the late cancellation fee. "
+                    "Resolve billing before restoring this visit."
+                )
+            }
+        )
+    if inv.status != Invoice.Status.VOID:
+        inv.status = Invoice.Status.VOID
+        inv.save(update_fields=["status", "updated_at"])
+
+
 def _complete_visit_payload_from_validated(data: dict, rendered_payload: list) -> dict:
     payload = {
         "doctor_notes": data.get("doctor_notes", ""),
@@ -2180,6 +2255,21 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         role = getattr(user, "role", None)
         data = serializer.validated_data
         waive_late_cancel = bool(data.pop("waive_late_cancel_fee", False))
+        restoring_cancelled = (
+            inst.status == Appointment.Status.CANCELLED
+            and data.get("status") == Appointment.Status.BOOKED
+            and role in ("owner_admin", "staff")
+        )
+        if restoring_cancelled:
+            if set(data.keys()) - {"status"}:
+                raise ValidationError(
+                    {
+                        "detail": (
+                            "When restoring a cancelled appointment, only status may be changed in this request."
+                        )
+                    }
+                )
+            _prepare_admin_uncancel_cancelled_appointment(inst)
 
         def _appointment_locked_as_no_show(appt: Appointment) -> bool:
             if appt.status == Appointment.Status.NO_SHOW:
@@ -2191,7 +2281,9 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                     return False
             return False
 
-        if inst.status == Appointment.Status.CANCELLED or _appointment_locked_as_no_show(inst):
+        if (inst.status == Appointment.Status.CANCELLED and not restoring_cancelled) or _appointment_locked_as_no_show(
+            inst
+        ):
             allowed_terminal_fields = {"clinical_handoff_notes", "notes"}
             disallowed = set(data.keys()) - allowed_terminal_fields
             if disallowed:
@@ -2359,6 +2451,10 @@ class AppointmentViewSet(viewsets.ModelViewSet):
             ):
                 data["checked_in_at"] = None
                 data["consultation_started_at"] = None
+        if restoring_cancelled:
+            data["checked_in_at"] = None
+            data["consultation_started_at"] = None
+            data["completed_at"] = None
 
         old = {
             "appointment_date": inst.appointment_date,
@@ -2372,7 +2468,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         time_changed = ("start_time" in data and data["start_time"] != inst.start_time) or (
             "end_time" in data and data["end_time"] != inst.end_time
         )
-        if date_changed or time_changed:
+        if date_changed or time_changed or restoring_cancelled:
             serializer.save(
                 day_before_reminder_sms_at=None,
                 day_before_reminder_email_at=None,
@@ -2448,6 +2544,10 @@ class AppointmentViewSet(viewsets.ModelViewSet):
             old["status"] != Appointment.Status.CANCELLED
             and new.status == Appointment.Status.CANCELLED
         )
+        became_uncancelled = (
+            old["status"] == Appointment.Status.CANCELLED
+            and new.status == Appointment.Status.BOOKED
+        )
         schedule_changed = (date_changed or time_changed) and new.status in (
             Appointment.Status.BOOKED,
             Appointment.Status.CHECKED_IN,
@@ -2460,6 +2560,18 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                 queue_patient_cancel_confirmations(aid, staff_initiated=True)
 
             transaction.on_commit(queue_patient_cancel)
+        elif became_uncancelled:
+
+            def queue_patient_restore():
+                from apps.clinic.patient_appointment_notifications import queue_patient_booking_confirmations
+
+                queue_patient_booking_confirmations(
+                    aid,
+                    include_provider_notify=True,
+                    include_gcal=True,
+                )
+
+            transaction.on_commit(queue_patient_restore)
         elif schedule_changed:
 
             def queue_patient_reschedule():
