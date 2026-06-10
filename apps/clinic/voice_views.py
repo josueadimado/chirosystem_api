@@ -43,7 +43,8 @@ from .voice_logging import upsert_voice_call_log
 from .voice_office import (
     clinic_office_phone_display,
     voice_answer_delay_seconds,
-    voice_greeting_for_returning_patient,
+    voice_clinic_display_name,
+    voice_greeting_for_caller,
     voice_greeting_opening,
 )
 
@@ -205,30 +206,6 @@ def _voice_ring_delay_before_answer() -> None:
         time.sleep(seconds)
 
 
-def _voice_greeting_for_caller(from_number: str, clinic_name: str) -> str:
-    """
-    Returning patient (phone matches one chart): short hello + first name + thank you for calling.
-    New or unknown caller: full Sarah intro (scheduling + front desk option).
-    """
-    import random
-
-    from apps.clinic.patient_phone import patients_matching_phone
-
-    norm = normalize_phone(from_number)
-    if norm:
-        matches = patients_matching_phone(norm)
-        if len(matches) == 1:
-            return voice_greeting_for_returning_patient(matches[0].first_name, clinic_name)
-
-    intro = voice_greeting_opening(clinic_name, clinic_office_phone_display())
-    closings = [
-        "How can I help you today?",
-        "What can I help you schedule?",
-        "Are you looking to book, change, or cancel an appointment?",
-    ]
-    return intro + random.choice(closings)
-
-
 @csrf_exempt
 @require_POST
 def twilio_voice_incoming(request):
@@ -239,9 +216,9 @@ def twilio_voice_incoming(request):
     frm = (request.POST.get("From") or "").strip()
     upsert_voice_call_log(call_sid=sid, from_number=frm, outcome=VoiceCallLog.Outcome.PROMPTED)
 
-    clinic = ClinicSettings.get_cached()
-    clinic_name = clinic.clinic_name
-    greeting = _voice_greeting_for_caller(frm, clinic_name)
+    clinic = ClinicSettings.get_solo()
+    clinic_name = voice_clinic_display_name(clinic)
+    greeting = voice_greeting_for_caller(frm, clinic)
 
     ws_base = _realtime_stream_ws_base()
     if ws_base:

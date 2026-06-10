@@ -51,6 +51,39 @@ def clinic_public_address_display(clinic: ClinicSettings | None = None) -> str:
     return ", ".join(p for p in parts if p)
 
 
+def voice_clinic_display_name(clinic: ClinicSettings | None = None) -> str:
+    """Clinic name for spoken greetings (Admin Settings → clinic_name)."""
+    c = clinic or ClinicSettings.get_solo()
+    return (c.clinic_name or "").strip() or "our office"
+
+
+def voice_greeting_for_caller(from_number: str, clinic: ClinicSettings | None = None) -> str:
+    """
+    Build the opening greeting for this caller.
+    Returning patient (one phone match): short hello + first name + clinic name.
+    New or unknown caller: full Sarah intro with clinic name from settings.
+    """
+    import random
+
+    from apps.clinic.patient_phone import patients_matching_phone
+    from apps.clinic.utils import normalize_phone
+
+    clinic_name = voice_clinic_display_name(clinic)
+    norm = normalize_phone(from_number)
+    if norm:
+        matches = patients_matching_phone(norm)
+        if len(matches) == 1:
+            return voice_greeting_for_returning_patient(matches[0].first_name, clinic_name)
+
+    intro = voice_greeting_opening(clinic_name, clinic_office_phone_display())
+    closings = [
+        "How can I help you today?",
+        "What can I help you schedule?",
+        "Are you looking to book, change, or cancel an appointment?",
+    ]
+    return intro + random.choice(closings)
+
+
 def voice_greeting_for_returning_patient(first_name: str, clinic_name: str) -> str:
     """Short greeting when caller's phone matches one patient on file."""
     import random

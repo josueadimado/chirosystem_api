@@ -61,6 +61,8 @@ from apps.clinic.voice_office import (
     clinic_office_phone_e164,
     clinic_public_info_prompt_block,
     transfer_active_call_to_office,
+    voice_clinic_display_name,
+    voice_greeting_for_caller,
 )
 
 from django.conf import settings
@@ -299,8 +301,9 @@ CRITICAL TIME RULES:
     public_clinic = clinic_public_info_prompt_block(clinic)
     office_display = clinic_office_phone_display()
     office_e164 = clinic_office_phone_e164()
+    exact_clinic_name = voice_clinic_display_name(clinic)
 
-    return f"""You are Sarah, the friendly front desk receptionist at {clinic.clinic_name} in Michigan.
+    return f"""You are Sarah, the friendly front desk receptionist at {exact_clinic_name} in Michigan.
 
 You are on a phone call helping patients with scheduling and basic public clinic information.
 
@@ -343,7 +346,8 @@ YOUR PERSONALITY:
 - Use natural contractions (you're, I'll)
 - Never say you are an AI or automated
 - Vary your responses don't repeat phrases
-- OPENING GREETING: Returning patients hear a short hello with their first name + thank you for calling {clinic.clinic_name} — do NOT repeat that; ask how you can help. New callers heard the full scheduling + front desk intro — do NOT repeat it; listen and help.
+- CLINIC NAME: Always say "{exact_clinic_name}" exactly — never shorten it, never say "the clinic" or "our office" instead of the full name when referring to the practice.
+- OPENING GREETING: Returning patients hear a short hello with their first name + thank you for calling {exact_clinic_name} — do NOT repeat that; ask how you can help. New callers heard the full scheduling + front desk intro — do NOT repeat it; listen and help.
 
 BOOKING FLOW:
 1. The opening greeting already ran (short for returning patients, full intro for new callers)
@@ -671,6 +675,7 @@ _cancel_async = sync_to_async(_cancel_appointment_sync, thread_sensitive=True)
 _reschedule_async = sync_to_async(_reschedule_appointment_sync, thread_sensitive=True)
 _transfer_async = sync_to_async(transfer_active_call_to_office, thread_sensitive=True)
 _build_prompt_async = sync_to_async(_build_system_prompt, thread_sensitive=True)
+_voice_greeting_async = sync_to_async(voice_greeting_for_caller, thread_sensitive=True)
 
 
 async def _run_tool(name: str, args: dict[str, Any], *, call_sid: str, from_number: str) -> str:
@@ -828,26 +833,27 @@ class RealtimeBridge:
         logger.info("Realtime [%s] OpenAI session started", self.call_sid[:8])
 
     async def send_greeting(self) -> None:
-        """Official Twilio pattern: user message item + response.create."""
+        """Speak the scripted opening greeting verbatim (clinic name from Admin Settings)."""
         if self._greeting_sent or not self.openai_ws or not self.greeting.strip():
             return
         self._greeting_sent = True
-        greeting_text = self.greeting
+        greeting_text = self.greeting.strip()
         await self.openai_ws.send(
             json.dumps(
                 {
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "message",
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": greeting_text},
-                        ],
+                    "type": "response.create",
+                    "response": {
+                        "instructions": (
+                            "The caller just answered the phone. "
+                            "Speak the following greeting OUT LOUD right now. "
+                            "Use these EXACT words — same clinic name spelling, "
+                            "do not paraphrase, shorten the clinic name, or add extra sentences:\n\n"
+                            f"{greeting_text}"
+                        ),
                     },
                 }
             )
         )
-        await self.openai_ws.send(json.dumps({"type": "response.create"}))
         await async_append_voice_conversation_turn(
             call_sid=self.call_sid,
             role="assistant",
@@ -1006,10 +1012,14 @@ async def twilio_realtime_stream(ws: WebSocket):
                 stream_sid = (start.get("streamSid") or "").strip()
                 call_sid = (start.get("callSid") or msg.get("callSid") or "").strip()
                 custom = start.get("customParameters") or {}
-                greeting = (custom.get("greeting") or "").strip()
                 from_number = (custom.get("from_number") or start.get("from") or "").strip()
                 if not call_sid:
                     call_sid = (custom.get("call_sid") or "unknown").strip()
+
+                # Rebuild greeting from live Admin Settings so clinic name is always current.
+                greeting = await _voice_greeting_async(from_number)
+                if not greeting.strip():
+                    greeting = (custom.get("greeting") or "").strip()
 
                 bridge = RealtimeBridge(
                     twilio_ws=ws,
