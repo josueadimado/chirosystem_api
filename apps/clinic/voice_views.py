@@ -26,7 +26,7 @@ from django.views.decorators.http import require_POST
 from twilio.request_validator import RequestValidator
 from zoneinfo import ZoneInfo
 
-from .models import Appointment, ClinicSettings, Patient, VoiceCallLog
+from .models import ClinicSettings, VoiceCallLog
 from .utils import normalize_phone
 from .public_booking_service import create_appointment_from_public_booking
 from .serializers import PublicBookingSerializer
@@ -39,6 +39,12 @@ from .voice_ai import (
     parse_datetime_from_speech,
 )
 from .voice_logging import upsert_voice_call_log
+from .voice_office import (
+    clinic_office_phone_display,
+    voice_answer_delay_seconds,
+    voice_greeting_for_returning_patient,
+    voice_greeting_opening,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,12 +83,13 @@ def _say(text: str) -> str:
     return f'<Say voice="Polly.Joanna">{escape(text)}</Say>'
 
 
-def _listen(request, prompt: str, *, hint: str = "") -> HttpResponse:
+def _listen(request, prompt: str, *, hint: str = "", pause_before: str = "") -> HttpResponse:
     """Gather speech — prompt plays INSIDE <Gather> so mic is on immediately."""
     action = _voice_url(request, "twilio_voice_gather").replace("&", "&amp;")
     h = f' hints="{escape(hint)}"' if hint else ""
     return _xml(
-        f'<Gather input="speech" action="{action}" method="POST" '
+        (pause_before or "")
+        + f'<Gather input="speech" action="{action}" method="POST" '
         f'timeout="8" speechTimeout="3" speechModel="phone_call" '
         f'language="en-US"{h}>'
         + _say(prompt)
@@ -188,49 +195,36 @@ def _elevenlabs_twilio_voice(tts_voice_full: str, voice_id: str) -> str:
 
 # ─── Incoming call (Media Streams → OpenAI Realtime) ───────────────────
 
+def _voice_answer_pause_twiml() -> str:
+    """Brief pause after answer so the line rings 2–3 times before the AI connects."""
+    seconds = voice_answer_delay_seconds()
+    if seconds <= 0:
+        return ""
+    return f"<Pause length=\"{seconds}\"/>"
+
+
 def _voice_greeting_for_caller(from_number: str, clinic_name: str) -> str:
-    """Build Sarah's opening line; passed to realtime_relay via Stream <Parameter>."""
+    """
+    Returning patient (phone matches one chart): short hello + first name + thank you for calling.
+    New or unknown caller: full Sarah intro (scheduling + front desk option).
+    """
     import random
 
     from apps.clinic.patient_phone import patients_matching_phone
 
-    patient = None
-    norm_phone = normalize_phone(from_number)
-    phone_matches = patients_matching_phone(norm_phone) if norm_phone else []
-    if len(phone_matches) == 1:
-        patient = phone_matches[0]
+    norm = normalize_phone(from_number)
+    if norm:
+        matches = patients_matching_phone(norm)
+        if len(matches) == 1:
+            return voice_greeting_for_returning_patient(matches[0].first_name, clinic_name)
 
-    if patient:
-        pname = f"{patient.first_name} {patient.last_name}".strip()
-        last_appt = (
-            Appointment.objects.filter(patient=patient)
-            .exclude(status__in=[Appointment.Status.CANCELLED, Appointment.Status.NO_SHOW])
-            .order_by("-appointment_date")
-            .first()
-        )
-        if last_appt and last_appt.booked_service:
-            last_svc = last_appt.booked_service.label_for_public_booking()
-            returning_greetings = [
-                f"Hey {pname}! Welcome back to {clinic_name}. Last time you had a {last_svc} — would you like to book that again, or try something different?",
-                f"Hi {pname}, great to hear from you again! I see your last visit was for a {last_svc}. Want to go with that again, or a different service?",
-                f"{pname}! So glad you called back. Your last appointment was a {last_svc} — should I set up the same thing, or would you like to see what else we offer?",
-            ]
-        else:
-            returning_greetings = [
-                f"Hey {pname}! Welcome back to {clinic_name}. What can I help you book today?",
-                f"Hi {pname}, good to hear from you again! What service would you like to schedule?",
-                f"{pname}! Great to have you back at {clinic_name}. What are you looking to book today?",
-            ]
-        return random.choice(returning_greetings)
-
-    new_greetings = [
-        f"Hey there! Thanks for calling {clinic_name}. I'm Sarah and I'd love to help you get an appointment set up. Could I get your first and last name?",
-        f"Hi! You've reached {clinic_name}, this is Sarah. I can help you book an appointment real quick. What's your name?",
-        f"Thanks for calling {clinic_name}! I'm Sarah. Let's get you scheduled — can I start with your first and last name?",
-        f"Hey, welcome to {clinic_name}! I'm Sarah and I'll help you book an appointment. What's your name?",
-        f"Hi there! Thanks for calling {clinic_name}. I'm Sarah — I can get you booked in just a minute. What's your first and last name?",
+    intro = voice_greeting_opening(clinic_name, clinic_office_phone_display())
+    closings = [
+        "How can I help you today?",
+        "What can I help you schedule?",
+        "Are you looking to book, change, or cancel an appointment?",
     ]
-    return random.choice(new_greetings)
+    return intro + random.choice(closings)
 
 
 @csrf_exempt
@@ -250,8 +244,10 @@ def twilio_voice_incoming(request):
     ws_base = _realtime_stream_ws_base()
     if ws_base:
         stream_url = f"{ws_base}/ws/realtime"
+        pause = _voice_answer_pause_twiml()
         twiml = (
-            "<Connect>"
+            pause
+            + "<Connect>"
             f'<Stream url="{escape(stream_url)}">'
             f'<Parameter name="greeting" value="{escape(greeting)}"/>'
             f'<Parameter name="call_sid" value="{escape(sid)}"/>'
@@ -259,7 +255,12 @@ def twilio_voice_incoming(request):
             "</Stream>"
             "</Connect>"
         )
-        logger.info("Voice [%s] Media Stream (Realtime) url=%s", sid[:8], stream_url)
+        logger.info(
+            "Voice [%s] Media Stream (Realtime) url=%s pause=%ss",
+            sid[:8],
+            stream_url,
+            voice_answer_delay_seconds(),
+        )
         return _xml(twiml)
 
     logger.warning(
@@ -267,11 +268,11 @@ def twilio_voice_incoming(request):
         "falling back to legacy Gather loop. "
         "Set wss://api.example.com (no path) for Media Streams + OpenAI Realtime."
     )
+    office_display = clinic_office_phone_display()
     return _listen(
         request,
-        f"Hi, thanks for calling {escape(clinic_name)}! "
-        "I can help you book an appointment. "
-        "What's your first and last name?",
+        voice_greeting_opening(clinic_name, office_display) + "How can I help you today?",
+        pause_before=_voice_answer_pause_twiml(),
     )
 
 

@@ -239,6 +239,13 @@ VOICE_LLM_STREAM = os.getenv("VOICE_LLM_STREAM", "true").strip().lower() in ("1"
 # Empty transcripts from ConversationRelay (silence / STT hiccup) before we hang up with a goodbye.
 # Increase if calls feel like they “drop” too quickly when the caller is still on the line (default 8).
 try:
+    VOICE_ANSWER_DELAY_SECONDS = int(os.getenv("VOICE_ANSWER_DELAY_SECONDS", "6"))
+except ValueError:
+    VOICE_ANSWER_DELAY_SECONDS = 6
+# Pause before AI picks up (≈2–3 rings at ~2 sec each). Set 0 to answer immediately.
+VOICE_ANSWER_DELAY_SECONDS = max(0, min(20, VOICE_ANSWER_DELAY_SECONDS))
+
+try:
     VOICE_SILENCE_MAX_RETRIES = int(os.getenv("VOICE_SILENCE_MAX_RETRIES", "8"))
 except ValueError:
     VOICE_SILENCE_MAX_RETRIES = 8

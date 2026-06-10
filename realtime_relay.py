@@ -56,6 +56,12 @@ from apps.clinic.voice_logging import (
     async_append_voice_conversation_turn,
     async_upsert_voice_call_log,
 )
+from apps.clinic.voice_office import (
+    clinic_office_phone_display,
+    clinic_office_phone_e164,
+    clinic_public_info_prompt_block,
+    transfer_active_call_to_office,
+)
 
 from django.conf import settings
 from django.utils import timezone
@@ -163,6 +169,15 @@ REALTIME_TOOLS: list[dict[str, Any]] = [
             "required": ["phone", "appointment_id", "new_date", "new_time"],
         },
     },
+    {
+        "type": "function",
+        "name": "transfer_to_front_desk",
+        "description": (
+            "Connect the caller to a live person at the clinic front desk when they ask to speak "
+            "with staff, the office, a human, receptionist, or front desk."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -230,7 +245,8 @@ def _returning_patient_prompt_note(patient: Patient) -> str:
                 f"{dur} minutes, {price} — not the New Office Visit price."
             )
         return (
-            f"\nRETURNING PATIENT (RE-INTAKE NEEDED): "
+            f"\nINTERNAL STAFF NOTE (never read aloud — do not mention to the caller until they identify themselves):\n"
+            f"RETURNING PATIENT (RE-INTAKE NEEDED): "
             f"{patient.first_name} {patient.last_name} is on file but {gap_detail}. "
             f"They must be treated like a new patient for chiropractic intake.{reexam_hint} "
             f"After booking, quote the exact fee for the service you booked (see AFTER BOOKING section)."
@@ -238,7 +254,8 @@ def _returning_patient_prompt_note(patient: Patient) -> str:
 
     days_label = str(days_since) if days_since is not None else "unknown"
     return (
-        f"\nRETURNING PATIENT (recent visit): "
+        f"\nINTERNAL STAFF NOTE (never read aloud — do not mention to the caller until they identify themselves):\n"
+        f"RETURNING PATIENT (recent visit): "
         f"{patient.first_name} {patient.last_name} is on file. "
         f"Last visit was {days_label} days ago. "
         f"Do NOT treat as new patient. "
@@ -258,7 +275,10 @@ def _build_system_prompt(*, from_number: str) -> str:
         if len(matches) == 1:
             returning_note = _returning_patient_prompt_note(matches[0])
         elif len(matches) > 1:
-            returning_note = "\nMultiple patients share this phone — confirm full name before booking."
+            returning_note = (
+                "\nINTERNAL STAFF NOTE: Multiple patients share this phone — confirm full legal name "
+                "before booking or discussing any appointment. Never mention other patients on this line."
+            )
 
     now = now_clinic()
     tz_name = get_clinic_tz_name()
@@ -276,16 +296,40 @@ CRITICAL TIME RULES:
 - When caller says "this afternoon" or "later today" only consider times after {now.strftime("%I:%M %p")}
 """
 
+    public_clinic = clinic_public_info_prompt_block(clinic)
+    office_display = clinic_office_phone_display()
+    office_e164 = clinic_office_phone_e164()
+
     return f"""You are Sarah, the friendly front desk receptionist at {clinic.clinic_name} in Michigan.
 
-You are on a phone call helping patients book, reschedule, or cancel appointments.
+You are on a phone call helping patients with scheduling and basic public clinic information.
 
-CLINIC INFORMATION:
-Name: {clinic.clinic_name}
-Phone: (269) 408-0303
+PUBLIC CLINIC INFORMATION (safe to share when asked — from Admin Settings):
+{public_clinic}
 Hours: {hours}
 Timezone: {tz_name}
 {time_context}
+
+PRIVACY AND CONFIDENTIALITY (critical):
+- NEVER disclose patient information, medical details, billing balances, insurance IDs, date of birth, chart notes, or any protected health information.
+- NEVER mention another patient's name, appointment, or records — even if you have internal background notes.
+- Do NOT mention another patient's name, appointment, or records — even if you have internal background notes.
+- If the opening greeting used the caller's first name (returning patient on file), you may continue using their first name — but still do NOT mention visit history, diagnoses, or billing until needed for scheduling.
+- Only discuss a caller's own upcoming appointments after using get_upcoming_appointments or cancel/reschedule tools (phone must match).
+- If someone asks about another person ("my wife's appointment", "is John Smith coming in?"): say you cannot share other patients' information and offer to connect them to the front desk.
+- Never quote tax IDs, NPI numbers, or internal billing codes.
+- Service prices from AVAILABLE SERVICES are public and OK to share.
+
+YOUR SCOPE:
+- You CAN help with: booking, rescheduling, canceling, checking availability, listing the caller's own upcoming visits (after phone verification via tools).
+- You CAN answer public questions: address, directions, location, phone number, email, hours, services and listed prices.
+- You CANNOT help with: billing disputes, insurance verification, clinical advice, medical records, or detailed account questions — transfer to front desk.
+- For anything outside scheduling or public clinic info, offer to connect them to the front desk at {office_display}.
+
+TRANSFER TO A LIVE PERSON:
+- If the caller wants to talk to the office, front desk, receptionist, a real person, or staff — say you will connect them, then call transfer_to_front_desk.
+- Do not argue; transfer promptly when they clearly want a human.
+- If transfer fails, give them the office number {office_display} and apologize.
 
 AVAILABLE SERVICES (use service_id and provider_id in tools):
 {_services_prompt_block(catalog)}
@@ -299,20 +343,25 @@ YOUR PERSONALITY:
 - Use natural contractions (you're, I'll)
 - Never say you are an AI or automated
 - Vary your responses don't repeat phrases
+- OPENING GREETING: Returning patients hear a short hello with their first name + thank you for calling {clinic.clinic_name} — do NOT repeat that; ask how you can help. New callers heard the full scheduling + front desk intro — do NOT repeat it; listen and help.
 
 BOOKING FLOW:
-1. Greet the caller
-2. Get their first and last name
-3. Ask what service they need
-4. Ask for preferred date and time
-5. Check availability using check_availability before confirming
-6. Confirm details and book with book_appointment
-7. After booking give confirmation and say goodbye — see AFTER BOOKING (NEW OFFICE / FIRST VISIT) below for first-visit services.
+1. The opening greeting already ran (short for returning patients, full intro for new callers)
+2. Returning patients: you often already know their first name — confirm last name if needed for booking tools
+3. New callers: get first and last name
+4. Ask what service they need
+5. Ask for preferred date and time
+6. Check availability using check_availability before confirming
+7. Confirm details and book with book_appointment
+8. After booking give confirmation and say goodbye — see AFTER BOOKING (NEW OFFICE / FIRST VISIT) below for first-visit services.
 
    IF it's a regular returning visit (not first-visit / intake):
    "You are all set — [service] on [date] at [time]. You'll get a confirmation text shortly. See you then!"
 
 HANDLING ISSUES:
+- If caller asks for address, location, directions, or "where are you": give the Address from PUBLIC CLINIC INFORMATION above in plain language.
+- If caller asks what hours you are open: give Hours above.
+- If caller asks for the phone number or how to reach the office: give Phone above.
 - If caller asks about insurance (any phrasing like "do you accept my insurance", "do you take Blue Cross", "are you in network"):
   Say: "Yes we accept most major health insurance. Would you like to schedule an appointment?"
   Then guide to booking.
@@ -325,6 +374,7 @@ HANDLING ISSUES:
 - If new chiropractic patient may need intake: suggest New Office Visit / intake service from catalog
 - If caller wants cancel/reschedule: get_upcoming_appointments then cancel_appointment or reschedule_appointment
 - If outside hours: let them know and offer next available day
+- If caller needs the office for non-scheduling help: transfer_to_front_desk or give {office_display}
 
 INSURANCE TRACKING:
 Only mention insurance billing AFTER booking if the caller already asked about insurance earlier in this call.
@@ -344,6 +394,7 @@ IMPORTANT:
 - Always check availability before confirming a booking
 - Always confirm details before book_appointment
 - Always say a warm goodbye after booking
+- Front desk transfer number (for your reference): {office_e164}
 """
 
 
@@ -618,6 +669,7 @@ _get_upcoming_async = sync_to_async(_get_upcoming_appointments, thread_sensitive
 _book_async = sync_to_async(_book_appointment_sync, thread_sensitive=True)
 _cancel_async = sync_to_async(_cancel_appointment_sync, thread_sensitive=True)
 _reschedule_async = sync_to_async(_reschedule_appointment_sync, thread_sensitive=True)
+_transfer_async = sync_to_async(transfer_active_call_to_office, thread_sensitive=True)
 _build_prompt_async = sync_to_async(_build_system_prompt, thread_sensitive=True)
 
 
@@ -688,6 +740,17 @@ async def _run_tool(name: str, args: dict[str, Any], *, call_sid: str, from_numb
                 str(args["new_date"]),
                 str(args["new_time"]),
             )
+            return json.dumps(result)
+
+        if name == "transfer_to_front_desk":
+            result = await _transfer_async(call_sid)
+            if result.get("ok"):
+                await async_upsert_voice_call_log(
+                    call_sid=call_sid,
+                    from_number=from_number,
+                    outcome=VoiceCallLog.Outcome.DISCONNECTED,
+                    detail=f"transferred_to_office:{result.get('transferred_to', '')}",
+                )
             return json.dumps(result)
 
         return json.dumps({"error": f"Unknown tool: {name}"})
