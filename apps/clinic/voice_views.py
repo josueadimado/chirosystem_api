@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from datetime import date as date_type
 from decimal import Decimal
+import time
 from xml.sax.saxutils import escape
 
 from django.conf import settings
@@ -83,13 +84,12 @@ def _say(text: str) -> str:
     return f'<Say voice="Polly.Joanna">{escape(text)}</Say>'
 
 
-def _listen(request, prompt: str, *, hint: str = "", pause_before: str = "") -> HttpResponse:
+def _listen(request, prompt: str, *, hint: str = "") -> HttpResponse:
     """Gather speech — prompt plays INSIDE <Gather> so mic is on immediately."""
     action = _voice_url(request, "twilio_voice_gather").replace("&", "&amp;")
     h = f' hints="{escape(hint)}"' if hint else ""
     return _xml(
-        (pause_before or "")
-        + f'<Gather input="speech" action="{action}" method="POST" '
+        f'<Gather input="speech" action="{action}" method="POST" '
         f'timeout="8" speechTimeout="3" speechModel="phone_call" '
         f'language="en-US"{h}>'
         + _say(prompt)
@@ -195,12 +195,14 @@ def _elevenlabs_twilio_voice(tts_voice_full: str, voice_id: str) -> str:
 
 # ─── Incoming call (Media Streams → OpenAI Realtime) ───────────────────
 
-def _voice_answer_pause_twiml() -> str:
-    """Brief pause after answer so the line rings 2–3 times before the AI connects."""
+def _voice_ring_delay_before_answer() -> None:
+    """
+    Delay returning TwiML so the caller hears ~2–3 rings before the line is answered.
+    (Pause in TwiML runs after answer = silence; pre-response delay extends ringback.)
+    """
     seconds = voice_answer_delay_seconds()
-    if seconds <= 0:
-        return ""
-    return f"<Pause length=\"{seconds}\"/>"
+    if seconds > 0:
+        time.sleep(seconds)
 
 
 def _voice_greeting_for_caller(from_number: str, clinic_name: str) -> str:
@@ -243,11 +245,10 @@ def twilio_voice_incoming(request):
 
     ws_base = _realtime_stream_ws_base()
     if ws_base:
+        _voice_ring_delay_before_answer()
         stream_url = f"{ws_base}/ws/realtime"
-        pause = _voice_answer_pause_twiml()
         twiml = (
-            pause
-            + "<Connect>"
+            "<Connect>"
             f'<Stream url="{escape(stream_url)}">'
             f'<Parameter name="greeting" value="{escape(greeting)}"/>'
             f'<Parameter name="call_sid" value="{escape(sid)}"/>'
@@ -256,7 +257,7 @@ def twilio_voice_incoming(request):
             "</Connect>"
         )
         logger.info(
-            "Voice [%s] Media Stream (Realtime) url=%s pause=%ss",
+            "Voice [%s] Media Stream (Realtime) url=%s ring_delay=%ss",
             sid[:8],
             stream_url,
             voice_answer_delay_seconds(),
@@ -268,11 +269,11 @@ def twilio_voice_incoming(request):
         "falling back to legacy Gather loop. "
         "Set wss://api.example.com (no path) for Media Streams + OpenAI Realtime."
     )
+    _voice_ring_delay_before_answer()
     office_display = clinic_office_phone_display()
     return _listen(
         request,
         voice_greeting_opening(clinic_name, office_display) + "How can I help you today?",
-        pause_before=_voice_answer_pause_twiml(),
     )
 
 

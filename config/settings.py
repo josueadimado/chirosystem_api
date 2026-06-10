@@ -236,6 +236,9 @@ OPENAI_VOICE_MODEL = os.getenv("OPENAI_VOICE_MODEL", "gpt-5.4-nano").strip() or 
 OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "coral").strip() or "coral"
 # Voice relay: stream LLM tokens to Twilio (lower perceived delay). Set VOICE_LLM_STREAM=false to disable.
 VOICE_LLM_STREAM = os.getenv("VOICE_LLM_STREAM", "true").strip().lower() in ("1", "true", "yes")
+# Public wss:// origin for Twilio Media Streams (OpenAI Realtime). Same host as API; path /ws/realtime.
+# Falls back to VOICE_WS_PUBLIC_URL when unset (voice_views normalizes to wss origin only).
+REALTIME_WS_PUBLIC_URL = os.getenv("REALTIME_WS_PUBLIC_URL", "").strip().rstrip("/")
 # Empty transcripts from ConversationRelay (silence / STT hiccup) before we hang up with a goodbye.
 # Increase if calls feel like they “drop” too quickly when the caller is still on the line (default 8).
 try:
