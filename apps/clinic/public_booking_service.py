@@ -64,11 +64,20 @@ def public_online_booking_calendar_span_minutes(service: Service) -> int:
     return n
 
 
-def record_patient_sms_consent_from_booking(patient: Patient) -> None:
-    """Persist SMS reminder consent and timestamp (idempotent refresh of consent time on repeat True)."""
-    patient.sms_consent = True
-    patient.sms_consent_at = timezone.now()
+def apply_patient_sms_consent_from_booking(patient: Patient, *, consented: bool) -> None:
+    """Persist SMS reminder consent from public booking / reschedule (opt-in or opt-out)."""
+    if consented:
+        patient.sms_consent = True
+        patient.sms_consent_at = timezone.now()
+    else:
+        patient.sms_consent = False
+        patient.sms_consent_at = None
     patient.save(update_fields=["sms_consent", "sms_consent_at", "updated_at"])
+
+
+def record_patient_sms_consent_from_booking(patient: Patient) -> None:
+    """Backward-compatible opt-in helper."""
+    apply_patient_sms_consent_from_booking(patient, consented=True)
 
 
 def create_appointment_from_public_booking(validated: dict) -> tuple[Appointment | None, str | None]:
@@ -85,8 +94,7 @@ def create_appointment_from_public_booking(validated: dict) -> tuple[Appointment
         last_name=validated["last_name"],
         email=(validated.get("email") or "").strip(),
     )
-    if validated.get("sms_consent"):
-        record_patient_sms_consent_from_booking(patient)
+    apply_patient_sms_consent_from_booking(patient, consented=bool(validated.get("sms_consent", True)))
 
     if validated.get("service_id"):
         try:
@@ -219,7 +227,7 @@ def reschedule_appointment_public(
     appointment_id: int,
     new_date,
     new_start,
-    sms_consent: bool = False,
+    sms_consent: bool = True,
 ) -> tuple[Appointment | None, str | None]:
     """
     Move an existing BOOKED visit to a new open slot. Verifies the patient's phone matches.
@@ -316,8 +324,7 @@ def reschedule_appointment_public(
         ]
     )
 
-    if sms_consent:
-        record_patient_sms_consent_from_booking(patient)
+    apply_patient_sms_consent_from_booking(patient, consented=sms_consent)
 
     aid = appt.id
     change_lines: list[str] = []

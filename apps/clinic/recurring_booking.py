@@ -16,8 +16,8 @@ from .models import Appointment, AppointmentSeries, Patient, Provider, Service, 
 from .patient_phone import get_or_create_patient_for_public_booking
 from .online_booking_hours import public_booking_treatment_duration_minutes
 from .public_booking_service import (
+    apply_patient_sms_consent_from_booking,
     public_online_booking_calendar_span_minutes,
-    record_patient_sms_consent_from_booking,
 )
 from .utils import format_time_12h, normalize_phone
 
@@ -169,7 +169,7 @@ def _booking_payload_for_date(
         "last_name": data.get("last_name") or (patient.last_name if patient else ""),
         "phone": data.get("phone") or (patient.phone if patient else ""),
         "email": data.get("email") or (patient.email if patient else ""),
-        "sms_consent": data.get("sms_consent", False),
+        "sms_consent": data.get("sms_consent", True),
         "service_id": service.id,
         "provider_id": provider.id,
         "service_name": service.label_for_public_booking(),
@@ -324,8 +324,7 @@ def book_recurring_from_public(data: dict) -> tuple[list[Appointment] | None, st
         last_name=data["last_name"],
         email=(data.get("email") or "").strip(),
     )
-    if data.get("sms_consent"):
-        record_patient_sms_consent_from_booking(patient)
+    apply_patient_sms_consent_from_booking(patient, consented=bool(data.get("sms_consent", True)))
 
     created: list[Appointment] = []
     series: AppointmentSeries | None = None

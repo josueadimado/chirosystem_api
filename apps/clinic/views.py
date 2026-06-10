@@ -4537,12 +4537,12 @@ class DoctorViewSet(viewsets.ViewSet):
         data = dict(ser.validated_data)
         data.pop("online_chiro_intake_waived", None)
         data.pop("date_established", None)
-        data.pop("sms_consent", None)
         err = apply_patient_intake_validated_data(
             patient,
             data,
             allow_identity_fields=True,
             allow_communication_prefs=True,
+            allow_sms_consent=True,
         )
         if err:
             return Response({"detail": err}, status=status.HTTP_400_BAD_REQUEST)

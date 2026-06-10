@@ -40,15 +40,15 @@ class Patient(TimeStampedModel):
     square_card_id = models.CharField(max_length=255, blank=True)
     card_brand = models.CharField(max_length=20, blank=True)
     card_last4 = models.CharField(max_length=4, blank=True)
-    # SMS (TCPA): recorded when patient checks consent on public booking / reschedule.
+    # SMS (TCPA): on by default; staff/doctor can turn off per patient. Online booking can opt out.
     sms_consent = models.BooleanField(
-        default=False,
-        help_text="True if the patient agreed to SMS appointment reminders via the online booking consent checkbox.",
+        default=True,
+        help_text="True when the patient may receive SMS appointment reminders. On by default; staff or doctor can turn off.",
     )
     sms_consent_at = models.DateTimeField(
         null=True,
         blank=True,
-        help_text="When SMS consent was last recorded from the booking site.",
+        help_text="When SMS consent was last turned on (online booking or staff save).",
     )
     # How to reach this patient for automated messages (staff/doctor can override per patient).
     _notify_channel_help = (
