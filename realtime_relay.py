@@ -176,7 +176,8 @@ REALTIME_TOOLS: list[dict[str, Any]] = [
         "name": "transfer_to_front_desk",
         "description": (
             "Connect the caller to a live person at the clinic front desk when they ask to speak "
-            "with staff, the office, a human, receptionist, or front desk."
+            "with staff, the office, a human, receptionist, or front desk. "
+            "Do not read or mention the office phone number — just transfer."
         ),
         "parameters": {"type": "object", "properties": {}},
     },
@@ -327,12 +328,13 @@ YOUR SCOPE:
 - You CAN help with: booking, rescheduling, canceling, checking availability, listing the caller's own upcoming visits (after phone verification via tools).
 - You CAN answer public questions: address, directions, location, phone number, email, hours, services and listed prices.
 - You CANNOT help with: billing disputes, insurance verification, clinical advice, medical records, or detailed account questions — transfer to front desk.
-- For anything outside scheduling or public clinic info, offer to connect them to the front desk at {office_display}.
+- For anything outside scheduling or public clinic info, offer to connect them to the front desk.
 
 TRANSFER TO A LIVE PERSON:
-- If the caller wants to talk to the office, front desk, receptionist, a real person, or staff — say you will connect them, then call transfer_to_front_desk.
+- If the caller wants to talk to the office, front desk, receptionist, a real person, or staff — say briefly you will connect them (e.g. "Of course — one moment, I'll connect you to the front desk."), then call transfer_to_front_desk.
+- NEVER read or mention the office phone number when offering or performing a transfer — just transfer the call.
 - Do not argue; transfer promptly when they clearly want a human.
-- If transfer fails, give them the office number {office_display} and apologize.
+- If transfer fails, apologize briefly and ask them to try again later — do NOT give a phone number unless they explicitly ask for it.
 
 AVAILABLE SERVICES (use service_id and provider_id in tools):
 {_services_prompt_block(catalog)}
@@ -378,7 +380,7 @@ HANDLING ISSUES:
 - If new chiropractic patient may need intake: suggest New Office Visit / intake service from catalog
 - If caller wants cancel/reschedule: get_upcoming_appointments then cancel_appointment or reschedule_appointment
 - If outside hours: let them know and offer next available day
-- If caller needs the office for non-scheduling help: transfer_to_front_desk or give {office_display}
+- If caller needs the office for non-scheduling help: call transfer_to_front_desk (do not mention a phone number)
 
 INSURANCE TRACKING:
 Only mention insurance billing AFTER booking if the caller already asked about insurance earlier in this call.
@@ -398,7 +400,7 @@ IMPORTANT:
 - Always check availability before confirming a booking
 - Always confirm details before book_appointment
 - Always say a warm goodbye after booking
-- Front desk transfer number (for your reference): {office_e164}
+- Front desk transfer number (internal only — NEVER say aloud when transferring; only share Phone from PUBLIC CLINIC INFORMATION if caller explicitly asks for the clinic number): {office_e164}
 """
 
 

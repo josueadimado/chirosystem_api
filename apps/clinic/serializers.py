@@ -940,6 +940,13 @@ class SaveSquareCardSerializer(serializers.Serializer):
         return attrs
 
 
+class StaffSavePatientCardSerializer(serializers.Serializer):
+    """Staff/doctor: save Square card on file for an existing patient (Web Payments token)."""
+
+    source_id = serializers.CharField(max_length=255)
+    verification_token = serializers.CharField(required=False, allow_blank=True, max_length=512)
+
+
 class TerminalCheckoutSerializer(serializers.Serializer):
     invoice_id = serializers.IntegerField(min_value=1)
     include_pending_fees = serializers.BooleanField(required=False, default=False)

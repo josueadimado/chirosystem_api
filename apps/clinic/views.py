@@ -61,6 +61,7 @@ from .serializers import (
     PatientListSerializer,
     PatientSerializer,
     SaveSquareCardSerializer,
+    StaffSavePatientCardSerializer,
     TerminalCheckoutSerializer,
     TerminalCheckoutStatusSerializer,
     TerminalCheckoutTestSerializer,
@@ -1935,6 +1936,33 @@ class PatientViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN,
             )
         return super().destroy(request, *args, **kwargs)
+
+    @action(detail=True, methods=["post"], url_path="save-card")
+    def save_card(self, request, pk=None):
+        """Owner, staff, or doctor: save a payment card on file for this patient (Square Web Payments token)."""
+        if not square_configured():
+            return Response(
+                {"detail": "Square payments are not configured. Ask your administrator to connect Square in Settings."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        patient = self.get_object()
+        ser = StaffSavePatientCardSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        src = data["source_id"]
+        vtok = (data.get("verification_token") or "").strip() or None
+        try:
+            save_card_from_source(patient, src, verification_token=vtok)
+        except Exception as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response(
+            {
+                "detail": "Card saved.",
+                "card_brand": patient.card_brand,
+                "card_last4": patient.card_last4,
+                "has_saved_card": bool(patient.card_last4),
+            }
+        )
 
 
 class ProviderViewSet(viewsets.ModelViewSet):

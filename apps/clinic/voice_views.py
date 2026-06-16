@@ -41,7 +41,6 @@ from .voice_ai import (
 )
 from .voice_logging import upsert_voice_call_log
 from .voice_office import (
-    clinic_office_phone_display,
     voice_answer_delay_seconds,
     voice_clinic_display_name,
     voice_greeting_for_caller,
@@ -247,10 +246,9 @@ def twilio_voice_incoming(request):
         "Set wss://api.example.com (no path) for Media Streams + OpenAI Realtime."
     )
     _voice_ring_delay_before_answer()
-    office_display = clinic_office_phone_display()
     return _listen(
         request,
-        voice_greeting_opening(clinic_name, office_display) + "How can I help you today?",
+        voice_greeting_opening(clinic_name) + "How can I help you today?",
     )
 
 

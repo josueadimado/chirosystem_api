@@ -75,7 +75,7 @@ def voice_greeting_for_caller(from_number: str, clinic: ClinicSettings | None = 
         if len(matches) == 1:
             return voice_greeting_for_returning_patient(matches[0].first_name, clinic_name)
 
-    intro = voice_greeting_opening(clinic_name, clinic_office_phone_display())
+    intro = voice_greeting_opening(clinic_name)
     closings = [
         "How can I help you today?",
         "What can I help you schedule?",
@@ -99,17 +99,16 @@ def voice_greeting_for_returning_patient(first_name: str, clinic_name: str) -> s
     return f"Hello {display}, thank you for calling {clinic}. " + random.choice(closings)
 
 
-def voice_greeting_opening(clinic_name: str, office_display: str) -> str:
+def voice_greeting_opening(clinic_name: str) -> str:
     """
-    Standard phone greeting — always starts with thank-you + clinic name from settings,
-    then scheduling scope and front-desk option.
+    Standard phone greeting — thank-you + clinic name, scheduling scope, front-desk option.
+    Does not mention the office phone number (caller is transferred when they ask).
     """
     name = (clinic_name or "").strip() or "our office"
     return (
         f"Thank you for calling {name}. This is Sarah. "
         f"I can help with anything related to scheduling — booking, rescheduling, or canceling appointments. "
-        f"If you'd rather speak with someone at the office, just say so and I'll connect you to our front desk at {office_display}, "
-        f"or you can call that number directly. "
+        f"If you'd rather speak with someone at the office, just say so and I'll connect you to our front desk. "
     )
 
 
@@ -149,7 +148,7 @@ def transfer_active_call_to_office(call_sid: str) -> dict:
         "<Response>"
         f'<Say voice="Polly.Joanna">{escape("One moment while I connect you to the front desk.")}</Say>'
         f"<Dial {dial_attrs}>{escape(to_e164)}</Dial>"
-        f'<Say voice="Polly.Joanna">{escape(f"We could not reach the office right now. Please call {display} during business hours. Goodbye.")}</Say>'
+        f'<Say voice="Polly.Joanna">{escape("We could not reach the front desk right now. Please try again in a few minutes. Goodbye.")}</Say>'
         "</Response>"
     )
 
