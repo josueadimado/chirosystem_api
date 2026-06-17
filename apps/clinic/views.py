@@ -5291,8 +5291,8 @@ class KioskViewSet(viewsets.ViewSet):
             .order_by("appointment_date", "start_time")
         )
 
-    @staticmethod
-    def _kiosk_appointments_qs(patient: Patient):
+    @classmethod
+    def _kiosk_visit_line(cls, appt: Appointment) -> dict:
         service_name = ""
         if appt.booked_service_id and appt.booked_service:
             service_name = (appt.booked_service.name or "").strip()
@@ -5656,6 +5656,8 @@ class KioskViewSet(viewsets.ViewSet):
         target_ids = [t.id for t in targets]
         now = timezone.now()
         checked_rows: list[Appointment] = []
+        conflict = False
+        early_err: str | None = None
 
         with transaction.atomic():
             locked = list(
@@ -5665,47 +5667,46 @@ class KioskViewSet(viewsets.ViewSet):
                 .order_by("start_time", "pk")
             )
             if len(locked) != len(set(target_ids)):
-                return Response(
-                    {"detail": "Appointment could not be found or was updated. Please try again."},
-                    status=status.HTTP_409_CONFLICT,
-                )
-
-            if not bypass_early:
+                conflict = True
+            elif not bypass_early:
                 for visit in locked:
                     if visit.status != Appointment.Status.BOOKED:
                         continue
-                    allowed, _, _ = self._can_kiosk_checkin_now(visit)
+                    allowed, _, earliest_local = self._can_kiosk_checkin_now(visit)
                     if not allowed:
                         minutes = self._kiosk_minutes_before()
-                        _, _, earliest_local = self._can_kiosk_checkin_now(visit)
                         earliest_disp = (
                             format_time_12h(earliest_local.time()) if earliest_local else ""
                         )
-                        return Response(
-                            {
-                                "detail": (
-                                    f"It is too early for kiosk check-in. You can check in up to {minutes} minutes "
-                                    f"before this appointment"
-                                    + (f" (opens around {earliest_disp})" if earliest_disp else "")
-                                    + ", or ask the front desk."
-                                ),
-                            },
-                            status=status.HTTP_400_BAD_REQUEST,
+                        early_err = (
+                            f"It is too early for kiosk check-in. You can check in up to {minutes} minutes "
+                            f"before this appointment"
+                            + (f" (opens around {earliest_disp})" if earliest_disp else "")
+                            + ", or ask the front desk."
                         )
+                        break
+            if not conflict and not early_err:
+                for visit in locked:
+                    if visit.status in (
+                        Appointment.Status.CANCELLED,
+                        Appointment.Status.NO_SHOW,
+                        Appointment.Status.COMPLETED,
+                    ):
+                        continue
+                    if visit.status != Appointment.Status.BOOKED:
+                        continue
+                    visit.status = Appointment.Status.CHECKED_IN
+                    visit.checked_in_at = now
+                    visit.save(update_fields=["status", "checked_in_at", "updated_at"])
+                    checked_rows.append(visit)
 
-            for visit in locked:
-                if visit.status in (
-                    Appointment.Status.CANCELLED,
-                    Appointment.Status.NO_SHOW,
-                    Appointment.Status.COMPLETED,
-                ):
-                    continue
-                if visit.status != Appointment.Status.BOOKED:
-                    continue
-                visit.status = Appointment.Status.CHECKED_IN
-                visit.checked_in_at = now
-                visit.save(update_fields=["status", "checked_in_at", "updated_at"])
-                checked_rows.append(visit)
+        if conflict:
+            return Response(
+                {"detail": "Appointment could not be found or was updated. Please try again."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if early_err:
+            return Response({"detail": early_err}, status=status.HTTP_400_BAD_REQUEST)
 
         if not checked_rows:
             return Response(
