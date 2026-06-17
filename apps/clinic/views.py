@@ -5708,9 +5708,9 @@ class KioskViewSet(viewsets.ViewSet):
                                 + ", or ask the front desk."
                             )
                             break
+                    # booked_service is nullable — FOR UPDATE + outer join crashes on Postgres.
                     locked = (
-                        Appointment.objects.select_for_update()
-                        .select_related("patient", "provider", "booked_service")
+                        Appointment.objects.select_for_update(of=("self",))
                         .filter(pk=visit.pk, status=Appointment.Status.BOOKED)
                         .first()
                     )
