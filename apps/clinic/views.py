@@ -5577,116 +5577,115 @@ class KioskViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"])
     def checkin(self, request):
+        import logging
+
         from apps.clinic.patient_phone import patient_matches_phone_normalized
         from apps.clinic.timezone_utils import today_clinic
 
-        appointment_id = request.data.get("appointment_id")
-        raw_ids = request.data.get("appointment_ids")
-        if appointment_id is None and not raw_ids:
-            return Response(
-                {"detail": "appointment_id or appointment_ids is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        if appointment_id is None and raw_ids:
-            try:
-                appointment_id = int(raw_ids[0])
-            except (TypeError, ValueError, IndexError):
-                return Response(
-                    {"detail": "appointment_ids must be a non-empty list of numbers."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-        try:
-            primary_id = int(appointment_id)
-        except (TypeError, ValueError):
-            return Response(
-                {"detail": "appointment_id must be a number."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        checkin_logger = logging.getLogger(__name__)
 
-        requested_ids: list[int] | None = None
-        if raw_ids is not None:
-            if not isinstance(raw_ids, (list, tuple)):
+        try:
+            appointment_id = request.data.get("appointment_id")
+            raw_ids = request.data.get("appointment_ids")
+            if appointment_id is None and not raw_ids:
                 return Response(
-                    {"detail": "appointment_ids must be a list."},
+                    {"detail": "appointment_id or appointment_ids is required."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+            if appointment_id is None and raw_ids:
+                try:
+                    appointment_id = int(raw_ids[0])
+                except (TypeError, ValueError, IndexError):
+                    return Response(
+                        {"detail": "appointment_ids must be a non-empty list of numbers."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
             try:
-                requested_ids = [int(x) for x in raw_ids]
+                primary_id = int(appointment_id)
             except (TypeError, ValueError):
                 return Response(
-                    {"detail": "appointment_ids must be a list of numbers."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            if not requested_ids:
-                return Response(
-                    {"detail": "appointment_ids cannot be empty."},
+                    {"detail": "appointment_id must be a number."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-        appt = get_object_or_404(
-            Appointment.objects.select_related("patient", "provider", "booked_service"),
-            pk=primary_id,
-        )
-        phone = request.data.get("phone")
-        if phone:
-            valid, msg = validate_phone(phone)
-            if not valid:
-                return Response({"detail": msg}, status=status.HTTP_400_BAD_REQUEST)
-            if not patient_matches_phone_normalized(appt.patient, normalize_phone(phone)):
+            requested_ids: list[int] | None = None
+            if raw_ids is not None:
+                if not isinstance(raw_ids, (list, tuple)):
+                    return Response(
+                        {"detail": "appointment_ids must be a list."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                try:
+                    requested_ids = [int(x) for x in raw_ids]
+                except (TypeError, ValueError):
+                    return Response(
+                        {"detail": "appointment_ids must be a list of numbers."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if not requested_ids:
+                    return Response(
+                        {"detail": "appointment_ids cannot be empty."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+            appt = get_object_or_404(
+                Appointment.objects.select_related("patient", "provider", "booked_service"),
+                pk=primary_id,
+            )
+            phone = request.data.get("phone")
+            if phone:
+                valid, msg = validate_phone(phone)
+                if not valid:
+                    return Response({"detail": msg}, status=status.HTTP_400_BAD_REQUEST)
+                if not patient_matches_phone_normalized(appt.patient, normalize_phone(phone)):
+                    return Response(
+                        {"detail": "This appointment does not match that phone number."},
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+            today = today_clinic()
+            if appt.appointment_date != today:
                 return Response(
-                    {"detail": "This appointment does not match that phone number."},
-                    status=status.HTTP_403_FORBIDDEN,
+                    {"detail": "Check-in is only available on the day of your appointment."},
+                    status=status.HTTP_400_BAD_REQUEST,
                 )
-        today = today_clinic()
-        if appt.appointment_date != today:
-            return Response(
-                {"detail": "Check-in is only available on the day of your appointment."},
-                status=status.HTTP_400_BAD_REQUEST,
+            bypass_early = not phone and self._desk_can_bypass_kiosk_early_window(request)
+
+            targets, err = self._kiosk_resolve_checkin_targets(
+                appt,
+                requested_ids=requested_ids,
+                bypass_early=bypass_early,
             )
-        bypass_early = not phone and self._desk_can_bypass_kiosk_early_window(request)
+            if err:
+                return Response({"detail": err}, status=status.HTTP_400_BAD_REQUEST)
 
-        targets, err = self._kiosk_resolve_checkin_targets(
-            appt,
-            requested_ids=requested_ids,
-            bypass_early=bypass_early,
-        )
-        if err:
-            return Response({"detail": err}, status=status.HTTP_400_BAD_REQUEST)
+            now = timezone.now()
+            checked_ids: list[int] = []
+            early_err: str | None = None
 
-        target_ids = [t.id for t in targets]
-        now = timezone.now()
-        checked_rows: list[Appointment] = []
-        conflict = False
-        early_err: str | None = None
+            def after_checkin_side_effects(appointment_id: int) -> None:
+                try:
+                    from apps.notifications.tasks import notify_provider_patient_checked_in_task
 
-        with transaction.atomic():
-            locked = list(
-                Appointment.objects.select_for_update()
-                .filter(pk__in=target_ids)
-                .select_related("patient", "provider", "booked_service")
-                .order_by("start_time", "pk")
-            )
-            if len(locked) != len(set(target_ids)):
-                conflict = True
-            elif not bypass_early:
-                for visit in locked:
-                    if visit.status != Appointment.Status.BOOKED:
-                        continue
-                    allowed, _, earliest_local = self._can_kiosk_checkin_now(visit)
-                    if not allowed:
-                        minutes = self._kiosk_minutes_before()
-                        earliest_disp = (
-                            format_time_12h(earliest_local.time()) if earliest_local else ""
-                        )
-                        early_err = (
-                            f"It is too early for kiosk check-in. You can check in up to {minutes} minutes "
-                            f"before this appointment"
-                            + (f" (opens around {earliest_disp})" if earliest_disp else "")
-                            + ", or ask the front desk."
-                        )
+                    notify_provider_patient_checked_in_task.delay(appointment_id)
+                except Exception:
+                    checkin_logger.exception(
+                        "check-in: failed to queue provider SMS for appointment %s",
+                        appointment_id,
+                    )
+                try:
+                    from apps.clinic.in_app_notify import create_checkin_in_app_notification
+
+                    create_checkin_in_app_notification(appointment_id)
+                except Exception:
+                    checkin_logger.exception(
+                        "check-in: failed in-app notification for appointment %s",
+                        appointment_id,
+                    )
+
+            with transaction.atomic():
+                for visit in targets:
+                    if early_err:
                         break
-            if not conflict and not early_err:
-                for visit in locked:
                     if visit.status in (
                         Appointment.Status.CANCELLED,
                         Appointment.Status.NO_SHOW,
@@ -5695,95 +5694,85 @@ class KioskViewSet(viewsets.ViewSet):
                         continue
                     if visit.status != Appointment.Status.BOOKED:
                         continue
-                    visit.status = Appointment.Status.CHECKED_IN
-                    visit.checked_in_at = now
-                    visit.save(update_fields=["status", "checked_in_at", "updated_at"])
-                    checked_rows.append(visit)
+                    if not bypass_early:
+                        allowed, _, earliest_local = self._can_kiosk_checkin_now(visit)
+                        if not allowed:
+                            minutes = self._kiosk_minutes_before()
+                            earliest_disp = (
+                                format_time_12h(earliest_local.time()) if earliest_local else ""
+                            )
+                            early_err = (
+                                f"It is too early for kiosk check-in. You can check in up to {minutes} minutes "
+                                f"before this appointment"
+                                + (f" (opens around {earliest_disp})" if earliest_disp else "")
+                                + ", or ask the front desk."
+                            )
+                            break
+                    locked = (
+                        Appointment.objects.select_for_update()
+                        .select_related("patient", "provider", "booked_service")
+                        .filter(pk=visit.pk, status=Appointment.Status.BOOKED)
+                        .first()
+                    )
+                    if not locked:
+                        continue
+                    locked.status = Appointment.Status.CHECKED_IN
+                    locked.checked_in_at = now
+                    locked.save(update_fields=["status", "checked_in_at", "updated_at"])
+                    checked_ids.append(locked.id)
+                    aid = locked.id
+                    transaction.on_commit(lambda aid=aid: after_checkin_side_effects(aid))
 
-        if conflict:
-            return Response(
-                {"detail": "Appointment could not be found or was updated. Please try again."},
-                status=status.HTTP_409_CONFLICT,
-            )
-        if early_err:
-            return Response({"detail": early_err}, status=status.HTTP_400_BAD_REQUEST)
+            if early_err:
+                return Response({"detail": early_err}, status=status.HTTP_400_BAD_REQUEST)
 
-        if not checked_rows:
-            return Response(
-                {"detail": "Check-in is already done or this visit is in progress."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        checked_ids = [a.id for a in checked_rows]
-
-        import logging
-
-        checkin_logger = logging.getLogger(__name__)
-
-        def after_checkin_side_effects(appointment_id: int) -> None:
-            try:
-                from apps.notifications.tasks import notify_provider_patient_checked_in_task
-
-                notify_provider_patient_checked_in_task.delay(appointment_id)
-            except Exception:
-                checkin_logger.exception(
-                    "check-in: failed to queue provider SMS for appointment %s",
-                    appointment_id,
-                )
-            try:
-                from apps.clinic.in_app_notify import create_checkin_in_app_notification
-
-                create_checkin_in_app_notification(appointment_id)
-            except Exception:
-                checkin_logger.exception(
-                    "check-in: failed in-app notification for appointment %s",
-                    appointment_id,
-                )
-
-        for aid in checked_ids:
-            transaction.on_commit(lambda aid=aid: after_checkin_side_effects(aid))
-
-        count = len(checked_ids)
-        lead = checked_rows[0]
-        patient_name = f"{lead.patient.first_name} {lead.patient.last_name}".strip()
-        service = (lead.booked_service.name if lead.booked_service else "").strip()
-        time_disp = format_time_12h(lead.start_time)
-        if service:
-            detail = f"Checked in for {service} at {time_disp}"
-        else:
-            detail = f"Checked in for {time_disp}"
-        if patient_name:
-            detail += f" — {patient_name}"
-        detail += "."
-
-        refreshed = list(
-            Appointment.objects.filter(pk__in=checked_ids).select_related("booked_service")
-        )
-        appointments_payload = []
-        for row in sorted(refreshed, key=lambda a: (a.start_time, a.pk)):
-            if row.status != Appointment.Status.CHECKED_IN or not row.checked_in_at:
-                checkin_logger.error("check-in: appointment %s not persisted as checked_in", row.pk)
+            if not checked_ids:
                 return Response(
-                    {"detail": "Check-in could not be saved. Please see the front desk."},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    {"detail": "Check-in is already done or this visit is in progress."},
+                    status=status.HTTP_400_BAD_REQUEST,
                 )
-            svc = (row.booked_service.name if row.booked_service else "").strip()
-            appointments_payload.append(
+
+            lead = (
+                Appointment.objects.select_related("patient", "booked_service")
+                .filter(pk=checked_ids[0])
+                .first()
+            ) or appt
+            patient_name = f"{lead.patient.first_name} {lead.patient.last_name}".strip()
+            service = (lead.booked_service.name if lead.booked_service else "").strip()
+            time_disp = format_time_12h(lead.start_time)
+            if service:
+                detail = f"Checked in for {service} at {time_disp}"
+            else:
+                detail = f"Checked in for {time_disp}"
+            if patient_name:
+                detail += f" — {patient_name}"
+            detail += "."
+
+            appointments_payload = []
+            for row in Appointment.objects.filter(pk__in=checked_ids).select_related("booked_service"):
+                svc = (row.booked_service.name if row.booked_service else "").strip()
+                appointments_payload.append(
+                    {
+                        "appointment_id": row.id,
+                        "status": row.status,
+                        "checked_in_at": row.checked_in_at.isoformat() if row.checked_in_at else "",
+                        "service_name": svc,
+                        "start_time_display": format_time_12h(row.start_time),
+                    }
+                )
+
+            return Response(
                 {
-                    "appointment_id": row.id,
-                    "status": row.status,
-                    "checked_in_at": row.checked_in_at.isoformat(),
-                    "service_name": svc,
-                    "start_time_display": format_time_12h(row.start_time),
+                    "detail": detail,
+                    "status": Appointment.Status.CHECKED_IN,
+                    "checked_in_count": len(checked_ids),
+                    "appointment_ids": checked_ids,
+                    "appointments": appointments_payload,
                 }
             )
-
-        return Response(
-            {
-                "detail": detail,
-                "status": Appointment.Status.CHECKED_IN,
-                "checked_in_count": count,
-                "appointment_ids": checked_ids,
-                "appointments": appointments_payload,
-            }
-        )
+        except Exception:
+            checkin_logger.exception("kiosk checkin failed")
+            return Response(
+                {"detail": "Check-in could not be completed. Please try again or see the front desk."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
