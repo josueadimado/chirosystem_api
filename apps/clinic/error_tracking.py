@@ -206,6 +206,195 @@ def build_error_fingerprint(
     return hashlib.sha256(base.encode("utf-8")).hexdigest()[:40]
 
 
+def _fingerprint_filter(fingerprint: str):
+    from apps.clinic.models import SystemErrorLog
+
+    if fingerprint:
+        return SystemErrorLog.objects.filter(fingerprint=fingerprint)
+    return SystemErrorLog.objects.none()
+
+
+def fingerprint_occurrence_stats(row) -> dict:
+    """Count and date range for all rows sharing this error fingerprint."""
+    from django.db.models import Count, Min, Max
+
+    from apps.clinic.models import SystemErrorLog
+
+    if not row.fingerprint:
+        return {
+            "count": 1,
+            "first_at": row.created_at,
+            "last_at": row.created_at,
+        }
+    agg = SystemErrorLog.objects.filter(fingerprint=row.fingerprint).aggregate(
+        count=Count("pk"),
+        first_at=Min("created_at"),
+        last_at=Max("created_at"),
+    )
+    return {
+        "count": agg["count"] or 1,
+        "first_at": agg["first_at"] or row.created_at,
+        "last_at": agg["last_at"] or row.created_at,
+    }
+
+
+def fingerprint_occurrence_history(row, *, limit: int = 15) -> list[dict]:
+    """Recent occurrences for the same fingerprint (newest first)."""
+    if not row.fingerprint:
+        return [
+            {
+                "id": row.pk,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "path": row.path,
+                "http_method": row.http_method,
+                "user_display": row.user_display,
+                "auto_reopened": bool((row.extra or {}).get("auto_reopened")),
+            }
+        ]
+    rows = (
+        _fingerprint_filter(row.fingerprint)
+        .order_by("-created_at")
+        .values("id", "created_at", "path", "http_method", "user_display", "extra")[:limit]
+    )
+    out = []
+    for item in rows:
+        extra = item.get("extra") or {}
+        out.append(
+            {
+                "id": item["id"],
+                "created_at": item["created_at"].isoformat() if item["created_at"] else None,
+                "path": item["path"],
+                "http_method": item["http_method"],
+                "user_display": item["user_display"],
+                "auto_reopened": bool(extra.get("auto_reopened")),
+            }
+        )
+    return out
+
+
+def build_error_log_groups_queryset(*, resolved: str = "", source: str = "", search: str = ""):
+    """
+    One row per error fingerprint (latest occurrence), with occurrence_count annotated.
+    Rows without a fingerprint are listed individually.
+    """
+    from django.db.models import Case, CharField, Count, F, Min, OuterRef, Q, Subquery, Value, When, Window
+    from django.db.models.functions import Cast, Coalesce, NullIf, RowNumber
+
+    from apps.clinic.models import SystemErrorLog
+
+    base = SystemErrorLog.objects.all()
+    if source:
+        base = base.filter(source=source)
+    if search:
+        base = base.filter(
+            Q(message__icontains=search)
+            | Q(path__icontains=search)
+            | Q(exception_type__icontains=search)
+        )
+
+    base = base.annotate(
+        group_key=Coalesce(
+            NullIf(F("fingerprint"), Value("")),
+            Cast(F("pk"), CharField()),
+        )
+    )
+
+    ranked = base.annotate(
+        row_num=Window(
+            expression=RowNumber(),
+            partition_by=[F("group_key")],
+            order_by=F("created_at").desc(),
+        )
+    ).filter(row_num=1)
+
+    if resolved == "true":
+        ranked = ranked.filter(resolved_at__isnull=False)
+    elif resolved == "false":
+        ranked = ranked.filter(resolved_at__isnull=True)
+
+    count_subq = (
+        SystemErrorLog.objects.filter(fingerprint=OuterRef("fingerprint"))
+        .values("fingerprint")
+        .annotate(c=Count("pk"))
+        .values("c")[:1]
+    )
+    first_subq = (
+        SystemErrorLog.objects.filter(fingerprint=OuterRef("fingerprint"))
+        .values("fingerprint")
+        .annotate(first_at=Min("created_at"))
+        .values("first_at")[:1]
+    )
+
+    return ranked.annotate(
+        occurrence_count=Case(
+            When(fingerprint="", then=Value(1)),
+            default=Subquery(count_subq),
+        ),
+        first_occurrence_at=Case(
+            When(fingerprint="", then=F("created_at")),
+            default=Subquery(first_subq),
+        ),
+    ).order_by("-created_at")
+
+
+def count_open_error_groups() -> int:
+    return build_error_log_groups_queryset(resolved="false").count()
+
+
+def _maybe_auto_reopen_resolved_fingerprint(row) -> bool:
+    """
+    If this fingerprint was marked resolved and the same error happens again,
+    reopen the whole group so it shows up as open in the tracker.
+    """
+    from apps.clinic.models import SystemErrorLog
+
+    if not row.fingerprint:
+        return False
+
+    prior = (
+        SystemErrorLog.objects.filter(fingerprint=row.fingerprint)
+        .exclude(pk=row.pk)
+        .order_by("-created_at")
+        .first()
+    )
+    if not prior or prior.resolved_at is None:
+        return False
+
+    SystemErrorLog.objects.filter(fingerprint=row.fingerprint).update(
+        resolved_at=None,
+        resolved_by_id=None,
+        resolution_notes="",
+    )
+
+    extra = dict(row.extra or {})
+    extra["auto_reopened"] = True
+    extra["auto_reopened_at"] = timezone.now().isoformat()
+    row.extra = extra
+    row.save(update_fields=["extra", "updated_at"])
+    return True
+
+
+def resolve_error_log_group(row, *, resolved_by_id: int, resolution_notes: str = "") -> None:
+    """Mark every occurrence of this fingerprint as resolved."""
+    notes = (resolution_notes or "").strip()
+    qs = _fingerprint_filter(row.fingerprint) if row.fingerprint else SystemErrorLog.objects.filter(pk=row.pk)
+    qs.update(
+        resolved_at=timezone.now(),
+        resolved_by_id=resolved_by_id,
+        resolution_notes=notes,
+    )
+
+
+def reopen_error_log_group(row) -> None:
+    """Reopen every occurrence of this fingerprint."""
+    qs = _fingerprint_filter(row.fingerprint) if row.fingerprint else SystemErrorLog.objects.filter(pk=row.pk)
+    qs.update(
+        resolved_at=None,
+        resolved_by_id=None,
+        resolution_notes="",
+    )
+
+
 def capture_application_error(
     *,
     exc: BaseException | None = None,
@@ -269,6 +458,10 @@ def capture_application_error(
             extra=extra or {},
             fingerprint=fingerprint,
         )
+        try:
+            _maybe_auto_reopen_resolved_fingerprint(row)
+        except Exception:
+            logger.exception("error tracker: auto-reopen failed for fingerprint %s", fingerprint)
         return row.pk
     except Exception:
         logger.exception("Could not save SystemErrorLog row")

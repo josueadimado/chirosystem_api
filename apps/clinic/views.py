@@ -85,6 +85,7 @@ from .serializers import (
     VisitSerializer,
     VoiceCallLogSerializer,
     SystemErrorLogDetailSerializer,
+    SystemErrorLogGroupListSerializer,
     SystemErrorLogListSerializer,
     complete_visit_with_services,
     revise_unpaid_visit_billing,
@@ -3714,21 +3715,11 @@ class AdminViewSet(viewsets.ViewSet):
         source = (request.query_params.get("source") or "").strip()
         search = (request.query_params.get("search") or "").strip()
 
-        qs = SystemErrorLog.objects.all().order_by("-created_at")
-        if resolved == "true":
-            qs = qs.exclude(resolved_at__isnull=True)
-        elif resolved == "false":
-            qs = qs.filter(resolved_at__isnull=True)
-        if source:
-            qs = qs.filter(source=source)
-        if search:
-            qs = qs.filter(
-                Q(message__icontains=search)
-                | Q(path__icontains=search)
-                | Q(exception_type__icontains=search)
-            )
+        from apps.clinic.error_tracking import build_error_log_groups_queryset, count_open_error_groups
+
+        qs = build_error_log_groups_queryset(resolved=resolved, source=source, search=search)
         total = qs.count()
-        open_count = SystemErrorLog.objects.filter(resolved_at__isnull=True).count()
+        open_count = count_open_error_groups()
         rows = qs[offset : offset + limit]
         return Response(
             {
@@ -3736,7 +3727,7 @@ class AdminViewSet(viewsets.ViewSet):
                 "open_count": open_count,
                 "offset": offset,
                 "limit": limit,
-                "results": SystemErrorLogListSerializer(rows, many=True).data,
+                "results": SystemErrorLogGroupListSerializer(rows, many=True).data,
             }
         )
 
@@ -3750,7 +3741,16 @@ class AdminViewSet(viewsets.ViewSet):
         except (TypeError, ValueError):
             return Response({"detail": "id is required."}, status=status.HTTP_400_BAD_REQUEST)
         row = get_object_or_404(SystemErrorLog, pk=log_id)
-        return Response(SystemErrorLogDetailSerializer(row).data)
+        from apps.clinic.error_tracking import fingerprint_occurrence_history, fingerprint_occurrence_stats
+
+        stats = fingerprint_occurrence_stats(row)
+        data = SystemErrorLogDetailSerializer(row).data
+        data["occurrence_count"] = stats["count"]
+        data["first_occurrence_at"] = stats["first_at"]
+        data["last_occurrence_at"] = stats["last_at"]
+        data["auto_reopened"] = bool((row.extra or {}).get("auto_reopened"))
+        data["occurrence_history"] = fingerprint_occurrence_history(row, limit=15)
+        return Response(data)
 
     @action(detail=False, methods=["patch"], url_path="error_log_resolve")
     def error_log_resolve(self, request):
@@ -3762,20 +3762,25 @@ class AdminViewSet(viewsets.ViewSet):
         except (TypeError, ValueError):
             return Response({"detail": "id is required."}, status=status.HTTP_400_BAD_REQUEST)
         row = get_object_or_404(SystemErrorLog, pk=log_id)
+        from apps.clinic.error_tracking import reopen_error_log_group, resolve_error_log_group
+
         if request.data.get("reopen"):
-            row.resolved_at = None
-            row.resolved_by_id = None
-            row.resolution_notes = ""
-            row.save(update_fields=["resolved_at", "resolved_by_id", "resolution_notes", "updated_at"])
+            reopen_error_log_group(row)
+            row.refresh_from_db()
         else:
             notes = str(request.data.get("resolution_notes") or "").strip()
-            row.resolved_at = timezone.now()
-            row.resolved_by_id = request.user.pk
-            row.resolution_notes = notes
-            row.save(
-                update_fields=["resolved_at", "resolved_by_id", "resolution_notes", "updated_at"]
-            )
-        return Response(SystemErrorLogDetailSerializer(row).data)
+            resolve_error_log_group(row, resolved_by_id=request.user.pk, resolution_notes=notes)
+            row.refresh_from_db()
+        from apps.clinic.error_tracking import fingerprint_occurrence_history, fingerprint_occurrence_stats
+
+        stats = fingerprint_occurrence_stats(row)
+        data = SystemErrorLogDetailSerializer(row).data
+        data["occurrence_count"] = stats["count"]
+        data["first_occurrence_at"] = stats["first_at"]
+        data["last_occurrence_at"] = stats["last_at"]
+        data["auto_reopened"] = bool((row.extra or {}).get("auto_reopened"))
+        data["occurrence_history"] = fingerprint_occurrence_history(row, limit=15)
+        return Response(data)
 
     @action(detail=False, methods=["get", "patch"], url_path="clinic_profile")
     def clinic_profile(self, request):

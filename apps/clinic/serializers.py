@@ -441,6 +441,24 @@ class SystemErrorLogListSerializer(serializers.ModelSerializer):
         )
 
 
+class SystemErrorLogGroupListSerializer(SystemErrorLogListSerializer):
+    """Latest row per fingerprint, with how many times that error occurred."""
+
+    occurrence_count = serializers.IntegerField(read_only=True)
+    first_occurrence_at = serializers.DateTimeField(read_only=True)
+    auto_reopened = serializers.SerializerMethodField()
+
+    class Meta(SystemErrorLogListSerializer.Meta):
+        fields = SystemErrorLogListSerializer.Meta.fields + (
+            "occurrence_count",
+            "first_occurrence_at",
+            "auto_reopened",
+        )
+
+    def get_auto_reopened(self, obj) -> bool:
+        return bool((obj.extra or {}).get("auto_reopened"))
+
+
 class SystemErrorLogDetailSerializer(SystemErrorLogListSerializer):
     class Meta(SystemErrorLogListSerializer.Meta):
         fields = SystemErrorLogListSerializer.Meta.fields + (
