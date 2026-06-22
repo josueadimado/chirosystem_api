@@ -788,6 +788,12 @@ class ClinicSettings(TimeStampedModel):
         default=60,
         help_text="Minutes after scheduled start before auto no-show runs.",
     )
+    error_tracker_password_hash = models.CharField(
+        max_length=128,
+        blank=True,
+        default="",
+        help_text="Hashed password for the owner-only admin error tracker page.",
+    )
 
     class Meta:
         verbose_name_plural = "Clinic settings"

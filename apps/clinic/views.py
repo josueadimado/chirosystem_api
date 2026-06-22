@@ -3554,8 +3554,8 @@ class AdminViewSet(viewsets.ViewSet):
             return Response(
                 {
                     "detail": (
-                        "Error tracker password is not configured on the server. "
-                        "Set ERROR_TRACKER_PASSWORD in the API environment."
+                        "Error tracker password is not configured yet. "
+                        "Choose a password on the Error tracker page, or set ERROR_TRACKER_PASSWORD in the API environment."
                     ),
                 },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -3587,7 +3587,7 @@ class AdminViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"], url_path="error_tracker_unlock")
     def error_tracker_unlock(self, request):
-        """Verify ERROR_TRACKER_PASSWORD and return a short-lived access token."""
+        """Verify error tracker password and return a short-lived access token."""
         from apps.clinic.error_tracking import (
             error_tracker_password_configured,
             error_tracker_password_ok,
@@ -3601,8 +3601,8 @@ class AdminViewSet(viewsets.ViewSet):
             return Response(
                 {
                     "detail": (
-                        "Error tracker password is not configured on the server. "
-                        "Set ERROR_TRACKER_PASSWORD in the API environment."
+                        "Error tracker password is not configured yet. "
+                        "Choose a password on the Error tracker page, or set ERROR_TRACKER_PASSWORD in the API environment."
                     ),
                 },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -3613,6 +3613,57 @@ class AdminViewSet(viewsets.ViewSet):
         token = issue_error_tracker_token(request.user.pk)
         return Response(
             {
+                "token": token,
+                "expires_in": int(getattr(settings, "ERROR_TRACKER_TOKEN_MAX_AGE", 8 * 3600)),
+            }
+        )
+
+    @action(detail=False, methods=["post"], url_path="error_tracker_configure")
+    def error_tracker_configure(self, request):
+        """First-time setup: owner chooses the error tracker password (saved hashed in DB)."""
+        from apps.clinic.error_tracking import (
+            _env_error_tracker_password,
+            error_tracker_password_configured,
+            issue_error_tracker_token,
+            set_error_tracker_password_in_db,
+        )
+
+        denied = self._error_tracker_owner_only(request)
+        if denied:
+            return denied
+        if _env_error_tracker_password():
+            return Response(
+                {
+                    "detail": (
+                        "The API already uses ERROR_TRACKER_PASSWORD from the server environment. "
+                        "Use that password to unlock this page."
+                    ),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        password = str(request.data.get("password") or "")
+        confirm = str(request.data.get("confirm_password") or request.data.get("password_confirm") or "")
+        if len(password) < 8:
+            return Response(
+                {"detail": "Choose a password at least 8 characters long."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if password != confirm:
+            return Response(
+                {"detail": "Passwords do not match."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        set_error_tracker_password_in_db(password)
+        if not error_tracker_password_configured():
+            return Response(
+                {"detail": "Password could not be saved. Run API migrations and try again."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        token = issue_error_tracker_token(request.user.pk)
+        return Response(
+            {
+                "detail": "Error tracker password saved.",
+                "configured": True,
                 "token": token,
                 "expires_in": int(getattr(settings, "ERROR_TRACKER_TOKEN_MAX_AGE", 8 * 3600)),
             }

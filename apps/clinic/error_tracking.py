@@ -37,19 +37,50 @@ _SENSITIVE_KEYS = frozenset(
 )
 
 
+def _env_error_tracker_password() -> str:
+    return (getattr(settings, "ERROR_TRACKER_PASSWORD", "") or "").strip()
+
+
+def _db_error_tracker_password_hash() -> str:
+    try:
+        from apps.clinic.models import ClinicSettings
+
+        solo = ClinicSettings.get_cached()
+        return (solo.error_tracker_password_hash or "").strip()
+    except Exception:
+        logger.exception("error tracker: could not read ClinicSettings password hash")
+        return ""
+
+
 def error_tracker_password_configured() -> bool:
-    return bool((getattr(settings, "ERROR_TRACKER_PASSWORD", "") or "").strip())
+    """True when env password or a saved owner-chosen password exists."""
+    return bool(_env_error_tracker_password() or _db_error_tracker_password_hash())
 
 
 def error_tracker_password_ok(password: str) -> bool:
-    expected = (getattr(settings, "ERROR_TRACKER_PASSWORD", "") or "").strip()
-    if not expected:
-        return False
-    # Constant-time compare without importing secrets in hot path for tiny strings is fine;
-    # use hmac for parity with Django auth patterns.
     import hmac
 
-    return hmac.compare_digest(str(password or ""), expected)
+    from django.contrib.auth.hashers import check_password
+
+    supplied = str(password or "")
+    env_password = _env_error_tracker_password()
+    if env_password:
+        return hmac.compare_digest(supplied, env_password)
+    stored_hash = _db_error_tracker_password_hash()
+    if stored_hash:
+        return check_password(supplied, stored_hash)
+    return False
+
+
+def set_error_tracker_password_in_db(password: str) -> None:
+    """Owner setup: store a hashed password in ClinicSettings (used when env var is unset)."""
+    from django.contrib.auth.hashers import make_password
+
+    from apps.clinic.models import ClinicSettings
+
+    solo = ClinicSettings.get_solo()
+    solo.error_tracker_password_hash = make_password(password)
+    solo.save(update_fields=["error_tracker_password_hash", "updated_at"])
 
 
 def issue_error_tracker_token(user_id: int) -> str:
