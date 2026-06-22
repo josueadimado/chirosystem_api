@@ -8,6 +8,7 @@ from django.utils import timezone
 
 from .doctor_dashboard_schedule_sort import sort_doctor_dashboard_appointments
 from .models import Appointment, Invoice, Visit
+from .square_helpers import patient_saved_card_display
 
 
 def _parse_date_param(value: str | None):
@@ -107,6 +108,10 @@ def serialize_doctor_dashboard_appointments(appt_list: list[Appointment]) -> lis
             "visit_id": v.id if v else None,
             "card_last4": a.patient.card_last4 or "",
             "card_brand": a.patient.card_brand or "",
+            **{
+                k: patient_saved_card_display(a.patient)[k]
+                for k in ("has_saved_card", "has_chargeable_saved_card", "card_display_only")
+            },
             "patient_payment_profile": (a.patient.payment_profile or "").strip(),
             "patient_balance_due": balance_by_patient.get(a.patient_id, "0.00"),
         }

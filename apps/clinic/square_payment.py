@@ -84,6 +84,7 @@ def mark_invoice_paid_from_square(
     square_payment_id: str,
     *,
     payment_reference: str | None = None,
+    amount: Decimal | None = None,
 ) -> bool:
     """
     Record a successful Square payment and close the invoice + appointment.
@@ -117,10 +118,11 @@ def mark_invoice_paid_from_square(
                 )
                 return False
         else:
+            pay_amount = amount if amount is not None else inv.total_amount
             Payment.objects.create(
                 invoice=inv,
                 patient=inv.patient,
-                amount=inv.total_amount,
+                amount=pay_amount,
                 payment_method=Payment.Method.CARD,
                 payment_reference=ref,
                 status=Payment.Status.SUCCESSFUL,
@@ -632,6 +634,25 @@ def _money_cents(invoice: Invoice) -> int:
     return int(Decimal(invoice.total_amount) * 100)
 
 
+def _invoice_amount_due_cents(invoice: Invoice) -> int:
+    """Cents still owed after prior cash/card payments on this invoice."""
+    from .invoice_collection import invoice_amount_due
+
+    due = invoice_amount_due(invoice)
+    return int((due * 100).quantize(Decimal("1")))
+
+
+def _square_payment_error_message(errors) -> str:
+    if not errors:
+        return "payment failed"
+    err = errors[0]
+    code = (getattr(err, "code", None) or "").strip()
+    detail = (getattr(err, "detail", None) or str(err) or "payment failed").strip()
+    if code and detail and code not in detail:
+        return f"{detail} ({code})"[:500]
+    return detail[:500] if detail else (code[:500] if code else "payment failed")
+
+
 def build_credit_topup_reference(*, patient_id: int, amount_cents: int) -> str:
     nonce = uuid.uuid4().hex[:8]
     return f"{_CREDIT_TOPUP_REF_PREFIX}{int(patient_id)}_{int(amount_cents)}_{nonce}"[:40]
@@ -690,6 +711,34 @@ def apply_credit_topup_from_square_payment(
     return True
 
 
+def charge_saved_card_error_message(error_code: str | None) -> str:
+    """Plain-language message for staff when auto-charge fails."""
+    code = (error_code or "").strip()
+    if code == "no_saved_card":
+        return (
+            "No chargeable card on file in Square. Open the patient chart, go to Payment card, "
+            "and save the card again — even if you already see last four digits."
+        )
+    if code == "card_on_file_not_chargeable":
+        return (
+            "This patient shows a card ending on file, but Square is not linked for charging. "
+            "Re-save the card in the patient chart, then try Retry saved card."
+        )
+    if code == "amount_below_minimum":
+        return "The amount due is under $1.00. Use cash, Square Terminal, or the desk pay screen."
+    if code == "nothing_due":
+        return "Nothing is owed on this invoice — refresh the page or use Check Square if payment already went through."
+    if code == "square_not_configured":
+        return "Square payments are not configured. Connect Square in Admin Settings."
+    if code == "square_location_not_configured":
+        return "Square location is not configured on the server. Ask your administrator to check Square settings."
+    if code.startswith("payment_status_"):
+        return f"Square did not complete the charge (status: {code.replace('payment_status_', '')}). Try Terminal or desk checkout."
+    if code:
+        return code
+    return "Could not charge the saved card. Try Square Terminal or the desk pay screen."
+
+
 def try_charge_saved_card(invoice: Invoice) -> dict:
     """
     Charge the patient's Square card on file (card-present not required).
@@ -698,36 +747,59 @@ def try_charge_saved_card(invoice: Invoice) -> dict:
     """
     from square.requests.money import MoneyParams
 
+    from .square_helpers import resolve_chargeable_card_for_patient
+
     patient = invoice.patient
-    if not patient.square_customer_id or not patient.square_card_id:
-        return {"ok": False, "error": "no_saved_card", "payment_intent_id": None}
+    card_id, customer_id, card_err = resolve_chargeable_card_for_patient(patient)
+    if card_err or not card_id or not customer_id:
+        err = card_err or (
+            "card_on_file_not_chargeable" if (patient.card_last4 or "").strip() else "no_saved_card"
+        )
+        return {"ok": False, "error": err, "payment_intent_id": None}
 
     loc = get_location_id()
     if not loc:
         return {"ok": False, "error": "square_location_not_configured", "payment_intent_id": None}
 
-    amount_cents = _money_cents(invoice)
+    amount_cents = _invoice_amount_due_cents(invoice)
+    if amount_cents <= 0:
+        return {"ok": False, "error": "nothing_due", "payment_intent_id": None}
     if amount_cents < _MIN_AMOUNT_CENTS:
         return {"ok": False, "error": "amount_below_minimum", "payment_intent_id": None}
+
+    charged_amount = (Decimal(amount_cents) / Decimal("100")).quantize(Decimal("0.01"))
 
     client = get_square_client()
     try:
         res = client.payments.create(
-            source_id=patient.square_card_id,
+            source_id=card_id,
             idempotency_key=str(uuid.uuid4()),
             amount_money=MoneyParams(amount=amount_cents, currency="USD"),
-            customer_id=patient.square_customer_id,
+            customer_id=customer_id,
             location_id=loc,
             reference_id=str(invoice.id)[:40],
             autocomplete=True,
             note=f"Invoice {invoice.invoice_number}",
         )
         if res.errors:
-            err = res.errors[0].detail if res.errors else "payment failed"
-            return {"ok": False, "error": err[:500], "payment_intent_id": None}
+            return {"ok": False, "error": _square_payment_error_message(res.errors), "payment_intent_id": None}
         pay = res.payment
-        if pay and pay.status == "COMPLETED" and pay.id:
-            mark_invoice_paid_from_square(invoice, pay.id)
+        pay_status = (getattr(pay, "status", None) or "").upper()
+        if pay and pay.id and pay_status in ("COMPLETED", "APPROVED", "CAPTURED"):
+            if not mark_invoice_paid_from_square(invoice, pay.id, amount=charged_amount):
+                logger.error(
+                    "Square charge succeeded (payment %s) but invoice %s could not be marked paid",
+                    pay.id,
+                    invoice.pk,
+                )
+                return {
+                    "ok": False,
+                    "error": (
+                        "Square charged the card but the invoice could not be updated. "
+                        "Use Check Square (any device) before trying again."
+                    ),
+                    "payment_intent_id": pay.id,
+                }
             return {"ok": True, "error": None, "payment_intent_id": pay.id}
         return {
             "ok": False,
@@ -1359,6 +1431,7 @@ def build_invoice_payment_followup_dict(invoice: Invoice, *, try_saved_card: boo
                 },
             }
         payment["charge_error"] = charge_result.get("error")
+        payment["charge_error_message"] = charge_saved_card_error_message(charge_result.get("error"))
 
     checkout_url = create_payment_link_for_invoice(invoice, success_url, cancel_url=cancel_url)
     if checkout_url:

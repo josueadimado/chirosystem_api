@@ -13,6 +13,8 @@ from django.conf import settings
 # Used for admin “connection test” HTTP calls; bump occasionally to match Square’s supported versions.
 _SQUARE_API_VERSION = "2024-11-20"
 
+logger = logging.getLogger(__name__)
+
 
 def square_configured() -> bool:
     return bool(os.environ.get("SQUARE_ACCESS_TOKEN", "").strip())
@@ -269,6 +271,113 @@ def get_square_payment_status_for_admin() -> dict:
         "pos_callback_configured": pos_cb_set,
         "square_locations_found": location_ids_count,
     }
+
+
+def patient_has_chargeable_saved_card(patient) -> bool:
+    """True when Square has both customer + card ids needed for card-not-present charges."""
+    return bool(
+        (getattr(patient, "square_customer_id", "") or "").strip()
+        and (getattr(patient, "square_card_id", "") or "").strip()
+    )
+
+
+def patient_saved_card_display(patient) -> dict:
+    """
+    Card-on-file hints for UI.
+    card_last4 may exist without chargeable Square ids (legacy/partial save) — flag that case.
+    """
+    last4 = (getattr(patient, "card_last4", "") or "").strip()
+    brand = (getattr(patient, "card_brand", "") or "").strip()
+    chargeable = patient_has_chargeable_saved_card(patient)
+    return {
+        "card_brand": brand,
+        "card_last4": last4,
+        "has_saved_card": chargeable,
+        "has_chargeable_saved_card": chargeable,
+        "card_display_only": bool(last4 and not chargeable),
+    }
+
+
+def _square_api_error_message(errors) -> str:
+    if not errors:
+        return "Square request failed."
+    err = errors[0]
+    code = (getattr(err, "code", None) or "").strip()
+    detail = (getattr(err, "detail", None) or str(err) or "").strip()
+    if code and detail:
+        return f"{detail} ({code})"
+    return detail or code or "Square request failed."
+
+
+def _persist_patient_square_card(patient, card) -> None:
+    """Update patient row from a Square Card object."""
+    last4 = getattr(card, "last_4", None) or getattr(card, "last4", None)
+    patient.square_card_id = card.id
+    patient.card_brand = (getattr(card, "card_brand", None) or "") or ""
+    patient.card_last4 = (str(last4) if last4 else "")[-4:] if last4 else ""
+    cid = (getattr(card, "customer_id", None) or patient.square_customer_id or "").strip()
+    if cid:
+        patient.square_customer_id = cid
+    patient.save(
+        update_fields=[
+            "square_customer_id",
+            "square_card_id",
+            "card_brand",
+            "card_last4",
+            "updated_at",
+        ]
+    )
+
+
+def resolve_chargeable_card_for_patient(patient) -> tuple[str | None, str | None, str | None]:
+    """
+    Verify the saved card still exists in Square before charging.
+    Returns (card_id, customer_id, error_code).
+    Refreshes stale card ids on the patient when Square has a newer enabled card.
+    """
+    if not square_configured():
+        return None, None, "square_not_configured"
+
+    cid = (getattr(patient, "square_customer_id", "") or "").strip()
+    card_id = (getattr(patient, "square_card_id", "") or "").strip()
+    client = get_square_client()
+
+    def _card_usable(card) -> bool:
+        if not card or not getattr(card, "id", None):
+            return False
+        if getattr(card, "enabled", True) is False:
+            return False
+        return True
+
+    if card_id:
+        try:
+            res = client.cards.get(card_id=card_id)
+            if res.errors:
+                logger.info(
+                    "Square card lookup failed for patient %s card %s: %s",
+                    patient.pk,
+                    card_id,
+                    _square_api_error_message(res.errors),
+                )
+            elif _card_usable(res.card):
+                _persist_patient_square_card(patient, res.card)
+                return patient.square_card_id, patient.square_customer_id, None
+        except Exception as exc:
+            logger.warning("Square card get failed for patient %s: %s", patient.pk, exc)
+
+    if cid:
+        try:
+            pager = client.cards.list(customer_id=cid, include_disabled=False)
+            for card in pager:
+                if _card_usable(card):
+                    _persist_patient_square_card(patient, card)
+                    return patient.square_card_id, patient.square_customer_id, None
+        except Exception as exc:
+            logger.warning("Square card list failed for patient %s: %s", patient.pk, exc)
+
+    if (getattr(patient, "card_last4", "") or "").strip():
+        return None, None, "card_on_file_not_chargeable"
+    return None, None, "no_saved_card"
 
 
 def ensure_square_customer(patient):

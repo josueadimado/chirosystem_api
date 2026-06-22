@@ -98,6 +98,7 @@ from .square_helpers import (
     get_application_id,
     get_location_id,
     get_terminal_device_id,
+    patient_saved_card_display,
     save_card_from_source,
     square_configured,
 )
@@ -670,6 +671,72 @@ def _sync_invoice_payment_api_response(request) -> Response:
     if not inv:
         return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
     return Response(sync_invoice_payment_from_square(inv))
+
+
+def _charge_saved_card_api_response(request) -> Response:
+    """Charge the patient's Square card on file for an open invoice."""
+    from .square_helpers import square_configured
+    from .square_payment import charge_saved_card_error_message, try_charge_saved_card
+
+    invoice_id, err = _parse_invoice_id_from_body(request)
+    if err:
+        return err
+    inv = (
+        Invoice.objects.filter(pk=invoice_id)
+        .select_related("appointment", "patient")
+        .first()
+    )
+    if not inv:
+        return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
+    if inv.status == Invoice.Status.PAID:
+        return Response(
+            {
+                "ok": True,
+                "paid": True,
+                "charged": True,
+                "detail": "Invoice is already marked paid.",
+            }
+        )
+    if not square_configured():
+        return Response(
+            {"detail": "Square payments are not configured. Connect Square in Admin Settings."},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    charge = try_charge_saved_card(inv)
+    inv.refresh_from_db()
+    if charge["ok"]:
+        if inv.appointment_id:
+            inv.appointment.refresh_from_db()
+        return Response(
+            {
+                "ok": True,
+                "paid": True,
+                "charged": True,
+                "detail": f"Saved card charged — {inv.invoice_number} is paid.",
+                "payment_intent_id": charge.get("payment_intent_id"),
+            }
+        )
+    err_raw = charge.get("error") or ""
+    detail = charge_saved_card_error_message(err_raw)
+    if detail == err_raw and err_raw and err_raw not in (
+        "no_saved_card",
+        "card_on_file_not_chargeable",
+        "amount_below_minimum",
+        "nothing_due",
+        "square_not_configured",
+        "square_location_not_configured",
+    ) and not err_raw.startswith("payment_status_"):
+        detail = err_raw
+    return Response(
+        {
+            "ok": False,
+            "paid": False,
+            "charged": False,
+            "detail": detail,
+            "charge_error": err_raw,
+        },
+        status=status.HTTP_400_BAD_REQUEST,
+    )
 
 
 def _confirm_invoice_paid_api_response(request) -> Response:
@@ -1444,9 +1511,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                     "first_name": patient.first_name,
                     "last_name": patient.last_name,
                     "email": patient.email or "",
-                    "has_saved_card": bool(patient.square_card_id and patient.card_last4),
-                    "card_brand": patient.card_brand or "",
-                    "card_last4": patient.card_last4 or "",
+                    **patient_saved_card_display(patient),
                     **chiropractic_intake_context_for_patient(patient),
                 }
             )
@@ -1473,9 +1538,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                     "first_name": p.first_name,
                     "last_name": p.last_name,
                     "email": p.email or "",
-                    "has_saved_card": bool(p.square_card_id and p.card_last4),
-                    "card_brand": p.card_brand or "",
-                    "card_last4": p.card_last4 or "",
+                    **patient_saved_card_display(p),
                     **chiropractic_intake_context_for_patient(p),
                 }
             )
@@ -1962,9 +2025,7 @@ class PatientViewSet(viewsets.ModelViewSet):
         return Response(
             {
                 "detail": "Card saved.",
-                "card_brand": patient.card_brand,
-                "card_last4": patient.card_last4,
-                "has_saved_card": bool(patient.card_last4),
+                **patient_saved_card_display(patient),
             }
         )
 
@@ -4419,6 +4480,11 @@ class AdminViewSet(viewsets.ViewSet):
         """Pull payment status from Square for a stuck awaiting-payment invoice."""
         return _sync_invoice_payment_api_response(request)
 
+    @action(detail=False, methods=["post"], url_path="charge-saved-card")
+    def charge_saved_card(self, request):
+        """Charge the patient's saved card on file for this invoice (owner/staff)."""
+        return _charge_saved_card_api_response(request)
+
     @action(detail=False, methods=["post"], url_path="confirm-invoice-paid")
     def confirm_invoice_paid(self, request):
         """Mark invoice paid when staff verified payment in the Square app (sync could not match)."""
@@ -4496,9 +4562,7 @@ class AdminViewSet(viewsets.ViewSet):
                 "city_state_zip": patient.city_state_zip or "",
                 "emergency_contact_name": patient.emergency_contact_name or "",
                 "emergency_contact_phone": patient.emergency_contact_phone or "",
-                "card_brand": patient.card_brand or "",
-                "card_last4": patient.card_last4 or "",
-                "has_saved_card": bool(patient.card_last4),
+                **patient_saved_card_display(patient),
                 "online_chiro_intake_waived": patient.online_chiro_intake_waived,
                 "payment_profile": (patient.payment_profile or "").strip(),
                 "sms_consent": patient.sms_consent,
@@ -4772,9 +4836,7 @@ class DoctorViewSet(viewsets.ViewSet):
                 "city_state_zip": patient.city_state_zip or "",
                 "emergency_contact_name": patient.emergency_contact_name or "",
                 "emergency_contact_phone": patient.emergency_contact_phone or "",
-                "card_brand": patient.card_brand or "",
-                "card_last4": patient.card_last4 or "",
-                "has_saved_card": bool(patient.card_last4),
+                **patient_saved_card_display(patient),
                 "online_chiro_intake_waived": patient.online_chiro_intake_waived,
                 "payment_profile": (patient.payment_profile or "").strip(),
                 "sms_consent": patient.sms_consent,
@@ -4951,6 +5013,22 @@ class DoctorViewSet(viewsets.ViewSet):
         if not self._get_provider(request):
             return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
         return _sync_invoice_payment_api_response(request)
+
+    @action(detail=False, methods=["post"], url_path="charge-saved-card")
+    def charge_saved_card(self, request):
+        """Charge the patient's saved card on file for this invoice."""
+        provider = self._get_provider(request)
+        if not provider:
+            return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
+        invoice_id, err = _parse_invoice_id_from_body(request)
+        if err:
+            return err
+        inv = Invoice.objects.filter(pk=invoice_id).select_related("appointment").first()
+        if not inv:
+            return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
+        if inv.appointment_id and inv.appointment.provider_id != provider.id:
+            return Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
+        return _charge_saved_card_api_response(request)
 
     @action(detail=False, methods=["get"], url_path="invoice_bill")
     def invoice_bill(self, request):
