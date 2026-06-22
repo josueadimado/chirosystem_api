@@ -3592,11 +3592,8 @@ class AdminViewSet(viewsets.ViewSet):
 
             logging.getLogger(__name__).exception("error_tracker_status failed")
             return Response(
-                {
-                    "configured": False,
-                    "unlocked": False,
-                    "password_source": "none",
-                }
+                {"detail": "Could not load error tracker status."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
     @action(detail=False, methods=["post"], url_path="error_tracker_unlock")
