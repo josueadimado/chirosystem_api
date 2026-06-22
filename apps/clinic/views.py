@@ -2395,6 +2395,18 @@ class AppointmentViewSet(viewsets.ModelViewSet):
 
             svc_span = data.get("booked_service", inst.booked_service)
             prov_for_span = prov_obj if hasattr(prov_obj, "pk") else inst.provider
+            # Only pass previous_end_time for end-only adjustments (extend/shorten on calendar).
+            # Rescheduling to a later slot also changes end_time but must not use extension overlap logic.
+            moving_visit = (
+                merged_date != inst.appointment_date
+                or merged_start != inst.start_time
+                or overlap_pid != inst.provider_id
+            )
+            previous_end_time = (
+                None
+                if moving_visit
+                else (inst.end_time if merged_end != inst.end_time else None)
+            )
             err_span, _is_conflict = validate_appointment_duration_span_for_desk(
                 provider=prov_for_span,
                 service=svc_span,
@@ -2402,7 +2414,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                 start_time=merged_start,
                 end_time=merged_end,
                 exclude_appointment_id=inst.pk,
-                previous_end_time=inst.end_time if merged_end != inst.end_time else None,
+                previous_end_time=previous_end_time,
             )
             if err_span:
                 raise ValidationError({"detail": err_span})
@@ -4878,7 +4890,7 @@ class DoctorViewSet(viewsets.ViewSet):
         )
         if include_pending:
             from .patient_payment_pending import invoice_ids_for_doctor_bundle
-            from .square_payment import try_reconcile_bundle_terminal_payment, try_reconcile_invoice_from_square
+            from .square_payment import try_reconcile_bundle_terminal_payment
 
             bundle_ids = list(invoice_ids_for_doctor_bundle(inv, include_pending_fees=True))
             try_reconcile_bundle_terminal_payment(inv)
