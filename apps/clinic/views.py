@@ -3570,22 +3570,34 @@ class AdminViewSet(viewsets.ViewSet):
     @action(detail=False, methods=["get"], url_path="error_tracker_status")
     def error_tracker_status(self, request):
         """Whether error tracker is configured and this session is unlocked."""
-        from apps.clinic.error_tracking import (
-            error_tracker_password_configured,
-            error_tracker_password_source,
-            request_has_error_tracker_access,
-        )
-
         denied = self._error_tracker_owner_only(request)
         if denied:
             return denied
-        return Response(
-            {
-                "configured": error_tracker_password_configured(),
-                "unlocked": request_has_error_tracker_access(request),
-                "password_source": error_tracker_password_source(),
-            }
-        )
+        try:
+            from apps.clinic.error_tracking import (
+                error_tracker_password_configured,
+                error_tracker_password_source,
+                request_has_error_tracker_access,
+            )
+
+            return Response(
+                {
+                    "configured": error_tracker_password_configured(),
+                    "unlocked": request_has_error_tracker_access(request),
+                    "password_source": error_tracker_password_source(),
+                }
+            )
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception("error_tracker_status failed")
+            return Response(
+                {
+                    "configured": False,
+                    "unlocked": False,
+                    "password_source": "none",
+                }
+            )
 
     @action(detail=False, methods=["post"], url_path="error_tracker_unlock")
     def error_tracker_unlock(self, request):
@@ -3593,6 +3605,7 @@ class AdminViewSet(viewsets.ViewSet):
         from apps.clinic.error_tracking import (
             error_tracker_password_configured,
             error_tracker_password_ok,
+            error_tracker_password_source,
             issue_error_tracker_token,
         )
 
@@ -3617,6 +3630,9 @@ class AdminViewSet(viewsets.ViewSet):
             {
                 "token": token,
                 "expires_in": int(getattr(settings, "ERROR_TRACKER_TOKEN_MAX_AGE", 8 * 3600)),
+                "configured": True,
+                "unlocked": True,
+                "password_source": error_tracker_password_source(),
             }
         )
 

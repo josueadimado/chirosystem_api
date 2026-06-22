@@ -77,10 +77,12 @@ def error_tracker_password_ok(password: str) -> bool:
 
     from django.contrib.auth.hashers import check_password
 
-    supplied = str(password or "")
+    supplied = str(password or "").strip()
+    if not supplied:
+        return False
     env_password = _env_error_tracker_password()
     if env_password:
-        return hmac.compare_digest(supplied, env_password)
+        return hmac.compare_digest(supplied, env_password.strip())
     stored_hash = _db_error_tracker_password_hash()
     if stored_hash:
         return check_password(supplied, stored_hash)

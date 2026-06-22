@@ -3,6 +3,7 @@ from datetime import timedelta
 from pathlib import Path
 import dj_database_url
 from celery.schedules import crontab
+from corsheaders.defaults import default_headers
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEBUG = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes")
@@ -324,6 +325,12 @@ else:
 # ---------------------------------------------------------
 # CORS
 # ---------------------------------------------------------
+# Browser admin app sends X-Error-Tracker-Token after unlock (cross-origin in production).
+CORS_ALLOW_HEADERS = (
+    *default_headers,
+    "x-error-tracker-token",
+)
+
 if DEBUG:
     CORS_ALLOW_ALL_ORIGINS = True
     CORS_ALLOWED_ORIGINS = []
