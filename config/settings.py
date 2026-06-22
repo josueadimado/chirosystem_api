@@ -64,6 +64,7 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "apps.clinic.error_tracking.ErrorCaptureMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -117,6 +118,7 @@ REST_FRAMEWORK = {
         "rest_framework_simplejwt.authentication.JWTAuthentication",
     ),
     "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
+    "EXCEPTION_HANDLER": "apps.clinic.error_tracking.drf_exception_handler",
 }
 
 SPECTACULAR_SETTINGS = {
@@ -187,6 +189,10 @@ else:
 CELERY_TIMEZONE = CLINIC_TIMEZONE
 # Kiosk: earliest patient self-service check-in on the appointment day (minutes before start). Staff desk check-in can be earlier.
 KIOSK_EARLY_CHECKIN_MINUTES_BEFORE = int(os.getenv("KIOSK_EARLY_CHECKIN_MINUTES_BEFORE", "30"))
+# Password for the admin Error Tracker page (/admin/errors). Owner admin must enter this after login.
+ERROR_TRACKER_PASSWORD = os.getenv("ERROR_TRACKER_PASSWORD", "").strip()
+# How long the unlock token stays valid (seconds). Default 8 hours.
+ERROR_TRACKER_TOKEN_MAX_AGE = int(os.getenv("ERROR_TRACKER_TOKEN_MAX_AGE", str(8 * 3600)))
 CELERY_BEAT_SCHEDULE = {
     "send-daily-appointment-sms-reminders": {
         "task": "apps.notifications.tasks.send_daily_appointment_reminders",

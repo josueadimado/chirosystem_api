@@ -34,6 +34,7 @@ from .models import (
     ProviderUnavailability,
     Service,
     StaffNotification,
+    SystemErrorLog,
     Visit,
     VisitRenderedService,
     VoiceCallLog,
@@ -83,6 +84,8 @@ from .serializers import (
     VisitCompleteSerializer,
     VisitSerializer,
     VoiceCallLogSerializer,
+    SystemErrorLogDetailSerializer,
+    SystemErrorLogListSerializer,
     complete_visit_with_services,
     revise_unpaid_visit_billing,
     revise_visit_billing_admin,
@@ -3527,6 +3530,174 @@ class AdminViewSet(viewsets.ViewSet):
         limit = min(int(request.query_params.get("limit", 50)), 100)
         qs = VoiceCallLog.objects.all().order_by("-updated_at")[:limit]
         return Response(VoiceCallLogSerializer(qs, many=True).data)
+
+    def _error_tracker_owner_only(self, request):
+        if getattr(request.user, "role", None) != "owner_admin" and not getattr(
+            request.user, "is_superuser", False
+        ):
+            return Response(
+                {"detail": "Only the clinic owner can access the error tracker."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return None
+
+    def _error_tracker_access(self, request):
+        from apps.clinic.error_tracking import (
+            error_tracker_password_configured,
+            request_has_error_tracker_access,
+        )
+
+        denied = self._error_tracker_owner_only(request)
+        if denied:
+            return denied
+        if not error_tracker_password_configured():
+            return Response(
+                {
+                    "detail": (
+                        "Error tracker password is not configured on the server. "
+                        "Set ERROR_TRACKER_PASSWORD in the API environment."
+                    ),
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        if not request_has_error_tracker_access(request):
+            return Response(
+                {"detail": "Enter the error tracker password to continue."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return None
+
+    @action(detail=False, methods=["get"], url_path="error_tracker_status")
+    def error_tracker_status(self, request):
+        """Whether error tracker is configured and this session is unlocked."""
+        from apps.clinic.error_tracking import (
+            error_tracker_password_configured,
+            request_has_error_tracker_access,
+        )
+
+        denied = self._error_tracker_owner_only(request)
+        if denied:
+            return denied
+        return Response(
+            {
+                "configured": error_tracker_password_configured(),
+                "unlocked": request_has_error_tracker_access(request),
+            }
+        )
+
+    @action(detail=False, methods=["post"], url_path="error_tracker_unlock")
+    def error_tracker_unlock(self, request):
+        """Verify ERROR_TRACKER_PASSWORD and return a short-lived access token."""
+        from apps.clinic.error_tracking import (
+            error_tracker_password_configured,
+            error_tracker_password_ok,
+            issue_error_tracker_token,
+        )
+
+        denied = self._error_tracker_owner_only(request)
+        if denied:
+            return denied
+        if not error_tracker_password_configured():
+            return Response(
+                {
+                    "detail": (
+                        "Error tracker password is not configured on the server. "
+                        "Set ERROR_TRACKER_PASSWORD in the API environment."
+                    ),
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        password = str(request.data.get("password") or "")
+        if not error_tracker_password_ok(password):
+            return Response({"detail": "Incorrect password."}, status=status.HTTP_403_FORBIDDEN)
+        token = issue_error_tracker_token(request.user.pk)
+        return Response(
+            {
+                "token": token,
+                "expires_in": int(getattr(settings, "ERROR_TRACKER_TOKEN_MAX_AGE", 8 * 3600)),
+            }
+        )
+
+    @action(detail=False, methods=["get"], url_path="error_logs")
+    def error_logs(self, request):
+        """Paginated list of captured system errors (password + owner required)."""
+        denied = self._error_tracker_access(request)
+        if denied:
+            return denied
+        try:
+            limit = min(max(int(request.query_params.get("limit", 50)), 1), 200)
+        except (TypeError, ValueError):
+            limit = 50
+        try:
+            offset = max(int(request.query_params.get("offset", 0)), 0)
+        except (TypeError, ValueError):
+            offset = 0
+        resolved = (request.query_params.get("resolved") or "").strip().lower()
+        source = (request.query_params.get("source") or "").strip()
+        search = (request.query_params.get("search") or "").strip()
+
+        qs = SystemErrorLog.objects.all().order_by("-created_at")
+        if resolved == "true":
+            qs = qs.exclude(resolved_at__isnull=True)
+        elif resolved == "false":
+            qs = qs.filter(resolved_at__isnull=True)
+        if source:
+            qs = qs.filter(source=source)
+        if search:
+            qs = qs.filter(
+                Q(message__icontains=search)
+                | Q(path__icontains=search)
+                | Q(exception_type__icontains=search)
+            )
+        total = qs.count()
+        open_count = SystemErrorLog.objects.filter(resolved_at__isnull=True).count()
+        rows = qs[offset : offset + limit]
+        return Response(
+            {
+                "total": total,
+                "open_count": open_count,
+                "offset": offset,
+                "limit": limit,
+                "results": SystemErrorLogListSerializer(rows, many=True).data,
+            }
+        )
+
+    @action(detail=False, methods=["get"], url_path="error_log_detail")
+    def error_log_detail(self, request):
+        denied = self._error_tracker_access(request)
+        if denied:
+            return denied
+        try:
+            log_id = int(request.query_params.get("id", ""))
+        except (TypeError, ValueError):
+            return Response({"detail": "id is required."}, status=status.HTTP_400_BAD_REQUEST)
+        row = get_object_or_404(SystemErrorLog, pk=log_id)
+        return Response(SystemErrorLogDetailSerializer(row).data)
+
+    @action(detail=False, methods=["patch"], url_path="error_log_resolve")
+    def error_log_resolve(self, request):
+        denied = self._error_tracker_access(request)
+        if denied:
+            return denied
+        try:
+            log_id = int(request.data.get("id"))
+        except (TypeError, ValueError):
+            return Response({"detail": "id is required."}, status=status.HTTP_400_BAD_REQUEST)
+        row = get_object_or_404(SystemErrorLog, pk=log_id)
+        if request.data.get("reopen"):
+            row.resolved_at = None
+            row.resolved_by_id = None
+            row.resolution_notes = ""
+            row.save(update_fields=["resolved_at", "resolved_by_id", "resolution_notes", "updated_at"])
+        else:
+            notes = str(request.data.get("resolution_notes") or "").strip()
+            row.resolved_at = timezone.now()
+            row.resolved_by_id = request.user.pk
+            row.resolution_notes = notes
+            row.save(
+                update_fields=["resolved_at", "resolved_by_id", "resolution_notes", "updated_at"]
+            )
+        return Response(SystemErrorLogDetailSerializer(row).data)
 
     @action(detail=False, methods=["get", "patch"], url_path="clinic_profile")
     def clinic_profile(self, request):

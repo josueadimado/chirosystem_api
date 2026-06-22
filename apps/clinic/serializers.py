@@ -18,6 +18,7 @@ from .models import (
     ProviderUnavailability,
     Service,
     StaffNotification,
+    SystemErrorLog,
     Visit,
     VisitRenderedService,
     VoiceCallLog,
@@ -415,6 +416,40 @@ class VoiceCallLogSerializer(serializers.ModelSerializer):
 
     def get_outcome_label(self, obj):
         return obj.get_outcome_display()
+
+
+class SystemErrorLogListSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SystemErrorLog
+        fields = (
+            "id",
+            "created_at",
+            "updated_at",
+            "level",
+            "source",
+            "message",
+            "exception_type",
+            "http_method",
+            "path",
+            "status_code",
+            "user_id",
+            "user_display",
+            "user_role",
+            "resolved_at",
+            "resolved_by_id",
+            "fingerprint",
+        )
+
+
+class SystemErrorLogDetailSerializer(SystemErrorLogListSerializer):
+    class Meta(SystemErrorLogListSerializer.Meta):
+        fields = SystemErrorLogListSerializer.Meta.fields + (
+            "traceback_text",
+            "query_string",
+            "request_body",
+            "extra",
+            "resolution_notes",
+        )
 
 
 _APPOINTMENT_FIELD_NAMES = tuple(f.name for f in Appointment._meta.fields)

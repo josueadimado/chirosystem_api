@@ -648,6 +648,50 @@ class VoiceCallLog(TimeStampedModel):
         ]
 
 
+class SystemErrorLog(TimeStampedModel):
+    """Server-side errors captured for the password-protected admin error tracker."""
+
+    class Level(models.TextChoices):
+        ERROR = "error", "Error"
+        WARNING = "warning", "Warning"
+        CRITICAL = "critical", "Critical"
+
+    class Source(models.TextChoices):
+        API = "api", "API"
+        MIDDLEWARE = "middleware", "Middleware"
+        CELERY = "celery", "Celery"
+        CLIENT = "client", "Browser (admin)"
+
+    level = models.CharField(max_length=20, choices=Level.choices, default=Level.ERROR)
+    source = models.CharField(max_length=20, choices=Source.choices, default=Source.API)
+    message = models.TextField()
+    exception_type = models.CharField(max_length=200, blank=True, default="")
+    traceback_text = models.TextField(blank=True, default="")
+    http_method = models.CharField(max_length=10, blank=True, default="")
+    path = models.CharField(max_length=500, blank=True, default="")
+    query_string = models.CharField(max_length=1000, blank=True, default="")
+    status_code = models.PositiveSmallIntegerField(null=True, blank=True)
+    user_id = models.IntegerField(null=True, blank=True)
+    user_role = models.CharField(max_length=30, blank=True, default="")
+    user_display = models.CharField(max_length=200, blank=True, default="")
+    request_body = models.TextField(blank=True, default="")
+    extra = models.JSONField(default=dict, blank=True)
+    fingerprint = models.CharField(max_length=64, blank=True, default="", db_index=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    resolved_by_id = models.IntegerField(null=True, blank=True)
+    resolution_notes = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["resolved_at", "created_at"]),
+            models.Index(fields=["source", "created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.source} {self.level}: {self.message[:80]}"
+
+
 class Payment(TimeStampedModel):
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
