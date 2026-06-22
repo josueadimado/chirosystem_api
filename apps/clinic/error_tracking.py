@@ -38,6 +38,12 @@ _SENSITIVE_KEYS = frozenset(
 
 
 def _env_error_tracker_password() -> str:
+    import os
+
+    # Read at call time so container env vars are picked up after redeploy.
+    raw = os.getenv("ERROR_TRACKER_PASSWORD")
+    if raw is not None and str(raw).strip():
+        return str(raw).strip()
     return (getattr(settings, "ERROR_TRACKER_PASSWORD", "") or "").strip()
 
 
@@ -52,9 +58,18 @@ def _db_error_tracker_password_hash() -> str:
         return ""
 
 
+def error_tracker_password_source() -> str:
+    """How the error tracker password is configured: env, database, or none."""
+    if _env_error_tracker_password():
+        return "env"
+    if _db_error_tracker_password_hash():
+        return "database"
+    return "none"
+
+
 def error_tracker_password_configured() -> bool:
     """True when env password or a saved owner-chosen password exists."""
-    return bool(_env_error_tracker_password() or _db_error_tracker_password_hash())
+    return error_tracker_password_source() != "none"
 
 
 def error_tracker_password_ok(password: str) -> bool:

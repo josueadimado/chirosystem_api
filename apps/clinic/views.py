@@ -3572,6 +3572,7 @@ class AdminViewSet(viewsets.ViewSet):
         """Whether error tracker is configured and this session is unlocked."""
         from apps.clinic.error_tracking import (
             error_tracker_password_configured,
+            error_tracker_password_source,
             request_has_error_tracker_access,
         )
 
@@ -3582,6 +3583,7 @@ class AdminViewSet(viewsets.ViewSet):
             {
                 "configured": error_tracker_password_configured(),
                 "unlocked": request_has_error_tracker_access(request),
+                "password_source": error_tracker_password_source(),
             }
         )
 
