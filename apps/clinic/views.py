@@ -4482,7 +4482,12 @@ class AdminViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"], url_path="charge-saved-card")
     def charge_saved_card(self, request):
-        """Charge the patient's saved card on file for this invoice (owner/staff)."""
+        """Charge the patient's saved card on file for this invoice (owner/staff desk only)."""
+        if getattr(request.user, "role", None) not in ("owner_admin", "staff"):
+            return Response(
+                {"detail": "Only clinic owner or staff can charge a saved card from the admin desk."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         return _charge_saved_card_api_response(request)
 
     @action(detail=False, methods=["post"], url_path="confirm-invoice-paid")

@@ -288,11 +288,13 @@ def patient_saved_card_display(patient) -> dict:
     """
     last4 = (getattr(patient, "card_last4", "") or "").strip()
     brand = (getattr(patient, "card_brand", "") or "").strip()
+    card_id = (getattr(patient, "square_card_id", "") or "").strip()
     chargeable = patient_has_chargeable_saved_card(patient)
     return {
         "card_brand": brand,
         "card_last4": last4,
-        "has_saved_card": chargeable,
+        # Display: card on file when Square card id + last4 exist (legacy rows may lack customer_id).
+        "has_saved_card": bool(card_id and last4),
         "has_chargeable_saved_card": chargeable,
         "card_display_only": bool(last4 and not chargeable),
     }
