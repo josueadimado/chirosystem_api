@@ -7,11 +7,11 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from django.conf import settings
-from django.db.models import Max, Min, OuterRef, Subquery, Sum
+from django.db.models import Count, Max, Min, OuterRef, Subquery, Sum
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
-from .models import Appointment, Invoice, Patient, Payment, Visit, VisitRenderedService, VoiceCallLog
+from .models import Appointment, Invoice, Patient, Payment, Provider, Visit, VisitRenderedService, VoiceCallLog
 
 _APPT_EXCLUDED = (
     Appointment.Status.CANCELLED,
@@ -186,6 +186,106 @@ def _client_health_counts(today: date) -> dict:
     }
 
 
+def _today_snapshot(today: date, cur_start: datetime, cur_end: datetime) -> dict:
+    """Same-day operational stats for the admin analytics header."""
+    tz = cur_start.tzinfo
+    day_start = datetime.combine(today, datetime.min.time(), tzinfo=tz)
+    day_end = day_start + timedelta(days=1)
+    all_today = Appointment.objects.filter(appointment_date=today)
+    active_today = all_today.exclude(status__in=_APPT_EXCLUDED)
+    revenue_today = _payments_collected_between(day_start, day_end)
+
+    return {
+        "appointments": active_today.count(),
+        "checked_in": active_today.filter(status=Appointment.Status.CHECKED_IN).count(),
+        "completed": all_today.filter(status=Appointment.Status.COMPLETED).count(),
+        "no_shows": all_today.filter(status=Appointment.Status.NO_SHOW).count(),
+        "revenue_today": _money_str(revenue_today),
+        "unpaid_invoices": Invoice.objects.filter(
+            status__in=(Invoice.Status.ISSUED, Invoice.Status.OVERDUE)
+        ).count(),
+    }
+
+
+def _provider_stats_month(start: datetime, end: datetime) -> list[dict]:
+    """Revenue collected and completed visits per provider this month."""
+    start_d = start.date()
+    end_d = end.date()
+    revenue_rows = {
+        r["invoice__appointment__provider_id"]: _quantize_money(r["revenue"])
+        for r in Payment.objects.filter(
+            status=Payment.Status.SUCCESSFUL,
+            paid_at__gte=start,
+            paid_at__lt=end,
+            invoice__appointment_id__isnull=False,
+        )
+        .values("invoice__appointment__provider_id")
+        .annotate(revenue=Sum("amount"))
+    }
+    visit_rows = {
+        r["provider_id"]: r["visits"]
+        for r in Appointment.objects.filter(
+            status=Appointment.Status.COMPLETED,
+            appointment_date__gte=start_d,
+            appointment_date__lt=end_d,
+        )
+        .values("provider_id")
+        .annotate(visits=Count("id"))
+    }
+    provider_ids = set(revenue_rows) | set(visit_rows)
+    provider_ids.discard(None)
+    if not provider_ids:
+        return []
+    names = {p.id: str(p) for p in Provider.objects.filter(pk__in=provider_ids).select_related("user")}
+    stats = []
+    for pid in provider_ids:
+        rev = revenue_rows.get(pid, Decimal("0.00"))
+        visits = visit_rows.get(pid, 0)
+        stats.append(
+            {
+                "provider_id": pid,
+                "name": (names.get(pid) or "Provider").strip(),
+                "revenue": _money_str(rev),
+                "visits_completed": visits,
+            }
+        )
+    stats.sort(key=lambda x: (-float(x["revenue"]), -x["visits_completed"], x["name"]))
+    return stats
+
+
+def _at_risk_patients(today: date, *, limit: int = 8) -> list[dict]:
+    """Patients with no visit in 60–89 days — good outreach list for front desk."""
+    active_cutoff = today - timedelta(days=30)
+    at_risk_cutoff = today - timedelta(days=89)
+    last_by_patient = (
+        Visit.objects.filter(status=Visit.Status.COMPLETED, completed_at__isnull=False)
+        .values("patient_id")
+        .annotate(last=Max("completed_at"))
+        .filter(last__date__lt=active_cutoff, last__date__gte=at_risk_cutoff)
+        .order_by("last")[:limit]
+    )
+    patient_ids = [r["patient_id"] for r in last_by_patient]
+    if not patient_ids:
+        return []
+    patients = {p.id: p for p in Patient.objects.filter(pk__in=patient_ids)}
+    out = []
+    for row in last_by_patient:
+        p = patients.get(row["patient_id"])
+        if not p:
+            continue
+        last_dt = row["last"]
+        days_ago = (today - last_dt.date()).days if last_dt else None
+        out.append(
+            {
+                "patient_id": p.id,
+                "name": f"{p.first_name} {p.last_name}".strip(),
+                "last_visit": last_dt.date().isoformat() if last_dt else None,
+                "days_since_visit": days_ago,
+            }
+        )
+    return out
+
+
 def _build_revenue_chart(months: int) -> list[dict]:
     """Monthly collected vs outstanding added for the last N calendar months."""
     tz = _clinic_tz()
@@ -334,11 +434,15 @@ def build_admin_analytics_payload(*, months: int = 6) -> dict:
 
     return {
         "kpis": kpis,
+        "today_snapshot": _today_snapshot(today, cur_start, cur_end),
         "revenue_chart": revenue_chart,
         "revenue_chart_months": chart_months,
         "appointments_this_week": appointments_this_week,
         "billing_summary": billing_summary,
         "revenue_by_service": revenue_by_service,
+        "provider_stats": _provider_stats_month(cur_start, cur_end),
+        "at_risk_patients": _at_risk_patients(today),
         "client_health": client_health,
         "voice_summary": voice_summary,
+        "generated_at": now.isoformat(),
     }
