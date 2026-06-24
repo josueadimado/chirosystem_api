@@ -4954,7 +4954,7 @@ class DoctorViewSet(viewsets.ViewSet):
         invoice_id = request.query_params.get("invoice_id")
         if not invoice_id:
             return Response({"detail": "invoice_id is required."}, status=status.HTTP_400_BAD_REQUEST)
-        inv = Invoice.objects.filter(pk=invoice_id).select_related("appointment").first()
+        inv = Invoice.objects.filter(pk=invoice_id).select_related("appointment", "patient").first()
         if not inv:
             return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
         include_pending = str(request.query_params.get("include_pending_fees", "")).lower() in (
@@ -4980,13 +4980,20 @@ class DoctorViewSet(viewsets.ViewSet):
                     "paid": all_paid,
                     "status": inv.status,
                     "bundle_invoice_ids": bundle_ids,
+                    **patient_saved_card_display(inv.patient),
                 }
             )
         if inv.status != Invoice.Status.PAID:
             try_reconcile_invoice_from_square(inv)
             inv.refresh_from_db()
         paid = inv.status == Invoice.Status.PAID
-        return Response({"paid": paid, "status": inv.status})
+        return Response(
+            {
+                "paid": paid,
+                "status": inv.status,
+                **patient_saved_card_display(inv.patient),
+            }
+        )
 
     @action(detail=False, methods=["get"], url_path="patient_pending_payment")
     def patient_pending_payment(self, request):

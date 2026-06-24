@@ -110,7 +110,12 @@ def serialize_doctor_dashboard_appointments(appt_list: list[Appointment]) -> lis
             "card_brand": a.patient.card_brand or "",
             **{
                 k: patient_saved_card_display(a.patient)[k]
-                for k in ("has_saved_card", "has_chargeable_saved_card", "card_display_only")
+                for k in (
+                    "has_saved_card",
+                    "has_card_on_file",
+                    "has_chargeable_saved_card",
+                    "card_display_only",
+                )
             },
             "patient_payment_profile": (a.patient.payment_profile or "").strip(),
             "patient_balance_due": balance_by_patient.get(a.patient_id, "0.00"),

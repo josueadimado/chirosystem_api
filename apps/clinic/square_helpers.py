@@ -295,6 +295,8 @@ def patient_saved_card_display(patient) -> dict:
         "card_last4": last4,
         # Display: card on file when Square card id + last4 exist (legacy rows may lack customer_id).
         "has_saved_card": bool(card_id and last4),
+        # Broader UI hint — show card section when digits or Square card id exist on the profile.
+        "has_card_on_file": bool(last4 or card_id),
         "has_chargeable_saved_card": chargeable,
         "card_display_only": bool(last4 and not chargeable),
     }
