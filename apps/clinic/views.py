@@ -363,6 +363,7 @@ def _invoice_bill_dict(inv: Invoice, *, preview: bool) -> dict:
 def _doctor_collect_payment_followup(invoice: Invoice, *, try_saved_card: bool) -> dict:
     """Payment banner payload: Square options plus other open penalty balances."""
     from .patient_payment_pending import build_doctor_pending_payment_context
+    from .square_helpers import patient_saved_card_display
 
     followup = build_invoice_payment_followup_dict(invoice, try_saved_card=try_saved_card)
     followup.pop("already_paid", None)
@@ -370,6 +371,7 @@ def _doctor_collect_payment_followup(invoice: Invoice, *, try_saved_card: bool) 
         invoice.patient_id,
         current_invoice_id=invoice.id,
     )
+    followup.update(patient_saved_card_display(invoice.patient))
     return followup
 
 
