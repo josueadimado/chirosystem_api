@@ -4630,6 +4630,39 @@ class AdminViewSet(viewsets.ViewSet):
             )
         return _save_appointment_handoff_notes(request)
 
+    @action(detail=False, methods=["post"], url_path="remove_patient_history_appointment")
+    def remove_patient_history_appointment(self, request):
+        """Owner/staff: remove a completed, no-show, or cancelled visit from the patient chart."""
+        denied = self._admin_staff_only(request)
+        if denied:
+            return denied
+        raw_pid = request.data.get("patient_id")
+        raw_aid = request.data.get("appointment_id")
+        if raw_pid is None or raw_aid is None:
+            return Response(
+                {"detail": "patient_id and appointment_id are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            patient_id = int(raw_pid)
+            appointment_id = int(raw_aid)
+        except (TypeError, ValueError):
+            return Response({"detail": "Invalid patient_id or appointment_id."}, status=status.HTTP_400_BAD_REQUEST)
+        appt = (
+            Appointment.objects.filter(pk=appointment_id, patient_id=patient_id)
+            .select_related("patient")
+            .first()
+        )
+        if not appt:
+            return Response({"detail": "Appointment not found for this patient."}, status=status.HTTP_404_NOT_FOUND)
+        from .patient_history_admin import remove_appointment_from_patient_chart
+
+        try:
+            remove_appointment_from_patient_chart(appt)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"detail": "Visit removed from this patient's chart."})
+
     @action(detail=False, methods=["get"], url_path="patient_documents")
     def patient_documents(self, request):
         """List all documents attached to a patient's record."""
