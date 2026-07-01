@@ -355,6 +355,11 @@ class Appointment(TimeStampedModel):
     )
     no_show_notice_sms_at = models.DateTimeField(null=True, blank=True)
     no_show_notice_email_at = models.DateTimeField(null=True, blank=True)
+    late_checkin_sms_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Set when the patient was texted because they had not checked in after the scheduled start.",
+    )
     # Google Calendar event on the provider's connected personal calendar
     google_calendar_event_id = models.CharField(max_length=255, blank=True)
 
@@ -364,6 +369,7 @@ class Appointment(TimeStampedModel):
         self.day_before_reminder_email_at = None
         self.same_day_reminder_sms_at = None
         self.same_day_reminder_email_at = None
+        self.late_checkin_sms_at = None
 
     def __str__(self) -> str:
         return f"{self.appointment_date} {self.start_time} ({self.status})"

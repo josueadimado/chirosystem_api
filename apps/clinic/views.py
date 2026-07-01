@@ -2656,6 +2656,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                 day_before_reminder_email_at=None,
                 same_day_reminder_sms_at=None,
                 same_day_reminder_email_at=None,
+                late_checkin_sms_at=None,
             )
         else:
             serializer.save()

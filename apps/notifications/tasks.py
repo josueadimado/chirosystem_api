@@ -929,6 +929,17 @@ def send_provider_dashboard_book_next_patient_email_task(appointment_id: int) ->
 
 
 @shared_task
+def process_late_checkin_sms_task() -> dict:
+    """
+    Celery Beat (every 5 minutes): text patients still in booked status
+    when their appointment start was 10+ minutes ago (configurable).
+    """
+    from apps.clinic.late_checkin_sms import process_late_checkin_sms
+
+    return process_late_checkin_sms()
+
+
+@shared_task
 def process_auto_no_show_appointments_task() -> dict:
     """
     Celery Beat (every 15 minutes): mark booked/checked-in visits as no-show when

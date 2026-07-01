@@ -320,6 +320,7 @@ def reschedule_appointment_public(
             "day_before_reminder_email_at",
             "same_day_reminder_sms_at",
             "same_day_reminder_email_at",
+            "late_checkin_sms_at",
             "updated_at",
         ]
     )

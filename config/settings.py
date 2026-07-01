@@ -190,6 +190,13 @@ else:
 CELERY_TIMEZONE = CLINIC_TIMEZONE
 # Kiosk: earliest patient self-service check-in on the appointment day (minutes before start). Staff desk check-in can be earlier.
 KIOSK_EARLY_CHECKIN_MINUTES_BEFORE = int(os.getenv("KIOSK_EARLY_CHECKIN_MINUTES_BEFORE", "30"))
+# SMS patients still in "booked" status this many minutes after start (default 10). Requires Celery Beat.
+LATE_CHECKIN_SMS_ENABLED = os.getenv("LATE_CHECKIN_SMS_ENABLED", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+LATE_CHECKIN_SMS_MINUTES_AFTER_START = int(os.getenv("LATE_CHECKIN_SMS_MINUTES_AFTER_START", "10"))
 # Password for the admin Error Tracker page (/admin/errors). Owner admin must enter this after login.
 ERROR_TRACKER_PASSWORD = os.getenv("ERROR_TRACKER_PASSWORD", "").strip()
 # How long the unlock token stays valid (seconds). Default 8 hours.
@@ -202,6 +209,10 @@ CELERY_BEAT_SCHEDULE = {
     "process-auto-no-show-appointments": {
         "task": "apps.notifications.tasks.process_auto_no_show_appointments_task",
         "schedule": crontab(minute="*/15"),
+    },
+    "send-late-checkin-sms": {
+        "task": "apps.notifications.tasks.process_late_checkin_sms_task",
+        "schedule": crontab(minute="*/5"),
     },
 }
 

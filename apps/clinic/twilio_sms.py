@@ -162,6 +162,21 @@ def series_booking_confirmation_body(
     )
 
 
+def late_checkin_sms_body(
+    *,
+    first_name: str,
+    provider_display: str,
+    appt_time_display: str,
+    service_name: str,
+) -> str:
+    """Patient SMS when they have not checked in shortly after their appointment start."""
+    return (
+        f"Relief Chiropractic: Hi {first_name}, {provider_display} is ready for your "
+        f"{appt_time_display} {service_name}. We have not seen you check in yet — "
+        f"please let us know if you are on your way. Call us at {CLINIC_PHONE_SELF_SERVICE_DISPLAY}.{sms_footer()}"
+    )
+
+
 def appointment_reminder_body(
     *,
     first_name: str,
