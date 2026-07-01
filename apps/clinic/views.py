@@ -2389,6 +2389,8 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         """If the visit time changes, allow a fresh day-before SMS reminder."""
         from datetime import datetime, timedelta
 
+        from apps.clinic.missed_visit_recovery import appointment_is_missed_no_show
+
         inst = serializer.instance
         user = self.request.user
         role = getattr(user, "role", None)
@@ -2396,6 +2398,11 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         waive_late_cancel = bool(data.pop("waive_late_cancel_fee", False))
         restoring_cancelled = (
             inst.status == Appointment.Status.CANCELLED
+            and data.get("status") == Appointment.Status.BOOKED
+            and role in ("owner_admin", "staff")
+        )
+        restoring_missed = (
+            appointment_is_missed_no_show(inst)
             and data.get("status") == Appointment.Status.BOOKED
             and role in ("owner_admin", "staff")
         )
@@ -2409,6 +2416,30 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                     }
                 )
             _prepare_admin_uncancel_cancelled_appointment(inst)
+        if restoring_missed:
+            from apps.clinic.missed_visit_recovery import prepare_admin_reopen_missed_visit
+
+            if set(data.keys()) - {"status"}:
+                raise ValidationError(
+                    {
+                        "detail": (
+                            "When reopening a missed visit, only status may be changed in this request."
+                        )
+                    }
+                )
+            prepare_admin_reopen_missed_visit(inst)
+            inst.save(
+                update_fields=[
+                    "checked_in_at",
+                    "consultation_started_at",
+                    "completed_at",
+                    "auto_no_show_processed_at",
+                    "updated_at",
+                ]
+            )
+            data["checked_in_at"] = None
+            data["consultation_started_at"] = None
+            data["completed_at"] = None
 
         def _appointment_locked_as_no_show(appt: Appointment) -> bool:
             if appt.status == Appointment.Status.NO_SHOW:
@@ -2420,8 +2451,8 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                     return False
             return False
 
-        if (inst.status == Appointment.Status.CANCELLED and not restoring_cancelled) or _appointment_locked_as_no_show(
-            inst
+        if (inst.status == Appointment.Status.CANCELLED and not restoring_cancelled) or (
+            _appointment_locked_as_no_show(inst) and not restoring_missed
         ):
             allowed_terminal_fields = {"clinical_handoff_notes", "notes"}
             disallowed = set(data.keys()) - allowed_terminal_fields
@@ -6069,12 +6100,37 @@ class KioskViewSet(viewsets.ViewSet):
                         status=status.HTTP_403_FORBIDDEN,
                     )
             today = today_clinic()
-            if appt.appointment_date != today:
-                return Response(
-                    {"detail": "Check-in is only available on the day of your appointment."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
             bypass_early = not phone and self._desk_can_bypass_kiosk_early_window(request)
+
+            if appt.appointment_date != today:
+                if not bypass_early:
+                    return Response(
+                        {"detail": "Check-in is only available on the day of your appointment."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                from apps.clinic.missed_visit_recovery import staff_may_checkin_appointment_date
+
+                ok_date, date_err = staff_may_checkin_appointment_date(appt.appointment_date, today=today)
+                if not ok_date:
+                    return Response({"detail": date_err}, status=status.HTTP_400_BAD_REQUEST)
+
+            if bypass_early:
+                from apps.clinic.missed_visit_recovery import (
+                    appointment_is_missed_no_show,
+                    reopen_missed_visit_to_booked,
+                )
+
+                if appointment_is_missed_no_show(appt):
+                    try:
+                        with transaction.atomic():
+                            locked = Appointment.objects.select_for_update().get(pk=appt.pk)
+                            reopen_missed_visit_to_booked(locked)
+                            appt = locked
+                    except ValidationError as exc:
+                        detail = exc.detail
+                        if not isinstance(detail, str):
+                            detail = detail[0] if isinstance(detail, list) else str(detail)
+                        return Response({"detail": detail}, status=status.HTTP_400_BAD_REQUEST)
 
             targets, err = self._kiosk_resolve_checkin_targets(
                 appt,
