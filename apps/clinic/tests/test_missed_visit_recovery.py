@@ -117,6 +117,46 @@ class MissedVisitRecoveryTests(TestCase):
         self.assertEqual(visit.status, Visit.Status.OPEN)
         self.assertEqual(visit.doctor_notes, "")
 
+    @patch("apps.notifications.tasks.notify_provider_patient_checked_in_task")
+    def test_desk_checkin_no_show_reopens_and_checks_in(self, _notify):
+        """Staff desk check-in on a no-show must reopen and check in atomically (no prior PATCH)."""
+        self.appt.status = Appointment.Status.NO_SHOW
+        self.appt.auto_no_show_processed_at = timezone.now()
+        self.appt.save(update_fields=["status", "auto_no_show_processed_at", "updated_at"])
+        visit = Visit.objects.create(
+            appointment=self.appt,
+            patient=self.patient,
+            provider=self.provider,
+            status=Visit.Status.COMPLETED,
+            doctor_notes="No-show fee (patient missed scheduled appointment).",
+            completed_at=timezone.now(),
+        )
+        Invoice.objects.create(
+            patient=self.patient,
+            appointment=self.appt,
+            visit=visit,
+            invoice_number="INV-NS-CHECKIN-1",
+            subtotal=Decimal("55.00"),
+            tax=Decimal("0"),
+            discount=Decimal("0"),
+            total_amount=Decimal("55.00"),
+            status=Invoice.Status.ISSUED,
+            kind=Invoice.Kind.NO_SHOW_FEE,
+        )
+        factory = APIRequestFactory()
+        request = factory.post("/api/v1/kiosk/checkin/", {"appointment_id": self.appt.id}, format="json")
+        force_authenticate(request, user=self.staff)
+        response = KioskViewSet.as_view({"post": "checkin"})(request)
+        self.assertEqual(response.status_code, 200, response.data)
+        self.appt.refresh_from_db()
+        self.assertEqual(self.appt.status, Appointment.Status.CHECKED_IN)
+        self.assertIsNotNone(self.appt.checked_in_at)
+        self.assertIsNone(self.appt.auto_no_show_processed_at)
+        inv = Invoice.objects.get(appointment=self.appt)
+        self.assertEqual(inv.status, Invoice.Status.VOID)
+        visit.refresh_from_db()
+        self.assertEqual(visit.status, Visit.Status.OPEN)
+
     def test_cannot_reopen_paid_no_show(self):
         self.appt.status = Appointment.Status.NO_SHOW
         self.appt.save(update_fields=["status", "updated_at"])

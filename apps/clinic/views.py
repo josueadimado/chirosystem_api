@@ -5809,12 +5809,19 @@ class KioskViewSet(viewsets.ViewSet):
         else:
             targets = [primary]
 
-        booked = [a for a in targets if a.status == Appointment.Status.BOOKED]
-        if not booked:
+        from apps.clinic.missed_visit_recovery import appointment_is_missed_no_show
+
+        eligible: list[Appointment] = []
+        for appt in targets:
+            if appt.status == Appointment.Status.BOOKED:
+                eligible.append(appt)
+            elif bypass_early and appointment_is_missed_no_show(appt):
+                eligible.append(appt)
+        if not eligible:
             return [], "Check-in is already done or this visit is in progress."
 
         if not bypass_early:
-            too_early = [a for a in booked if not cls._can_kiosk_checkin_now(a)[0]]
+            too_early = [a for a in eligible if not cls._can_kiosk_checkin_now(a)[0]]
             if too_early:
                 minutes = cls._kiosk_minutes_before()
                 appt = too_early[0]
@@ -5827,7 +5834,7 @@ class KioskViewSet(viewsets.ViewSet):
                     + ", or ask the front desk."
                 )
 
-        return booked, None
+        return eligible, None
 
     @classmethod
     def _kiosk_minutes_before(cls) -> int:
@@ -6115,24 +6122,6 @@ class KioskViewSet(viewsets.ViewSet):
                 if not ok_date:
                     return Response({"detail": date_err}, status=status.HTTP_400_BAD_REQUEST)
 
-            if bypass_early:
-                from apps.clinic.missed_visit_recovery import (
-                    appointment_is_missed_no_show,
-                    reopen_missed_visit_to_booked,
-                )
-
-                if appointment_is_missed_no_show(appt):
-                    try:
-                        with transaction.atomic():
-                            locked = Appointment.objects.select_for_update().get(pk=appt.pk)
-                            reopen_missed_visit_to_booked(locked)
-                            appt = locked
-                    except ValidationError as exc:
-                        detail = exc.detail
-                        if not isinstance(detail, str):
-                            detail = detail[0] if isinstance(detail, list) else str(detail)
-                        return Response({"detail": detail}, status=status.HTTP_400_BAD_REQUEST)
-
             targets, err = self._kiosk_resolve_checkin_targets(
                 appt,
                 requested_ids=requested_ids,
@@ -6144,6 +6133,7 @@ class KioskViewSet(viewsets.ViewSet):
             now = timezone.now()
             checked_ids: list[int] = []
             early_err: str | None = None
+            desk_checkin_err: str | None = None
 
             def after_checkin_side_effects(appointment_id: int) -> None:
                 try:
@@ -6167,8 +6157,23 @@ class KioskViewSet(viewsets.ViewSet):
 
             with transaction.atomic():
                 for visit in targets:
-                    if early_err:
+                    if early_err or desk_checkin_err:
                         break
+                    if bypass_early:
+                        from apps.clinic.missed_visit_recovery import staff_desk_checkin_appointment
+
+                        try:
+                            locked = staff_desk_checkin_appointment(visit, now=now)
+                        except ValidationError as exc:
+                            detail = exc.detail
+                            if not isinstance(detail, str):
+                                detail = detail[0] if isinstance(detail, list) else str(detail)
+                            desk_checkin_err = str(detail)
+                            break
+                        checked_ids.append(locked.id)
+                        aid = locked.id
+                        transaction.on_commit(lambda aid=aid: after_checkin_side_effects(aid))
+                        continue
                     if visit.status in (
                         Appointment.Status.CANCELLED,
                         Appointment.Status.NO_SHOW,
@@ -6177,20 +6182,19 @@ class KioskViewSet(viewsets.ViewSet):
                         continue
                     if visit.status != Appointment.Status.BOOKED:
                         continue
-                    if not bypass_early:
-                        allowed, _, earliest_local = self._can_kiosk_checkin_now(visit)
-                        if not allowed:
-                            minutes = self._kiosk_minutes_before()
-                            earliest_disp = (
-                                format_time_12h(earliest_local.time()) if earliest_local else ""
-                            )
-                            early_err = (
-                                f"It is too early for kiosk check-in. You can check in up to {minutes} minutes "
-                                f"before this appointment"
-                                + (f" (opens around {earliest_disp})" if earliest_disp else "")
-                                + ", or ask the front desk."
-                            )
-                            break
+                    allowed, _, earliest_local = self._can_kiosk_checkin_now(visit)
+                    if not allowed:
+                        minutes = self._kiosk_minutes_before()
+                        earliest_disp = (
+                            format_time_12h(earliest_local.time()) if earliest_local else ""
+                        )
+                        early_err = (
+                            f"It is too early for kiosk check-in. You can check in up to {minutes} minutes "
+                            f"before this appointment"
+                            + (f" (opens around {earliest_disp})" if earliest_disp else "")
+                            + ", or ask the front desk."
+                        )
+                        break
                     # booked_service is nullable — FOR UPDATE + outer join crashes on Postgres.
                     locked = (
                         Appointment.objects.select_for_update(of=("self",))
@@ -6205,6 +6209,9 @@ class KioskViewSet(viewsets.ViewSet):
                     checked_ids.append(locked.id)
                     aid = locked.id
                     transaction.on_commit(lambda aid=aid: after_checkin_side_effects(aid))
+
+            if desk_checkin_err:
+                return Response({"detail": desk_checkin_err}, status=status.HTTP_400_BAD_REQUEST)
 
             if early_err:
                 return Response({"detail": early_err}, status=status.HTTP_400_BAD_REQUEST)
