@@ -375,6 +375,32 @@ def _doctor_collect_payment_followup(invoice: Invoice, *, try_saved_card: bool) 
     return followup
 
 
+def _log_payment_charge_failure_from_followup(
+    request,
+    followup: dict,
+    *,
+    operation: str,
+    patient_id: int | None = None,
+) -> None:
+    """Record handled saved-card failures on Admin → Errors (visit complete, revise billing, etc.)."""
+    from apps.clinic.error_tracking import capture_payment_failure
+    from apps.clinic.square_payment import charge_saved_card_error_message
+
+    payment = (followup or {}).get("payment") or {}
+    err_raw = payment.get("charge_error")
+    if not err_raw:
+        return
+    detail = payment.get("charge_error_message") or charge_saved_card_error_message(str(err_raw))
+    capture_payment_failure(
+        request=request,
+        operation=operation,
+        detail=detail,
+        error_code=str(err_raw),
+        invoice_id=followup.get("invoice_id"),
+        patient_id=patient_id,
+    )
+
+
 def _set_appointment_status_after_invoice_paid(inv: Invoice) -> None:
     from apps.clinic.invoice_collection import set_appointment_status_after_invoice_paid
 
@@ -720,22 +746,31 @@ def _charge_saved_card_api_response(request) -> Response:
         )
     err_raw = charge.get("error") or ""
     detail = charge_saved_card_error_message(err_raw)
-    if detail == err_raw and err_raw and err_raw not in (
-        "no_saved_card",
-        "card_on_file_not_chargeable",
-        "amount_below_minimum",
-        "nothing_due",
-        "square_not_configured",
-        "square_location_not_configured",
-    ) and not err_raw.startswith("payment_status_"):
-        detail = err_raw
+    from apps.clinic.error_tracking import capture_payment_failure
+
+    capture_payment_failure(
+        request=request,
+        operation="charge_saved_card",
+        detail=detail,
+        error_code=err_raw,
+        invoice_id=inv.id,
+        patient_id=inv.patient_id,
+    )
     return Response(
         {
             "ok": False,
             "paid": False,
             "charged": False,
             "detail": detail,
-            "charge_error": err_raw,
+            "charge_error": err_raw if err_raw in (
+                "no_saved_card",
+                "card_on_file_not_chargeable",
+                "amount_below_minimum",
+                "nothing_due",
+                "square_not_configured",
+                "square_location_not_configured",
+            ) or err_raw.startswith("payment_status_") else None,
+            "charge_error_message": detail,
         },
         status=status.HTTP_400_BAD_REQUEST,
     )
@@ -5282,6 +5317,12 @@ class DoctorViewSet(viewsets.ViewSet):
         followup = _doctor_collect_payment_followup(
             invoice, try_saved_card=data.get("charge_saved_card_if_present", True)
         )
+        _log_payment_charge_failure_from_followup(
+            request,
+            followup,
+            operation="complete_visit_saved_card",
+            patient_id=invoice.patient_id,
+        )
         invoice.refresh_from_db()
         if invoice.status != Invoice.Status.PAID:
             terminal_checkout_id = try_push_terminal_checkout_to_kiosk(invoice)
@@ -5345,6 +5386,12 @@ class DoctorViewSet(viewsets.ViewSet):
         invoice.refresh_from_db()
         followup = _doctor_collect_payment_followup(
             invoice, try_saved_card=data.get("charge_saved_card_if_present", False)
+        )
+        _log_payment_charge_failure_from_followup(
+            request,
+            followup,
+            operation="revise_visit_billing_saved_card",
+            patient_id=invoice.patient_id,
         )
         invoice.refresh_from_db()
         if invoice.status != Invoice.Status.PAID:

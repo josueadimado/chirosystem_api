@@ -302,15 +302,87 @@ def patient_saved_card_display(patient) -> dict:
     }
 
 
-def _square_api_error_message(errors) -> str:
+def _square_error_field(err, field: str) -> str:
+    if err is None:
+        return ""
+    if isinstance(err, dict):
+        return (err.get(field) or "").strip()
+    return (getattr(err, field, None) or "").strip()
+
+
+def square_error_list_message(errors, *, status_code: int | None = None) -> str:
+    """Human-readable message from Square errors[] (objects or dicts)."""
     if not errors:
+        if status_code == 401:
+            return "Square access token is invalid or expired. Check Admin → Settings."
+        if status_code == 403:
+            return "Square rejected this request (permission denied). Check the token and sandbox vs production."
         return "Square request failed."
     err = errors[0]
-    code = (getattr(err, "code", None) or "").strip()
-    detail = (getattr(err, "detail", None) or str(err) or "").strip()
-    if code and detail:
+    code = _square_error_field(err, "code")
+    detail = _square_error_field(err, "detail")
+    if code and detail and code not in detail:
         return f"{detail} ({code})"
     return detail or code or "Square request failed."
+
+
+def looks_like_technical_square_error(text: str) -> bool:
+    """True when str(exception) is HTTP metadata, not a staff-facing message."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if "headers" in t and ("square-version" in t or "content-type" in t or "cf-ray" in t):
+        return True
+    if "'server':" in t and "cloudflare" in t:
+        return True
+    if t.startswith("status_code=") or t.startswith("http "):
+        return True
+    return False
+
+
+def format_square_exception(exc: BaseException) -> str:
+    """
+    Turn a Square SDK ApiError (or similar) into a short staff-facing message.
+    Never returns raw HTTP headers.
+    """
+    errors = getattr(exc, "errors", None)
+    status_code = getattr(exc, "status_code", None)
+    if errors:
+        return square_error_list_message(errors, status_code=status_code)[:500]
+
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        msg = square_error_list_message(body.get("errors") or [], status_code=status_code)
+        if msg != "Square request failed.":
+            return msg[:500]
+    elif isinstance(body, str) and body.strip():
+        try:
+            parsed = json.loads(body)
+            if isinstance(parsed, dict):
+                msg = square_error_list_message(parsed.get("errors") or [], status_code=status_code)
+                if msg != "Square request failed.":
+                    return msg[:500]
+        except json.JSONDecodeError:
+            pass
+
+    if status_code == 401:
+        return "Square access token is invalid or expired. Check Admin → Settings."
+    if status_code == 403:
+        return "Square rejected this charge (permission denied). Check Admin → Settings."
+    if status_code == 404:
+        return "Square cannot find this saved card. Re-save the card on the patient chart (sandbox vs production mismatch is common)."
+
+    text = str(exc).strip()
+    if looks_like_technical_square_error(text):
+        return (
+            "Square could not process this charge. Check Admin → Settings (sandbox vs production), "
+            "re-save the patient's card, or use cash/Terminal."
+        )
+    return text[:500] if text else "Square could not process this charge."
+
+
+def _square_api_error_message(errors) -> str:
+    return square_error_list_message(errors)
 
 
 def _persist_patient_square_card(patient, card) -> None:

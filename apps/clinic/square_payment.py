@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
 from datetime import timedelta
 from decimal import Decimal
@@ -14,11 +15,14 @@ from django.utils import timezone
 from .models import Appointment, Invoice, Patient, PatientCreditTransaction, Payment
 from .square_helpers import (
     ensure_square_customer,
+    format_square_exception,
     get_kiosk_terminal_device_id,
     get_location_id,
     get_square_client,
     get_terminal_device_id,
+    looks_like_technical_square_error,
     square_configured,
+    square_error_list_message,
     square_search_orders,
 )
 
@@ -643,14 +647,81 @@ def _invoice_amount_due_cents(invoice: Invoice) -> int:
 
 
 def _square_payment_error_message(errors) -> str:
-    if not errors:
-        return "payment failed"
-    err = errors[0]
-    code = (getattr(err, "code", None) or "").strip()
-    detail = (getattr(err, "detail", None) or str(err) or "payment failed").strip()
-    if code and detail and code not in detail:
-        return f"{detail} ({code})"[:500]
-    return detail[:500] if detail else (code[:500] if code else "payment failed")
+    return square_error_list_message(errors)
+
+
+_SQUARE_CHARGE_CODE_MESSAGES: dict[str, str] = {
+    "CARD_DECLINED": "The card was declined by the bank. Use another card, cash, or Square Terminal.",
+    "GENERIC_DECLINE": "The card was declined. Use another card, cash, or Square Terminal.",
+    "CARD_EXPIRED": "This card has expired. Re-save a current card on the patient chart.",
+    "CVV_FAILURE": "Square could not verify this saved card. Re-save the card on the patient chart.",
+    "INVALID_CARD": "This saved card is no longer valid in Square. Re-save the card on the patient chart.",
+    "INVALID_CARD_DATA": "This saved card is no longer valid in Square. Re-save the card on the patient chart.",
+    "INSUFFICIENT_PERMISSIONS": "The Square access token cannot charge cards. Check Admin → Settings.",
+    "NOT_FOUND": (
+        "Square cannot find this saved card (sandbox vs production mismatch is common). "
+        "Re-save the card on the patient chart."
+    ),
+    "INVALID_VALUE": "Square rejected the charge. Refresh the page and try again, or use cash/Terminal.",
+    "PAYMENT_LIMIT_EXCEEDED": "This charge exceeds Square's limit. Use cash, Terminal, or split payment.",
+    "TRANSACTION_LIMIT": "This charge exceeds Square's limit. Use cash, Terminal, or split payment.",
+    "ADDRESS_VERIFICATION_FAILURE": "The bank could not verify this card. Re-save the card or use another payment method.",
+    "UNSUPPORTED_CARD_BRAND": "This card type is not supported for this charge. Use another payment method.",
+}
+
+
+def _extract_square_error_code(raw: str) -> str | None:
+    """Pull a Square error code from 'detail (CODE)' or a bare code string."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    m = re.search(r"\(([A-Z0-9_]+)\)\s*$", text)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"[A-Z0-9_]+", text):
+        return text
+    return None
+
+
+def charge_saved_card_error_message(error_code: str | None) -> str:
+    """Plain-language message for staff when auto-charge fails."""
+    code = (error_code or "").strip()
+    if code == "no_saved_card":
+        return (
+            "No chargeable card on file in Square. Open the patient chart, go to Payment card, "
+            "and save the card again — even if you already see last four digits."
+        )
+    if code == "card_on_file_not_chargeable":
+        return (
+            "This patient shows a card ending on file, but Square is not linked for charging. "
+            "Re-save the card in the patient chart, then try Retry saved card."
+        )
+    if code == "amount_below_minimum":
+        return "The amount due is under $1.00. Use cash, Square Terminal, or the desk pay screen."
+    if code == "nothing_due":
+        return "Nothing is owed on this invoice — refresh the page or use Check Square if payment already went through."
+    if code == "square_not_configured":
+        return "Square payments are not configured. Connect Square in Admin Settings."
+    if code == "square_location_not_configured":
+        return "Square location is not configured on the server. Ask your administrator to check Square settings."
+    if code.startswith("payment_status_"):
+        return (
+            f"Square did not complete the charge (status: {code.replace('payment_status_', '')}). "
+            "Try Terminal or desk checkout."
+        )
+    if looks_like_technical_square_error(code):
+        return (
+            "Square could not process this charge. Check Admin → Settings (sandbox vs production), "
+            "re-save the patient's card, or use cash/Terminal."
+        )
+    square_code = _extract_square_error_code(code)
+    if square_code and square_code in _SQUARE_CHARGE_CODE_MESSAGES:
+        return _SQUARE_CHARGE_CODE_MESSAGES[square_code]
+    if square_code:
+        return f"Square could not charge the saved card ({square_code.replace('_', ' ').lower()}). Try cash or Terminal."
+    if code:
+        return code
+    return "Could not charge the saved card. Try Square Terminal or the desk pay screen."
 
 
 def build_credit_topup_reference(*, patient_id: int, amount_cents: int) -> str:
@@ -709,34 +780,6 @@ def apply_credit_topup_from_square_payment(
             created_by=None,
         )
     return True
-
-
-def charge_saved_card_error_message(error_code: str | None) -> str:
-    """Plain-language message for staff when auto-charge fails."""
-    code = (error_code or "").strip()
-    if code == "no_saved_card":
-        return (
-            "No chargeable card on file in Square. Open the patient chart, go to Payment card, "
-            "and save the card again — even if you already see last four digits."
-        )
-    if code == "card_on_file_not_chargeable":
-        return (
-            "This patient shows a card ending on file, but Square is not linked for charging. "
-            "Re-save the card in the patient chart, then try Retry saved card."
-        )
-    if code == "amount_below_minimum":
-        return "The amount due is under $1.00. Use cash, Square Terminal, or the desk pay screen."
-    if code == "nothing_due":
-        return "Nothing is owed on this invoice — refresh the page or use Check Square if payment already went through."
-    if code == "square_not_configured":
-        return "Square payments are not configured. Connect Square in Admin Settings."
-    if code == "square_location_not_configured":
-        return "Square location is not configured on the server. Ask your administrator to check Square settings."
-    if code.startswith("payment_status_"):
-        return f"Square did not complete the charge (status: {code.replace('payment_status_', '')}). Try Terminal or desk checkout."
-    if code:
-        return code
-    return "Could not charge the saved card. Try Square Terminal or the desk pay screen."
 
 
 def try_charge_saved_card(invoice: Invoice) -> dict:
@@ -808,7 +851,7 @@ def try_charge_saved_card(invoice: Invoice) -> dict:
         }
     except Exception as exc:
         logger.warning("Square saved card charge failed: %s", exc)
-        return {"ok": False, "error": str(exc)[:500], "payment_intent_id": None}
+        return {"ok": False, "error": format_square_exception(exc), "payment_intent_id": None}
 
 
 def create_payment_link_for_invoice(

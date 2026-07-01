@@ -404,12 +404,14 @@ def capture_application_error(
     level: str = "error",
     status_code: int | None = None,
     extra: dict | None = None,
+    fingerprint_message: str | None = None,
+    exception_type: str | None = None,
 ) -> int | None:
     """Persist one error row. Returns pk or None if logging failed."""
     from apps.clinic.models import SystemErrorLog
 
     tb_text = ""
-    exc_type = ""
+    exc_type = (exception_type or "").strip()
     if exc is not None:
         exc_type = type(exc).__name__
         tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -436,7 +438,7 @@ def capture_application_error(
     fingerprint = build_error_fingerprint(
         source=source,
         exception_type=exc_type,
-        message=message,
+        message=(fingerprint_message or message)[:500],
         path=path,
     )
 
@@ -466,6 +468,41 @@ def capture_application_error(
     except Exception:
         logger.exception("Could not save SystemErrorLog row")
         return None
+
+
+def capture_payment_failure(
+    *,
+    request,
+    operation: str,
+    detail: str,
+    error_code: str | None = None,
+    invoice_id: int | None = None,
+    patient_id: int | None = None,
+    status_code: int = 400,
+) -> int | None:
+    """
+    Log a handled payment failure (Square decline, nothing due, etc.) for Admin → Errors.
+
+    Unlike crashes, these are expected business outcomes — logged as warnings so staff can
+    review patterns without treating them as server outages.
+    """
+    extra: dict = {"category": "payment", "operation": operation}
+    if invoice_id is not None:
+        extra["invoice_id"] = invoice_id
+    if patient_id is not None:
+        extra["patient_id"] = patient_id
+    if error_code:
+        extra["error_code"] = (error_code or "")[:500]
+    return capture_application_error(
+        message=(detail or "Payment failed.")[:8000],
+        request=request,
+        source="api",
+        level="warning",
+        status_code=status_code,
+        extra=extra,
+        exception_type=f"Payment:{operation}"[:200],
+        fingerprint_message=(error_code or detail or operation)[:500],
+    )
 
 
 def drf_exception_handler(exc, context):
