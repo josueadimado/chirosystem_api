@@ -34,11 +34,15 @@ from asgiref.sync import sync_to_async
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from apps.clinic.chiropractic_booking_policy import chiropractic_booking_must_use_intake
+from apps.clinic.error_tracking import capture_voice_ai_error
 from apps.clinic.models import Appointment, ClinicSettings, Patient, Service, VoiceCallLog
 from apps.clinic.patient_phone import patients_matching_phone
 from apps.clinic.public_booking_service import (
     cancel_appointment_public,
     create_appointment_from_public_booking,
+    normalize_caller_phone,
+    public_self_service_household_context,
+    public_self_service_upcoming_appointments,
     reschedule_appointment_public,
 )
 from apps.clinic.serializers import PublicBookingSerializer
@@ -74,6 +78,15 @@ _clinic_get_solo_async = sync_to_async(ClinicSettings.get_solo, thread_sensitive
 _openai_parse_datetime_async = sync_to_async(openai_parse_datetime, thread_sensitive=True)
 
 logger = logging.getLogger("voice_relay")
+
+_capture_voice_error_async = sync_to_async(capture_voice_ai_error, thread_sensitive=True)
+
+
+async def _log_voice_error(**kwargs) -> None:
+    try:
+        await _capture_voice_error_async(**kwargs)
+    except Exception:
+        logger.exception("error tracker: voice capture failed")
 
 app = FastAPI(title="ChiroFlow Voice Relay")
 
@@ -332,6 +345,15 @@ async def _llm_respond(
                 break
 
     logger.error("All OpenAI models exhausted — using fallback response")
+    if state:
+        await _log_voice_error(
+            message="All OpenAI chat models failed for voice reply",
+            channel="conversation_relay",
+            operation="llm_reply",
+            call_sid=state.call_sid,
+            from_number=state.from_number,
+            level="warning",
+        )
     return fallback
 
 
@@ -558,9 +580,11 @@ class ConversationState:
         self._noise_count = 0
         self.cancel_appointment_id: int | None = None
         self.pending_appointments: list[int] = []
-        self.self_service_action: str = ""  # "cancel" | "reschedule"
+        self.self_service_action: str = ""  # "cancel" | "reschedule" | "info"
         self.reschedule_appointment_id: int | None = None
         self.offered_slots: list[str] = []
+        self.ambiguous_phone = False
+        self.household_members: list[dict[str, str]] = []
 
     @property
     def current_service(self) -> ServiceEntry | None:
@@ -619,17 +643,16 @@ async def _send_text(ws: WebSocket, text: str, *, last: bool = True):
 # ─── Patient lookup ──────────────────────────────────────────────────
 
 def _lookup_patient(from_number: str) -> Patient | None:
+    """Single profile only — None when zero or multiple patients share the number."""
     if not from_number:
         return None
     normalized = normalize_phone(from_number)
     if not normalized:
         return None
-    try:
-        return Patient.objects.get(phone=normalized)
-    except Patient.DoesNotExist:
-        return None
-    except Patient.MultipleObjectsReturned:
-        return Patient.objects.filter(phone=normalized).first()
+    matches = patients_matching_phone(normalized)
+    if len(matches) == 1:
+        return matches[0]
+    return None
 
 
 def _chiropractic_intake_block_for_caller(from_number: str, service_id: int) -> str | None:
@@ -656,10 +679,24 @@ _chiropractic_intake_block_for_caller_async = sync_to_async(
 
 def _returning_patient_voice_setup(from_number: str) -> dict | None:
     """Load returning-patient context from DB (sync only). Returns None if unknown caller."""
-    patient = _lookup_patient(from_number)
-    if not patient:
+    norm = normalize_phone(from_number)
+    if not norm:
         return None
+    matches = patients_matching_phone(norm)
+    if not matches:
+        return None
+
     catalog = _booking_catalog_json()
+    household = public_self_service_household_context(from_number)
+    if household.get("ambiguous_phone"):
+        return {
+            "ambiguous_phone": True,
+            "household_members": household.get("household_members") or [],
+            "catalog": catalog,
+            "last_service_id": None,
+        }
+
+    patient = matches[0]
     last_sid = None
     last_appt = (
         Appointment.objects.filter(patient=patient)
@@ -675,6 +712,7 @@ def _returning_patient_voice_setup(from_number: str) -> dict | None:
     if last_appt and last_appt.booked_service_id:
         last_sid = last_appt.booked_service_id
     return {
+        "ambiguous_phone": False,
         "first_name": patient.first_name,
         "last_name": patient.last_name,
         "catalog": catalog,
@@ -687,26 +725,146 @@ _returning_setup_async = sync_to_async(_returning_patient_voice_setup, thread_se
 
 # ─── Upcoming appointments (cancel / reschedule) ─────────────────────
 
-def _get_upcoming_appointments(phone: str) -> list[Appointment]:
-    norm = normalize_phone(phone)
-    if not norm:
-        return []
-    patients = patients_matching_phone(norm)
-    if not patients:
-        return []
-    now = timezone.now()
-    return list(
-        Appointment.objects.filter(
-            patient__in=patients,
-            status=Appointment.Status.BOOKED,
-            appointment_date__gte=now.date(),
-        )
-        .select_related("patient", "booked_service")
-        .order_by("appointment_date", "start_time")[:5]
-    )
+def _get_upcoming_appointments(phone: str) -> tuple[list[Appointment], str | None]:
+    return public_self_service_upcoming_appointments(phone)
 
 
 _get_upcoming_appointments_async = sync_to_async(_get_upcoming_appointments, thread_sensitive=True)
+
+
+def _voice_include_patient_names(phone: str, appts: list[Appointment]) -> bool:
+    household = public_self_service_household_context(phone)
+    if household.get("ambiguous_phone"):
+        return True
+    patient_ids = {a.patient_id for a in appts}
+    return len(patient_ids) > 1 or len(appts) > 1
+
+
+def _voice_appt_spoken_label(
+    appt: Appointment,
+    *,
+    include_patient_name: bool,
+    index: int | None = None,
+) -> str:
+    d = appt.appointment_date.strftime("%A, %B %d")
+    t = appt.start_time.strftime("%I:%M %p").lstrip("0")
+    svc = appt.booked_service.label_for_public_booking() if appt.booked_service else "appointment"
+    prefix = f"{index}. " if index is not None else ""
+    if include_patient_name and appt.patient_id:
+        name = f"{appt.patient.first_name} {appt.patient.last_name}".strip()
+        return f"{prefix}{name}'s {svc} on {d} at {t}"
+    return f"{prefix}{svc} on {d} at {t}"
+
+
+async def _present_upcoming_appointments(
+    ws: WebSocket,
+    state: ConversationState,
+    *,
+    action: str,
+) -> None:
+    """List upcoming visits — cancel, reschedule, or info-only."""
+    appts, empty_hint = await _get_upcoming_appointments_async(state.from_number)
+
+    if not appts:
+        hint = empty_hint or (
+            "I don't see any upcoming appointments for your number. "
+            "Would you like to book a new visit?"
+        )
+        if action == "info":
+            await _speak_llm(
+                ws,
+                "Caller asked about their appointment but none are available to read back online. "
+                f"Explain warmly: {hint} Offer to book or transfer to front desk.",
+                hint,
+                state=state,
+            )
+        else:
+            await _speak_llm(
+                ws,
+                f"Caller wants to {action} but has no upcoming appointments they can change online. "
+                f"Explain warmly: {hint} Offer to book a new appointment or transfer to front desk.",
+                hint,
+                state=state,
+            )
+        return
+
+    include_names = _voice_include_patient_names(state.from_number, appts)
+    household = public_self_service_household_context(state.from_number)
+    if household.get("ambiguous_phone"):
+        state.ambiguous_phone = True
+        state.household_members = household.get("household_members") or []
+
+    if action == "info":
+        if len(appts) == 1:
+            label = _voice_appt_spoken_label(appts[0], include_patient_name=include_names)
+            name_note = (
+                " Ask who is calling (full name) before giving details if they have not said yet."
+                if include_names
+                else ""
+            )
+            await _speak_llm(
+                ws,
+                f"Caller wants appointment details. One upcoming visit: {label}.{name_note} "
+                "Read it clearly and ask if they need anything else.",
+                f"I see {label}. Is there anything else I can help with?",
+                state=state,
+            )
+        else:
+            lines = [
+                _voice_appt_spoken_label(a, include_patient_name=include_names, index=i)
+                for i, a in enumerate(appts[:5], 1)
+            ]
+            appt_list = "; ".join(lines)
+            name_note = (
+                " Ask who is calling if unclear, then focus on their visit(s)."
+                if include_names
+                else ""
+            )
+            await _speak_llm(
+                ws,
+                f"Caller wants appointment details. List each visit with patient name when shown: "
+                f"{appt_list}.{name_note} Ask if they need anything else.",
+                f"I see a few upcoming visits: {appt_list}. "
+                f"Which one were you asking about, or is there anything else I can help with?",
+                state=state,
+            )
+        return
+
+    state.self_service_action = action
+
+    if len(appts) == 1:
+        appt = appts[0]
+        label = _voice_appt_spoken_label(appt, include_patient_name=include_names)
+        state.cancel_appointment_id = appt.id
+        state.step = f"confirm_{action}"
+        name_note = (
+            " Confirm who is calling (full name) if multiple people share this number."
+            if include_names
+            else ""
+        )
+        await _speak_llm(
+            ws,
+            f"Caller wants to {action} their appointment. They have one upcoming: {label}.{name_note} "
+            f"Ask if that's the one they want to {action}.",
+            f"I see {label}. Is that the appointment you'd like to {action}?",
+            state=state,
+        )
+    else:
+        lines = [
+            _voice_appt_spoken_label(a, include_patient_name=include_names, index=i)
+            for i, a in enumerate(appts[:3], 1)
+        ]
+        appt_list = "; ".join(lines)
+        state.pending_appointments = [a.id for a in appts[:3]]
+        state.step = "pick_appointment"
+        await _speak_llm(
+            ws,
+            f"Caller has multiple appointments and wants to {action}. "
+            f"List each with patient name when shown and ask which one: {appt_list}",
+            f"I see a few upcoming appointments: {appt_list}. "
+            f"Which one would you like to {action}?",
+            state=state,
+        )
 
 
 # ─── Off-script intent detection ──────────────────────────────────────
@@ -721,8 +879,58 @@ _PRICE_PATTERNS = [
     "pricing", "cost of", "price of", "how much does",
 ]
 _CANCEL_PATTERNS = [
-    "cancel", "reschedule", "change my appointment", "move my appointment",
+    "cancel",
+    "cancellation",
+    "reschedule",
+    "change my appointment",
+    "change the appointment",
+    "move my appointment",
+    "different time",
+    "another time",
+    "new time",
+    "different day",
 ]
+
+
+_APPOINTMENT_INFO_PATTERNS = [
+    "when is my appointment",
+    "what time is my appointment",
+    "confirm my appointment",
+    "check my appointment",
+    "my appointment",
+    "upcoming appointment",
+    "do i have an appointment",
+    "appointment details",
+    "what do i have scheduled",
+    "when am i scheduled",
+]
+
+
+def _detect_appointment_info_intent(speech: str) -> bool:
+    lower = speech.lower().strip()
+    if any(p in lower for p in _APPOINTMENT_INFO_PATTERNS):
+        if any(w in lower for w in ("cancel", "cancellation", "reschedule", "change my appointment", "move my appointment")):
+            return False
+        return True
+    if "appointment" in lower and any(w in lower for w in ("when", "what time", "confirm", "check", "scheduled")):
+        return True
+    return False
+
+
+def _detect_cancel_reschedule_intent(speech: str) -> tuple[bool, str]:
+    """Return (matched, action) where action is 'cancel' or 'reschedule'."""
+    lower = speech.lower().strip()
+    wants_reschedule = any(p in lower for p in _CANCEL_PATTERNS if p not in ("cancel", "cancellation"))
+    if "move" in lower and "appointment" in lower:
+        wants_reschedule = True
+    if "change" in lower and "appointment" in lower:
+        wants_reschedule = True
+    wants_cancel = any(w in lower for w in ("cancel", "cancellation")) and not wants_reschedule
+    if not wants_cancel and not wants_reschedule:
+        return False, ""
+    return True, "reschedule" if wants_reschedule else "cancel"
+
+
 _TRANSFER_PATTERNS = [
     "talk to a person", "speak to someone", "real person", "human",
     "front desk", "receptionist", "operator", "talk to someone",
@@ -798,66 +1006,13 @@ async def _handle_off_script(ws: WebSocket, state: ConversationState, speech: st
         )
         return True
 
-    # Cancel / reschedule — look up upcoming visits by phone
-    if any(p in lower for p in _CANCEL_PATTERNS):
-        wants_reschedule = any(
-            w in lower
-            for w in ("reschedule", "change", "move", "different time", "another time")
-        )
-        wants_cancel = any(w in lower for w in ("cancel", "cancellation")) and not wants_reschedule
-        if not wants_cancel and not wants_reschedule:
-            wants_reschedule = "reschedule" in lower or "change" in lower or "move" in lower
-            wants_cancel = "cancel" in lower
+    matched, action = _detect_cancel_reschedule_intent(speech)
+    if matched:
+        await _present_upcoming_appointments(ws, state, action=action)
+        return True
 
-        action = "reschedule" if wants_reschedule else "cancel"
-        state.self_service_action = action
-
-        appts = await _get_upcoming_appointments_async(state.from_number)
-
-        if not appts:
-            await _speak_llm(
-                ws,
-                "Caller wants to cancel or reschedule but has no upcoming appointments on file. "
-                "Let them know warmly and offer to book a new appointment instead.",
-                "I don't see any upcoming appointments for your number. "
-                "Would you like to book a new visit?",
-                state=state,
-            )
-            return True
-
-        if len(appts) == 1:
-            appt = appts[0]
-            d = appt.appointment_date.strftime("%A, %B %d")
-            t = appt.start_time.strftime("%I:%M %p").lstrip("0")
-            svc = appt.booked_service.name if appt.booked_service else "appointment"
-            state.cancel_appointment_id = appt.id
-            state.step = f"confirm_{action}"
-            await _speak_llm(
-                ws,
-                f"Caller wants to {action} their appointment. They have one upcoming: "
-                f"{svc} on {d} at {t}. Ask if that's the one they want to {action}.",
-                f"I see your {svc} on {d} at {t}. "
-                f"Is that the appointment you'd like to {action}?",
-                state=state,
-            )
-        else:
-            lines = []
-            for i, a in enumerate(appts[:3], 1):
-                d = a.appointment_date.strftime("%A %B %d")
-                t = a.start_time.strftime("%I:%M %p").lstrip("0")
-                svc = a.booked_service.name if a.booked_service else "appointment"
-                lines.append(f"{i}. {svc} on {d} at {t}")
-            appt_list = ", ".join(lines)
-            state.pending_appointments = [a.id for a in appts[:3]]
-            state.step = "pick_appointment"
-            await _speak_llm(
-                ws,
-                f"Caller has multiple appointments and wants to cancel or reschedule. "
-                f"List them and ask which one: {appt_list}",
-                f"I see a few upcoming appointments. {appt_list}. "
-                f"Which one would you like to change?",
-                state=state,
-            )
+    if _detect_appointment_info_intent(speech):
+        await _present_upcoming_appointments(ws, state, action="info")
         return True
 
     return False
@@ -872,84 +1027,40 @@ def _find_nearby_slots(
     rejected_time,
     max_suggestions: int = 3,
     *,
-    within_minutes: int | None = 120,
+    within_minutes: int | None = None,
 ) -> list[str]:
     """Find available slots on the same date, optionally within ±within_minutes of rejected time."""
-    from apps.clinic.models import Provider, Service
-    from apps.clinic.booking_availability import provider_interval_blocked_online
-    from apps.clinic.online_booking_hours import (
-        CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES,
-        effective_public_booking_window_minutes,
-        public_booking_last_slot_start_minute,
-        public_booking_treatment_duration_minutes,
+    from apps.clinic.booking_availability import (
+        format_slot_time_label,
+        public_available_slot_times_for_service,
     )
-    from apps.clinic.public_booking_service import public_online_booking_calendar_span_minutes
-    from datetime import time as time_cls
+    from apps.clinic.timezone_utils import filter_past_slot_times_for_date
 
-    if not provider_id:
+    slot_times = public_available_slot_times_for_service(
+        service_id=service_id,
+        appt_date=appt_date,
+        provider_id=provider_id,
+    )
+    if not slot_times and provider_id is not None:
+        slot_times = public_available_slot_times_for_service(
+            service_id=service_id,
+            appt_date=appt_date,
+            provider_id=None,
+        )
+    slot_times = filter_past_slot_times_for_date(slot_times, appt_date, buffer_minutes=30)
+    if not slot_times:
         return []
-    provider = Provider.objects.filter(pk=provider_id, active=True).first()
-    service = Service.objects.filter(pk=service_id, is_active=True).first()
-    if not provider or not service:
-        return []
 
-    required_span = public_online_booking_calendar_span_minutes(service)
-    closing_compliance_span = public_booking_treatment_duration_minutes(service)
-    slot_step = CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES
-    win = effective_public_booking_window_minutes(appt_date, service)
-    if not win:
-        return []
-    day_start, day_end = win
-
-    last_slot_start = public_booking_last_slot_start_minute(appt_date, day_end)
-
-    taken = set()
-    for s, e in (
-        Appointment.objects.filter(provider=provider, appointment_date=appt_date)
-        .exclude(status__in=[
-            Appointment.Status.CANCELLED, Appointment.Status.NO_SHOW,
-            Appointment.Status.COMPLETED,
-        ])
-        .values_list("start_time", "end_time")
-    ):
-        for m in range(s.hour * 60 + s.minute, e.hour * 60 + e.minute):
-            taken.add(m)
-
-    past_cutoff: dt_time | None = None
-    if appt_date == today_clinic():
-        past_cutoff = (now_clinic() + timedelta(minutes=30)).time()
-
-    slots: list[tuple[int, str]] = []
-    cursor = day_start
     target_min = rejected_time.hour * 60 + rejected_time.minute if rejected_time else 600
-    while cursor <= last_slot_start:
-        if cursor + closing_compliance_span <= day_end and not any(
-            cursor <= t < cursor + required_span for t in taken
-        ):
-            h, m = divmod(cursor, 60)
-            st = time_cls(hour=h, minute=m)
-            et_total = cursor + required_span
-            eh, em = divmod(et_total, 60)
-            et = time_cls(hour=min(eh, 23), minute=em if eh < 24 else 59)
-            treat_total = cursor + closing_compliance_span
-            teh, tem = divmod(treat_total, 60)
-            treat_t = time_cls(hour=min(teh, 23), minute=tem if teh < 24 else 59)
-            if not provider_interval_blocked_online(
-                provider.pk, appt_date, st, et, block_overlap_end=treat_t
-            ):
-                if past_cutoff is not None and st < past_cutoff:
-                    cursor += slot_step
-                    continue
-                suffix = "AM" if h < 12 else "PM"
-                dh = h if 1 <= h <= 12 else (h - 12 if h > 12 else 12)
-                label = f"{dh}:{m:02d} {suffix}"
-                dist = abs(cursor - target_min)
-                if within_minutes is None or dist <= within_minutes:
-                    slots.append((dist, label))
-        cursor += slot_step
+    ranked: list[tuple[int, str]] = []
+    for st in slot_times:
+        cursor = st.hour * 60 + st.minute
+        if within_minutes is not None and abs(cursor - target_min) > within_minutes:
+            continue
+        ranked.append((abs(cursor - target_min), format_slot_time_label(st)))
 
-    slots.sort(key=lambda x: x[0])
-    return [label for _, label in slots[:max_suggestions]]
+    ranked.sort(key=lambda x: x[0])
+    return [label for _, label in ranked[:max_suggestions]]
 
 
 def _find_next_available_slot(
@@ -1024,11 +1135,20 @@ async def handle_name(ws: WebSocket, state: ConversationState, speech: str):
     state.catalog = await _booking_catalog_async()
 
     services = _svc_list(state.catalog)
+    household_note = ""
+    if state.ambiguous_phone and state.household_members:
+        known = ", ".join(
+            f"{m['first_name']} {m['last_name']}".strip() for m in state.household_members
+        )
+        household_note = (
+            f" This phone number is shared by: {known}. "
+            f"Confirm the visit is for {fn} {ln} when booking."
+        )
     await _speak_llm(
         ws,
         f"The caller's name is {fn} {ln}. Thank them by name — do NOT say hi/hello again "
         f"(they already heard the phone welcome). "
-        f"Then ask what service they'd like. Mention they can book more than one. "
+        f"Then ask what service they'd like. Mention they can book more than one.{household_note} "
         f"REQUIRED FACTS — available services: {services}",
         f"Great to meet you, {fn}! We offer: {services}. Which one would you like? You can also book more than one.",
     state=state,
@@ -1928,24 +2048,46 @@ def _book_single_try_sync(
     ser = PublicBookingSerializer(data=payload)
     if not ser.is_valid():
         logger.info("Voice serializer errors: %s", ser.errors)
+        detail = str(ser.errors)[:2000]
         upsert_voice_call_log(
             call_sid=call_sid,
             from_number=from_number,
             transcript=transcript,
             outcome=VoiceCallLog.Outcome.SERIALIZER_REJECTED,
-            detail=str(ser.errors)[:2000],
+            detail=detail,
+        )
+        capture_voice_ai_error(
+            message=f"Voice booking serializer rejected: {detail}",
+            channel="conversation_relay",
+            operation="book_appointment",
+            call_sid=call_sid,
+            from_number=from_number,
+            level="warning",
+            fingerprint_message=detail[:500],
+            exception_type="VoiceBooking:serializer",
         )
         return "serializer", None, None
     vd = ser.validated_data
     appt, err = create_appointment_from_public_booking(vd)
     if err:
         logger.info("Voice booking error: %s", err)
+        err_detail = err[:2000]
         upsert_voice_call_log(
             call_sid=call_sid,
             from_number=from_number,
             transcript=transcript,
             outcome=VoiceCallLog.Outcome.SLOT_OR_RULE_ERROR,
-            detail=err[:2000],
+            detail=err_detail,
+        )
+        capture_voice_ai_error(
+            message=f"Voice booking failed: {err_detail}",
+            channel="conversation_relay",
+            operation="book_appointment",
+            call_sid=call_sid,
+            from_number=from_number,
+            level="warning",
+            fingerprint_message=err_detail[:500],
+            exception_type="VoiceBooking:slot_or_rule",
         )
         p_phone = normalize_phone(vd["phone"])
         patient = Patient.objects.filter(phone=p_phone).first()
@@ -2104,7 +2246,7 @@ async def _offer_alternative_slots(ws, state, svc, rejected_time):
         appt_date,
         rejected_time,
         max_suggestions=3,
-        within_minutes=120,
+        within_minutes=None,
     )
 
     if nearby:
@@ -2308,8 +2450,15 @@ async def handle_confirm_cancel(ws: WebSocket, state: ConversationState, speech:
         )
         return
 
+    if not state.cancel_appointment_id:
+        await _send_text(ws, "I lost track of which appointment to cancel. Let's start over — what can I help with?")
+        state.step = "service" if state.catalog else "name"
+        return
+
     def _cancel():
-        norm = normalize_phone(state.from_number)
+        norm = normalize_caller_phone(state.from_number)
+        if not norm:
+            return None, "We couldn't read the phone number on this call. Please call the clinic."
         return cancel_appointment_public(
             phone_normalized=norm,
             appointment_id=state.cancel_appointment_id,
@@ -2418,7 +2567,9 @@ async def handle_reschedule_datetime(ws: WebSocket, state: ConversationState, sp
         return
 
     def _reschedule():
-        norm = normalize_phone(state.from_number)
+        norm = normalize_caller_phone(state.from_number)
+        if not norm:
+            return None, "We couldn't read the phone number on this call. Please call the clinic."
         return reschedule_appointment_public(
             phone_normalized=norm,
             appointment_id=appt_id,
@@ -2671,17 +2822,28 @@ async def voice_websocket(ws: WebSocket):
                 # DO NOT send any text here — welcomeGreeting in TwiML handles the greeting
                 returning = await _returning_setup_async(from_number)
                 if returning:
-                    state.first_name = returning["first_name"]
-                    state.last_name = returning["last_name"]
-                    state.step = "service"
-                    state.is_returning = True
                     state.catalog = returning["catalog"]
-                    if returning["last_service_id"]:
-                        state.last_service_id = returning["last_service_id"]
-                    logger.info(
-                        "Voice WS [%s] returning patient: %s %s",
-                        call_sid[:8], returning["first_name"], returning["last_name"],
-                    )
+                    if returning.get("ambiguous_phone"):
+                        state.ambiguous_phone = True
+                        state.household_members = returning.get("household_members") or []
+                        state.step = "name"
+                        state.is_returning = False
+                        logger.info(
+                            "Voice WS [%s] shared phone — %s household profile(s)",
+                            call_sid[:8],
+                            len(state.household_members),
+                        )
+                    else:
+                        state.first_name = returning["first_name"]
+                        state.last_name = returning["last_name"]
+                        state.step = "service"
+                        state.is_returning = True
+                        if returning["last_service_id"]:
+                            state.last_service_id = returning["last_service_id"]
+                        logger.info(
+                            "Voice WS [%s] returning patient: %s %s",
+                            call_sid[:8], returning["first_name"], returning["last_name"],
+                        )
 
             elif msg_type == "interrupt":
                 if state:
@@ -2816,6 +2978,13 @@ async def voice_websocket(ws: WebSocket):
                         outcome=VoiceCallLog.Outcome.OPENAI_FAILED,
                         detail=f"relay:{desc}"[:2000],
                     )
+                    await _log_voice_error(
+                        message=f"ConversationRelay error: {desc}"[:8000],
+                        channel="conversation_relay",
+                        operation="relay_error",
+                        call_sid=state.call_sid,
+                        from_number=state.from_number,
+                    )
 
     except WebSocketDisconnect:
         _last_responses.pop(id(ws), None)
@@ -2830,6 +2999,15 @@ async def voice_websocket(ws: WebSocket):
             state.call_sid[:8] if state else "?",
             e,
         )
+        if state:
+            await _log_voice_error(
+                exc=e,
+                message="ConversationRelay voice websocket failed",
+                channel="conversation_relay",
+                operation="websocket",
+                call_sid=state.call_sid,
+                from_number=state.from_number,
+            )
         try:
             await _send_text(
                 ws,

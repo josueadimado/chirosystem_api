@@ -28,6 +28,7 @@ from asgiref.sync import sync_to_async
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
 
+from apps.clinic.error_tracking import capture_voice_ai_error
 from apps.clinic.models import Appointment, ClinicSettings, Patient, Provider, Service, VoiceCallLog
 from apps.clinic.timezone_utils import (
     filter_past_slot_times_for_date,
@@ -37,8 +38,12 @@ from apps.clinic.timezone_utils import (
 )
 from apps.clinic.patient_phone import patients_matching_phone
 from apps.clinic.public_booking_service import (
+    appointment_to_self_service_payload,
     cancel_appointment_public,
     create_appointment_from_public_booking,
+    normalize_caller_phone,
+    public_self_service_household_context,
+    public_self_service_upcoming_appointments,
     reschedule_appointment_public,
 )
 from apps.clinic.serializers import PublicBookingSerializer
@@ -57,8 +62,6 @@ from apps.clinic.voice_logging import (
     async_upsert_voice_call_log,
 )
 from apps.clinic.voice_office import (
-    clinic_office_phone_display,
-    clinic_office_phone_e164,
     clinic_public_info_prompt_block,
     transfer_active_call_to_office,
     voice_clinic_display_name,
@@ -134,7 +137,11 @@ REALTIME_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": "get_upcoming_appointments",
-        "description": "List upcoming booked appointments for a phone number.",
+        "description": (
+            "List upcoming booked appointments for a phone number. "
+            "Each row includes patient_name when several people share the number. "
+            "Also returns ambiguous_phone and household_members when applicable."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -175,9 +182,10 @@ REALTIME_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "name": "transfer_to_front_desk",
         "description": (
-            "Connect the caller to a live person at the clinic front desk when they ask to speak "
-            "with staff, the office, a human, receptionist, or front desk. "
-            "Do not read or mention the office phone number — just transfer."
+            "Connect the caller to a live person at the clinic front desk. Use when they ask to "
+            "speak with staff, the office, a human, receptionist, or front desk; when they ask "
+            "for the clinic phone number or how to reach the office; or when you cannot help and "
+            "they need a person. Never read or mention any phone number — just transfer."
         ),
         "parameters": {"type": "object", "properties": {}},
     },
@@ -278,9 +286,12 @@ def _build_system_prompt(*, from_number: str) -> str:
         if len(matches) == 1:
             returning_note = _returning_patient_prompt_note(matches[0])
         elif len(matches) > 1:
+            names = ", ".join(f"{p.first_name} {p.last_name}".strip() for p in matches)
             returning_note = (
-                "\nINTERNAL STAFF NOTE: Multiple patients share this phone — confirm full legal name "
-                "before booking or discussing any appointment. Never mention other patients on this line."
+                "\nSHARED PHONE / HOUSEHOLD: Multiple patient profiles share this number "
+                f"({names}). Confirm who is calling (full name) before booking or discussing visits. "
+                "When listing appointments from get_upcoming_appointments, always say each "
+                "patient_name with date/time/service so callers are not confused."
             )
 
     now = now_clinic()
@@ -299,9 +310,7 @@ CRITICAL TIME RULES:
 - When caller says "this afternoon" or "later today" only consider times after {now.strftime("%I:%M %p")}
 """
 
-    public_clinic = clinic_public_info_prompt_block(clinic)
-    office_display = clinic_office_phone_display()
-    office_e164 = clinic_office_phone_e164()
+    public_clinic = clinic_public_info_prompt_block(clinic, include_phone=False)
     exact_clinic_name = voice_clinic_display_name(clinic)
 
     return f"""You are Sarah, the friendly front desk receptionist at {exact_clinic_name} in Michigan.
@@ -316,25 +325,29 @@ Timezone: {tz_name}
 
 PRIVACY AND CONFIDENTIALITY (critical):
 - NEVER disclose patient information, medical details, billing balances, insurance IDs, date of birth, chart notes, or any protected health information.
-- NEVER mention another patient's name, appointment, or records — even if you have internal background notes.
-- Do NOT mention another patient's name, appointment, or records — even if you have internal background notes.
-- If the opening greeting used the caller's first name (returning patient on file), you may continue using their first name — but still do NOT mention visit history, diagnoses, or billing until needed for scheduling.
-- Only discuss a caller's own upcoming appointments after using get_upcoming_appointments or cancel/reschedule tools (phone must match).
-- If someone asks about another person ("my wife's appointment", "is John Smith coming in?"): say you cannot share other patients' information and offer to connect them to the front desk.
+- Do NOT read another patient's chart, billing, or clinical details — even if you have internal background notes.
+- If the opening greeting used the caller's first name (single profile on this number), you may continue using their first name — but still do NOT mention visit history, diagnoses, or billing until needed for scheduling.
+- Only discuss upcoming appointments after using get_upcoming_appointments or cancel/reschedule tools (phone must match).
+- SHARED PHONE: When ambiguous_phone is true or multiple visits are returned, ask who is calling (full name) if unclear. List each visit with patient_name from the tool (e.g. "Maria's massage Tuesday at 2, Juan's adjustment Tuesday at 2"). After they identify themselves, focus on their visit(s) only.
+- If someone asks about a person who is NOT on this phone number's household ("is John Smith coming in?" with no match): say you cannot share other patients' information and call transfer_to_front_desk.
+- Calling on behalf of a household member on this number is OK once they confirm that person's full name matches patient_name on the visit.
 - Never quote tax IDs, NPI numbers, or internal billing codes.
 - Service prices from AVAILABLE SERVICES are public and OK to share.
 
 YOUR SCOPE:
 - You CAN help with: booking, rescheduling, canceling, checking availability, listing the caller's own upcoming visits (after phone verification via tools).
-- You CAN answer public questions: address, directions, location, phone number, email, hours, services and listed prices.
-- You CANNOT help with: billing disputes, insurance verification, clinical advice, medical records, or detailed account questions — transfer to front desk.
-- For anything outside scheduling or public clinic info, offer to connect them to the front desk.
+- You CAN answer public questions: address, directions, location, email, hours, services and listed prices.
+- You CANNOT help with: billing disputes, insurance verification, clinical advice, medical records, or detailed account questions — call transfer_to_front_desk.
+- For anything outside scheduling or public clinic info, call transfer_to_front_desk.
+
+PHONE NUMBER — NEVER SAY IT ALOUD:
+- NEVER read, spell, or mention the clinic phone number, digits, or "call this number" in any situation.
+- If the caller asks for the phone number, how to reach the office, or a direct line: say briefly you will connect them (e.g. "I can connect you to the front desk right now."), then call transfer_to_front_desk — do NOT give digits.
 
 TRANSFER TO A LIVE PERSON:
 - If the caller wants to talk to the office, front desk, receptionist, a real person, or staff — say briefly you will connect them (e.g. "Of course — one moment, I'll connect you to the front desk."), then call transfer_to_front_desk.
-- NEVER read or mention the office phone number when offering or performing a transfer — just transfer the call.
-- Do not argue; transfer promptly when they clearly want a human.
-- If transfer fails, apologize briefly and ask them to try again later — do NOT give a phone number unless they explicitly ask for it.
+- Do not argue; transfer promptly when they clearly want a human or when you cannot help.
+- If transfer fails, apologize briefly and offer to try connecting again — still do NOT give a phone number.
 
 AVAILABLE SERVICES (use service_id and provider_id in tools):
 {_services_prompt_block(catalog)}
@@ -358,6 +371,7 @@ BOOKING FLOW:
 4. Ask what service they need
 5. Ask for preferred date and time
 6. Check availability using check_availability before confirming
+   - Omit provider_id unless the caller asked for a specific doctor — then all eligible providers are checked
 7. Confirm details and book with book_appointment
 8. After booking give confirmation and say goodbye — see AFTER BOOKING (NEW OFFICE / FIRST VISIT) below for first-visit services.
 
@@ -367,7 +381,7 @@ BOOKING FLOW:
 HANDLING ISSUES:
 - If caller asks for address, location, directions, or "where are you": give the Address from PUBLIC CLINIC INFORMATION above in plain language.
 - If caller asks what hours you are open: give Hours above.
-- If caller asks for the phone number or how to reach the office: give Phone above.
+- If caller asks for the phone number or how to reach the office: call transfer_to_front_desk (never read digits).
 - If caller asks about insurance (any phrasing like "do you accept my insurance", "do you take Blue Cross", "are you in network"):
   Say: "Yes we accept most major health insurance. Would you like to schedule an appointment?"
   Then guide to booking.
@@ -378,9 +392,10 @@ HANDLING ISSUES:
   Then guide to booking.
 - If slot taken: call check_availability and offer alternatives
 - If new chiropractic patient may need intake: suggest New Office Visit / intake service from catalog
-- If caller wants cancel/reschedule: get_upcoming_appointments then cancel_appointment or reschedule_appointment
+- If caller wants to check, confirm, cancel, or reschedule a visit: call get_upcoming_appointments first (uses this call's phone number), read empty_hint if no rows, include patient_name when reading visits back, then cancel_appointment or reschedule_appointment with the correct appointment_id
+- For reschedule: call check_availability for the same service_id and new date before reschedule_appointment when possible
 - If outside hours: let them know and offer next available day
-- If caller needs the office for non-scheduling help: call transfer_to_front_desk (do not mention a phone number)
+- If caller needs the office for non-scheduling help: call transfer_to_front_desk
 
 INSURANCE TRACKING:
 Only mention insurance billing AFTER booking if the caller already asked about insurance earlier in this call.
@@ -400,7 +415,7 @@ IMPORTANT:
 - Always check availability before confirming a booking
 - Always confirm details before book_appointment
 - Always say a warm goodbye after booking
-- Front desk transfer number (internal only — NEVER say aloud when transferring; only share Phone from PUBLIC CLINIC INFORMATION if caller explicitly asks for the clinic number): {office_e164}
+- Never say the clinic phone number aloud — connect callers to the front desk with transfer_to_front_desk instead
 """
 
 
@@ -421,79 +436,14 @@ def _get_public_available_slot_times(
     appt_date: date_type,
     provider_id: int | None = None,
 ) -> list[dt_time]:
-    """
-    Same slot logic as public booking availability (views.booking_options.availability).
-    Returns start times as datetime.time objects.
-    """
-    from apps.clinic.booking_availability import provider_interval_blocked_online
-    from apps.clinic.online_booking_hours import (
-        CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES,
-        effective_public_booking_window_minutes,
-        public_booking_last_slot_start_minute,
-        public_booking_treatment_duration_minutes,
+    """Bookable start times — unions all eligible providers when provider_id is omitted."""
+    from apps.clinic.booking_availability import public_available_slot_times_for_service
+
+    return public_available_slot_times_for_service(
+        service_id=service_id,
+        appt_date=appt_date,
+        provider_id=provider_id,
     )
-    from apps.clinic.public_booking_service import public_online_booking_calendar_span_minutes
-
-    service = Service.objects.filter(
-        pk=service_id, is_active=True, show_in_public_booking=True
-    ).first()
-    if not service:
-        return []
-    catalog = _booking_catalog_json()
-    pid = provider_id or _default_provider_id(catalog, service_id)
-    if not pid:
-        return []
-    provider = Provider.objects.filter(pk=pid, active=True).first()
-    if not provider:
-        return []
-
-    win = effective_public_booking_window_minutes(appt_date, service)
-    if not win:
-        return []
-    day_start, day_end = win
-    required_span = public_online_booking_calendar_span_minutes(service)
-    closing_compliance_span = public_booking_treatment_duration_minutes(service)
-    last_slot_start = public_booking_last_slot_start_minute(appt_date, day_end)
-
-    taken: set[int] = set()
-    for s, e in (
-        Appointment.objects.filter(provider=provider, appointment_date=appt_date)
-        .exclude(
-            status__in=[
-                Appointment.Status.CANCELLED,
-                Appointment.Status.NO_SHOW,
-                Appointment.Status.COMPLETED,
-            ]
-        )
-        .values_list("start_time", "end_time")
-    ):
-        for m in range(s.hour * 60 + s.minute, e.hour * 60 + e.minute):
-            taken.add(m)
-
-    available: list[dt_time] = []
-    cursor = day_start
-    while cursor <= last_slot_start:
-        h, m = divmod(cursor, 60)
-        slot_start_time = dt_time(hour=h, minute=m)
-        end_total = cursor + required_span
-        eh, em = divmod(end_total, 60)
-        slot_end_time = dt_time(hour=min(eh, 23), minute=em if eh < 24 else 59)
-        treat_total = cursor + closing_compliance_span
-        teh, tem = divmod(treat_total, 60)
-        treat_end = dt_time(hour=min(teh, 23), minute=tem if teh < 24 else 59)
-        if cursor + closing_compliance_span <= day_end and not any(
-            cursor <= t < cursor + required_span for t in taken
-        ):
-            if not provider_interval_blocked_online(
-                provider.pk,
-                appt_date,
-                slot_start_time,
-                slot_end_time,
-                block_overlap_end=treat_end,
-            ):
-                available.append(slot_start_time)
-        cursor += CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES
-    return available
 
 
 def get_public_available_slots(
@@ -519,18 +469,44 @@ def _check_availability_sync(
 ) -> dict[str, Any]:
     """
     Availability for AI voice: clinic-local today + 30-minute buffer filters past slots.
+    Checks all eligible providers when provider_id is omitted; falls back to other
+    providers when a specific provider is fully booked.
     """
+    from apps.clinic.booking_availability import (
+        format_slot_time_label,
+        public_available_slot_times_for_service,
+    )
+
     try:
         requested_date = datetime.date.fromisoformat(date_str)
     except ValueError:
         return {"available": False, "error": "Invalid date format"}
 
+    if not Service.objects.filter(
+        pk=service_id, is_active=True, show_in_public_booking=True
+    ).exists():
+        return {"available": False, "error": "Unknown or inactive service_id."}
+
     today = today_clinic()
-    slots = _get_public_available_slot_times(
+    slots = public_available_slot_times_for_service(
         service_id=service_id,
         appt_date=requested_date,
         provider_id=provider_id,
     )
+    alternate_note = ""
+    if provider_id is not None and not slots:
+        fallback_slots = public_available_slot_times_for_service(
+            service_id=service_id,
+            appt_date=requested_date,
+            provider_id=None,
+        )
+        if fallback_slots:
+            slots = fallback_slots
+            alternate_note = (
+                "The requested provider is fully booked that day; "
+                "these times are with other available providers."
+            )
+
     slots = filter_past_slot_times_for_date(slots, requested_date, buffer_minutes=30)
 
     if requested_date == today and not slots:
@@ -548,42 +524,34 @@ def _check_availability_sync(
             "message": "No available slots for that date.",
         }
 
-    return {
+    result: dict[str, Any] = {
         "available": True,
         "date": date_str,
-        "slots": [s.strftime("%I:%M %p").lstrip("0") for s in slots[:8]],
+        "slots": [format_slot_time_label(s) for s in slots[:8]],
         "timezone": get_clinic_tz_name(),
     }
+    if alternate_note:
+        result["message"] = alternate_note
+        result["requested_provider_unavailable"] = True
+    return result
 
 
-def _get_upcoming_appointments(phone: str) -> list[dict[str, Any]]:
-    norm = normalize_phone(phone)
-    if not norm:
-        return []
-    patients = patients_matching_phone(norm)
-    if not patients:
-        return []
-    rows = (
-        Appointment.objects.filter(
-            patient__in=patients,
-            status=Appointment.Status.BOOKED,
-            appointment_date__gte=today_clinic(),
-        )
-        .select_related("booked_service")
-        .order_by("appointment_date", "start_time")[:5]
-    )
-    out = []
-    for a in rows:
-        svc = a.booked_service.name if a.booked_service else "appointment"
-        out.append(
-            {
-                "appointment_id": a.id,
-                "service": svc,
-                "date": a.appointment_date.isoformat(),
-                "time": a.start_time.strftime("%I:%M %p").lstrip("0"),
-            }
-        )
-    return out
+def _caller_phone_for_tools(from_number: str, args_phone: str | None = None) -> str:
+    """Prefer Twilio caller ID over model-supplied phone for cancel/reschedule security."""
+    return (from_number or "").strip() or (args_phone or "").strip()
+
+
+def _get_upcoming_appointments(phone: str) -> dict[str, Any]:
+    rows, hint = public_self_service_upcoming_appointments(phone)
+    household = public_self_service_household_context(phone)
+    patient_ids = {a.patient_id for a in rows}
+    return {
+        **household,
+        "appointments": [appointment_to_self_service_payload(a) for a in rows],
+        "empty_hint": hint or "",
+        "multiple_appointments": len(rows) > 1,
+        "multiple_patients_in_results": len(patient_ids) > 1,
+    }
 
 
 def _book_appointment_sync(payload: dict[str, Any]) -> dict[str, Any]:
@@ -619,9 +587,11 @@ def _book_appointment_sync(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _cancel_appointment_sync(phone: str, appointment_id: int) -> dict[str, Any]:
-    norm = normalize_phone(phone)
+    if not appointment_id:
+        return {"ok": False, "error": "appointment_id is required."}
+    norm = normalize_caller_phone(phone)
     if not norm:
-        return {"ok": False, "error": "Invalid phone number."}
+        return {"ok": False, "error": "Invalid phone number on this call."}
     appt, err = cancel_appointment_public(
         phone_normalized=norm, appointment_id=int(appointment_id)
     )
@@ -633,9 +603,11 @@ def _cancel_appointment_sync(phone: str, appointment_id: int) -> dict[str, Any]:
 def _reschedule_appointment_sync(
     phone: str, appointment_id: int, new_date: str, new_time: str
 ) -> dict[str, Any]:
-    norm = normalize_phone(phone)
+    if not appointment_id:
+        return {"ok": False, "error": "appointment_id is required."}
+    norm = normalize_caller_phone(phone)
     if not norm:
-        return {"ok": False, "error": "Invalid phone number."}
+        return {"ok": False, "error": "Invalid phone number on this call."}
     try:
         d = date_type.fromisoformat(new_date)
     except ValueError:
@@ -678,6 +650,36 @@ _reschedule_async = sync_to_async(_reschedule_appointment_sync, thread_sensitive
 _transfer_async = sync_to_async(transfer_active_call_to_office, thread_sensitive=True)
 _build_prompt_async = sync_to_async(_build_system_prompt, thread_sensitive=True)
 _voice_greeting_async = sync_to_async(voice_greeting_for_caller, thread_sensitive=True)
+_capture_voice_error_async = sync_to_async(capture_voice_ai_error, thread_sensitive=True)
+
+
+async def _log_voice_error(**kwargs) -> None:
+    try:
+        await _capture_voice_error_async(**kwargs)
+    except Exception:
+        logger.exception("error tracker: voice capture failed")
+
+
+async def _log_voice_tool_failure(
+    *,
+    name: str,
+    result: dict[str, Any],
+    call_sid: str,
+    from_number: str,
+) -> None:
+    if result.get("ok") is not False and "error" not in result:
+        return
+    err = str(result.get("error") or result.get("detail") or "Tool failed")[:8000]
+    await _log_voice_error(
+        message=f"Realtime tool {name}: {err}",
+        channel="realtime",
+        operation=f"tool:{name}",
+        call_sid=call_sid,
+        from_number=from_number,
+        level="warning",
+        fingerprint_message=err[:500],
+        exception_type=f"VoiceTool:{name}"[:200],
+    )
 
 
 async def _run_tool(name: str, args: dict[str, Any], *, call_sid: str, from_number: str) -> str:
@@ -727,26 +729,46 @@ async def _run_tool(name: str, args: dict[str, Any], *, call_sid: str, from_numb
                     outcome=VoiceCallLog.Outcome.BOOKED,
                     detail=f"booked:{result.get('appointment_id')}",
                 )
+            else:
+                await _log_voice_tool_failure(
+                    name="book_appointment",
+                    result=result,
+                    call_sid=call_sid,
+                    from_number=from_number,
+                )
             return json.dumps(result)
 
         if name == "get_upcoming_appointments":
-            phone = str(args.get("phone") or from_number)
-            appts = await _get_upcoming_async(phone)
-            return json.dumps({"appointments": appts})
+            phone = _caller_phone_for_tools(from_number, args.get("phone"))
+            return json.dumps(_get_upcoming_appointments(phone))
 
         if name == "cancel_appointment":
-            phone = str(args.get("phone") or from_number)
+            phone = _caller_phone_for_tools(from_number, args.get("phone"))
             result = await _cancel_async(phone, int(args["appointment_id"]))
+            if isinstance(result, dict):
+                await _log_voice_tool_failure(
+                    name="cancel_appointment",
+                    result=result,
+                    call_sid=call_sid,
+                    from_number=from_number,
+                )
             return json.dumps(result)
 
         if name == "reschedule_appointment":
-            phone = str(args.get("phone") or from_number)
+            phone = _caller_phone_for_tools(from_number, args.get("phone"))
             result = await _reschedule_async(
                 phone,
                 int(args["appointment_id"]),
                 str(args["new_date"]),
                 str(args["new_time"]),
             )
+            if isinstance(result, dict):
+                await _log_voice_tool_failure(
+                    name="reschedule_appointment",
+                    result=result,
+                    call_sid=call_sid,
+                    from_number=from_number,
+                )
             return json.dumps(result)
 
         if name == "transfer_to_front_desk":
@@ -758,11 +780,28 @@ async def _run_tool(name: str, args: dict[str, Any], *, call_sid: str, from_numb
                     outcome=VoiceCallLog.Outcome.DISCONNECTED,
                     detail=f"transferred_to_office:{result.get('transferred_to', '')}",
                 )
+            else:
+                await _log_voice_error(
+                    message=str(result.get("error") or "Transfer to front desk failed")[:8000],
+                    channel="realtime",
+                    operation="transfer_to_front_desk",
+                    call_sid=call_sid,
+                    from_number=from_number,
+                    level="warning",
+                )
             return json.dumps(result)
 
         return json.dumps({"error": f"Unknown tool: {name}"})
     except Exception as exc:
         logger.exception("Realtime tool %s failed", name)
+        await _log_voice_error(
+            exc=exc,
+            message=f"Realtime tool {name} failed",
+            channel="realtime",
+            operation=f"tool:{name}",
+            call_sid=call_sid,
+            from_number=from_number,
+        )
         return json.dumps({"ok": False, "error": str(exc)})
 
 
@@ -964,7 +1003,15 @@ class RealtimeBridge:
             return
 
         if etype == "error":
+            err_msg = str(event.get("error") or event)[:8000]
             logger.error("Realtime [%s] OpenAI error: %s", self.call_sid[:8], event)
+            await _log_voice_error(
+                message=f"OpenAI Realtime error: {err_msg}",
+                channel="realtime",
+                operation="openai_error_event",
+                call_sid=self.call_sid,
+                from_number=self.from_number,
+            )
             return
 
     async def close_openai(self) -> None:
@@ -989,8 +1036,16 @@ async def _openai_reader(bridge: RealtimeBridge) -> None:
             await bridge.receive_from_openai(event)
     except ConnectionClosed:
         logger.info("Realtime [%s] OpenAI socket closed", bridge.call_sid[:8])
-    except Exception:
+    except Exception as exc:
         logger.exception("Realtime [%s] OpenAI reader error", bridge.call_sid[:8])
+        await _log_voice_error(
+            exc=exc,
+            message="OpenAI Realtime reader failed",
+            channel="realtime",
+            operation="openai_reader",
+            call_sid=bridge.call_sid,
+            from_number=bridge.from_number,
+        )
 
 
 @app.websocket("/ws/realtime")
@@ -1030,7 +1085,18 @@ async def twilio_realtime_stream(ws: WebSocket):
                     greeting=greeting,
                     stream_sid=stream_sid,
                 )
-                await bridge.connect_openai()
+                try:
+                    await bridge.connect_openai()
+                except Exception as exc:
+                    await _log_voice_error(
+                        exc=exc,
+                        message="Could not start OpenAI Realtime session",
+                        channel="realtime",
+                        operation="connect_openai",
+                        call_sid=call_sid,
+                        from_number=from_number,
+                    )
+                    raise
                 reader_task = asyncio.create_task(_openai_reader(bridge))
                 await bridge.send_greeting()
                 logger.info(
@@ -1059,11 +1125,20 @@ async def twilio_realtime_stream(ws: WebSocket):
             "Realtime [%s] Twilio disconnected",
             bridge.call_sid[:8] if bridge else "?",
         )
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "Realtime [%s] unexpected error",
             bridge.call_sid[:8] if bridge else "?",
         )
+        if bridge:
+            await _log_voice_error(
+                exc=exc,
+                message="Realtime voice websocket failed",
+                channel="realtime",
+                operation="websocket",
+                call_sid=bridge.call_sid,
+                from_number=bridge.from_number,
+            )
     finally:
         if reader_task:
             reader_task.cancel()

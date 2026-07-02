@@ -112,17 +112,21 @@ def voice_greeting_opening(clinic_name: str) -> str:
     )
 
 
-def clinic_public_info_prompt_block(clinic: ClinicSettings | None = None) -> str:
+def clinic_public_info_prompt_block(
+    clinic: ClinicSettings | None = None,
+    *,
+    include_phone: bool = True,
+) -> str:
     """Public clinic facts the voice AI may share (from Admin Settings)."""
     c = clinic or ClinicSettings.get_solo()
-    phone = clinic_office_phone_display()
     address = clinic_public_address_display(c)
     email = (c.email or "").strip()
     lines = [
         f"Clinic name: {c.clinic_name}",
         f"Address: {address or '(not set in settings)'}",
-        f"Phone: {phone}",
     ]
+    if include_phone:
+        lines.append(f"Phone: {clinic_office_phone_display()}")
     if email:
         lines.append(f"Email: {email}")
     return "\n".join(lines)

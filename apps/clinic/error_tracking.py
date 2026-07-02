@@ -406,6 +406,8 @@ def capture_application_error(
     extra: dict | None = None,
     fingerprint_message: str | None = None,
     exception_type: str | None = None,
+    path_override: str | None = None,
+    http_method_override: str | None = None,
 ) -> int | None:
     """Persist one error row. Returns pk or None if logging failed."""
     from apps.clinic.models import SystemErrorLog
@@ -434,6 +436,10 @@ def capture_application_error(
         user_id, user_role, user_display = _user_snapshot(request)
         if http_method in ("POST", "PUT", "PATCH"):
             request_body = sanitize_request_payload(request)
+    if path_override is not None:
+        path = path_override[:500]
+    if http_method_override is not None:
+        http_method = http_method_override[:10]
 
     fingerprint = build_error_fingerprint(
         source=source,
@@ -502,6 +508,46 @@ def capture_payment_failure(
         extra=extra,
         exception_type=f"Payment:{operation}"[:200],
         fingerprint_message=(error_code or detail or operation)[:500],
+    )
+
+
+def capture_voice_ai_error(
+    *,
+    exc: BaseException | None = None,
+    message: str = "",
+    channel: str = "realtime",
+    operation: str = "",
+    call_sid: str = "",
+    from_number: str = "",
+    level: str = "error",
+    extra: dict | None = None,
+    fingerprint_message: str | None = None,
+    exception_type: str | None = None,
+) -> int | None:
+    """
+    Log Sarah / voice assistant failures for Admin → Errors.
+
+    channel: ``realtime`` (Sarah / Media Streams) or ``conversation_relay`` (legacy voice).
+    """
+    op = (operation or "unknown").strip().replace(" ", "_")[:80]
+    ch = (channel or "realtime").strip().replace(" ", "_")[:40]
+    merged: dict = {"category": "voice_ai", "channel": ch, "operation": op}
+    if call_sid:
+        merged["call_sid"] = call_sid[:64]
+    if from_number:
+        merged["from_number"] = _redact_value("phone", from_number)
+    if extra:
+        merged.update(extra)
+    return capture_application_error(
+        exc=exc,
+        message=(message or "Voice AI error")[:8000],
+        source="voice_ai",
+        level=level,
+        extra=merged,
+        path_override=f"/voice/{ch}/{op}",
+        http_method_override="WS",
+        fingerprint_message=fingerprint_message,
+        exception_type=exception_type,
     )
 
 

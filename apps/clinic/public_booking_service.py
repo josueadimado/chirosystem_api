@@ -25,7 +25,11 @@ from .online_booking_hours import (
     public_booking_treatment_duration_minutes,
 )
 from .models import Appointment, Patient, Provider, Service, Visit
-from .patient_phone import get_or_create_patient_for_public_booking, patient_matches_phone_normalized
+from .patient_phone import (
+    get_or_create_patient_for_public_booking,
+    patient_matches_phone_normalized,
+    patients_matching_phone,
+)
 from .utils import format_time_12h, normalize_phone
 
 logger = logging.getLogger(__name__)
@@ -54,6 +58,160 @@ def _local_now_passed_appointment_start(appt: Appointment) -> bool:
     from apps.clinic.clinic_time import slot_start_is_in_past
 
     return slot_start_is_in_past(appt.appointment_date, appt.start_time)
+
+
+def normalize_caller_phone(phone_raw: str) -> str | None:
+    """Normalize caller ID / spoken phone to E.164; None when missing or invalid."""
+    try:
+        norm = normalize_phone((phone_raw or "").strip())
+    except Exception:
+        logger.warning("normalize_phone failed for caller phone", exc_info=True)
+        return None
+    return norm or None
+
+
+def _self_service_empty_hint(*, patient_ids: list[int], today) -> str:
+    """Why no online-manageable BOOKED visits were found (voice + web parity)."""
+    future = (
+        Appointment.objects.filter(
+            patient_id__in=patient_ids,
+            appointment_date__gte=today,
+        )
+        .exclude(
+            status__in=[
+                Appointment.Status.CANCELLED,
+                Appointment.Status.NO_SHOW,
+                Appointment.Status.COMPLETED,
+            ]
+        )
+        .select_related("booked_service")
+    )
+    if not future.exists():
+        if Appointment.objects.filter(
+            patient_id__in=patient_ids,
+            appointment_date__lt=today,
+        ).exclude(status=Appointment.Status.CANCELLED).exists():
+            return (
+                "We found older visits on this number but nothing scheduled from today onward. "
+                "If you expected a future visit, call the clinic — the number on file may differ."
+            )
+        return (
+            "We don't see any scheduled visits on or after today for this number. "
+            "Use the same cell number from when you booked, or call the clinic."
+        )
+
+    active = future.filter(
+        status__in=[
+            Appointment.Status.CHECKED_IN,
+            Appointment.Status.IN_CONSULTATION,
+            Appointment.Status.AWAITING_PAYMENT,
+        ]
+    )
+    if active.exists():
+        return (
+            "You have a visit today that is already checked in or in progress. "
+            "Only visits still marked Booked can be changed online — call the front desk for help."
+        )
+
+    booked = future.filter(status=Appointment.Status.BOOKED)
+    for a in booked:
+        if a.appointment_date == today and _local_now_passed_appointment_start(a):
+            return (
+                "Today's visit time has already started or passed for online changes. "
+                "Call the clinic if you still need to reschedule or cancel."
+            )
+        svc = a.booked_service
+        if not svc or not svc.is_active or not svc.show_in_public_booking:
+            return (
+                "A visit is on file for this number but cannot be changed online. "
+                "Please call the clinic for help."
+            )
+
+    return (
+        "No upcoming visits found for this number that can be changed online. "
+        "Please call the clinic for help."
+    )
+
+
+def public_self_service_upcoming_appointments(
+    phone_raw: str,
+    *,
+    limit: int = 5,
+) -> tuple[list[Appointment], str | None]:
+    """
+    Booked visits a caller may cancel/reschedule online (matches web my-appointments manage mode).
+    Skips today's visits whose start time has already passed.
+    """
+    from apps.clinic.clinic_time import clinic_localdate
+    from apps.clinic.patient_phone import patients_matching_phone
+
+    norm = normalize_caller_phone(phone_raw)
+    if not norm:
+        return [], "We couldn't read the phone number on this call. Please call the clinic for help."
+
+    patients = patients_matching_phone(norm)
+    if not patients:
+        return [], (
+            "We don't see any patient profile for this phone number. "
+            "Use the same cell number from when you booked, or call the clinic."
+        )
+
+    patient_ids = [p.id for p in patients]
+    today = clinic_localdate()
+    rows = (
+        Appointment.objects.filter(
+            patient_id__in=patient_ids,
+            appointment_date__gte=today,
+            status=Appointment.Status.BOOKED,
+        )
+        .select_related("patient", "provider", "booked_service")
+        .order_by("appointment_date", "start_time")
+    )
+    out: list[Appointment] = []
+    for appt in rows:
+        if appt.appointment_date == today and _local_now_passed_appointment_start(appt):
+            continue
+        out.append(appt)
+        if len(out) >= limit:
+            break
+
+    if out:
+        return out, None
+    return [], _self_service_empty_hint(patient_ids=patient_ids, today=today)
+
+
+def public_self_service_household_context(phone_raw: str) -> dict:
+    """Profiles sharing this phone (parent/child households)."""
+    norm = normalize_caller_phone(phone_raw)
+    patients = patients_matching_phone(norm) if norm else []
+    return {
+        "ambiguous_phone": len(patients) > 1,
+        "household_members": [
+            {"first_name": p.first_name, "last_name": p.last_name}
+            for p in patients
+        ],
+    }
+
+
+def appointment_to_self_service_payload(appt: Appointment) -> dict:
+    svc = appt.booked_service
+    svc_name = svc.label_for_public_booking() if svc else "appointment"
+    patient = appt.patient
+    patient_name = ""
+    if patient:
+        patient_name = f"{patient.first_name} {patient.last_name}".strip()
+    return {
+        "appointment_id": appt.id,
+        "patient_first_name": patient.first_name if patient else "",
+        "patient_last_name": patient.last_name if patient else "",
+        "patient_name": patient_name,
+        "service": svc_name,
+        "service_id": svc.id if svc else None,
+        "date": appt.appointment_date.isoformat(),
+        "time": format_time_12h(appt.start_time),
+        "provider_id": appt.provider_id,
+        "can_reschedule_online": bool(svc and svc.is_active),
+    }
 
 
 def public_online_booking_calendar_span_minutes(service: Service) -> int:

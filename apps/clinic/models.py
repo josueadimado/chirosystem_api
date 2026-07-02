@@ -667,6 +667,7 @@ class SystemErrorLog(TimeStampedModel):
         MIDDLEWARE = "middleware", "Middleware"
         CELERY = "celery", "Celery"
         CLIENT = "client", "Browser (admin)"
+        VOICE_AI = "voice_ai", "Voice AI"
 
     level = models.CharField(max_length=20, choices=Level.choices, default=Level.ERROR)
     source = models.CharField(max_length=20, choices=Source.choices, default=Source.API)
