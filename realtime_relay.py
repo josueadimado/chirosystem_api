@@ -740,7 +740,8 @@ async def _run_tool(name: str, args: dict[str, Any], *, call_sid: str, from_numb
 
         if name == "get_upcoming_appointments":
             phone = _caller_phone_for_tools(from_number, args.get("phone"))
-            return json.dumps(_get_upcoming_appointments(phone))
+            result = await _get_upcoming_async(phone)
+            return json.dumps(result)
 
         if name == "cancel_appointment":
             phone = _caller_phone_for_tools(from_number, args.get("phone"))

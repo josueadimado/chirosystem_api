@@ -906,17 +906,6 @@ _APPOINTMENT_INFO_PATTERNS = [
 ]
 
 
-def _detect_appointment_info_intent(speech: str) -> bool:
-    lower = speech.lower().strip()
-    if any(p in lower for p in _APPOINTMENT_INFO_PATTERNS):
-        if any(w in lower for w in ("cancel", "cancellation", "reschedule", "change my appointment", "move my appointment")):
-            return False
-        return True
-    if "appointment" in lower and any(w in lower for w in ("when", "what time", "confirm", "check", "scheduled")):
-        return True
-    return False
-
-
 def _detect_cancel_reschedule_intent(speech: str) -> tuple[bool, str]:
     """Return (matched, action) where action is 'cancel' or 'reschedule'."""
     lower = speech.lower().strip()
@@ -929,6 +918,17 @@ def _detect_cancel_reschedule_intent(speech: str) -> tuple[bool, str]:
     if not wants_cancel and not wants_reschedule:
         return False, ""
     return True, "reschedule" if wants_reschedule else "cancel"
+
+
+def _detect_appointment_info_intent(speech: str) -> bool:
+    lower = speech.lower().strip()
+    if _detect_cancel_reschedule_intent(lower)[0]:
+        return False
+    if any(p in lower for p in _APPOINTMENT_INFO_PATTERNS):
+        return True
+    if "appointment" in lower and any(w in lower for w in ("when", "what time", "confirm", "check", "scheduled")):
+        return True
+    return False
 
 
 _TRANSFER_PATTERNS = [
