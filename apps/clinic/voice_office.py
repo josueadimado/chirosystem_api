@@ -78,8 +78,7 @@ def voice_greeting_for_caller(from_number: str, clinic: ClinicSettings | None = 
     intro = voice_greeting_opening(clinic_name)
     closings = [
         "How can I help you today?",
-        "What can I help you schedule?",
-        "Are you looking to book, change, or cancel an appointment?",
+        "What can I help you with today?",
     ]
     return intro + random.choice(closings)
 
@@ -94,22 +93,14 @@ def voice_greeting_for_returning_patient(first_name: str, clinic_name: str) -> s
     closings = [
         "What can I help you with today?",
         "How can I help you today?",
-        "What would you like to do — book, reschedule, or cancel?",
     ]
     return f"Hello {display}, thank you for calling {clinic}. " + random.choice(closings)
 
 
 def voice_greeting_opening(clinic_name: str) -> str:
-    """
-    Standard phone greeting — thank-you + clinic name, scheduling scope, front-desk option.
-    Does not mention the office phone number (caller is transferred when they ask).
-    """
+    """Short phone greeting — thank-you, clinic name, Sarah's name."""
     name = (clinic_name or "").strip() or "our office"
-    return (
-        f"Thank you for calling {name}. This is Sarah. "
-        f"I can help with anything related to scheduling — booking, rescheduling, or canceling appointments. "
-        f"If you'd rather speak with someone at the office, just say so and I'll connect you to our front desk. "
-    )
+    return f"Thank you for calling {name}. This is Sarah. "
 
 
 def clinic_public_info_prompt_block(
