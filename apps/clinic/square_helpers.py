@@ -47,17 +47,18 @@ def get_location_id() -> str:
 def square_web_sdk_environment() -> str:
     """
     Environment for the Web Payments SDK script (sandbox vs production).
-    Prefer the application id prefix — it must match the tokenize nonce environment.
+    The application id prefix is authoritative — the SDK script must match the app id
+    used to initialize payments(), not only SQUARE_ENVIRONMENT.
     """
     app_id = get_application_id()
+    if app_id.startswith("sandbox-"):
+        return "sandbox"
+    if app_id:
+        return "production"
     configured = (
         getattr(settings, "SQUARE_ENVIRONMENT", None) or os.environ.get("SQUARE_ENVIRONMENT", "sandbox") or "sandbox"
     ).strip().lower()
-    if app_id.startswith("sandbox-"):
-        return "sandbox"
-    if configured == "production":
-        return "production"
-    return "sandbox"
+    return "production" if configured == "production" else "sandbox"
 
 
 def square_environment_mismatch_warning() -> str | None:

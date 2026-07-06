@@ -1,6 +1,9 @@
 """Staff-facing Square charge error messages."""
 
-from django.test import SimpleTestCase
+import os
+from unittest.mock import patch
+
+from django.test import SimpleTestCase, override_settings
 
 from apps.clinic.square_helpers import (
     format_save_card_exception,
@@ -74,3 +77,33 @@ class SquareChargeErrorMessageTests(SimpleTestCase):
         msg = format_save_card_exception(exc)
         self.assertNotIn("headers", msg.lower())
         self.assertIn("could not save", msg.lower())
+
+
+class SquareWebSdkEnvironmentTests(SimpleTestCase):
+    @override_settings(SQUARE_ENVIRONMENT="production")
+    @patch.dict(os.environ, {"SQUARE_APPLICATION_ID": "sandbox-sq0idb-test", "SQUARE_ENVIRONMENT": "production"})
+    def test_sandbox_app_id_always_sandbox(self):
+        self.assertEqual(square_web_sdk_environment(), "sandbox")
+
+    @override_settings(SQUARE_ENVIRONMENT="sandbox")
+    @patch.dict(os.environ, {"SQUARE_APPLICATION_ID": "sq0idb-production-test", "SQUARE_ENVIRONMENT": "sandbox"})
+    def test_production_app_id_overrides_sandbox_env(self):
+        self.assertEqual(square_web_sdk_environment(), "production")
+
+    @override_settings(SQUARE_ENVIRONMENT="sandbox")
+    @patch.dict(os.environ, {"SQUARE_APPLICATION_ID": "", "SQUARE_ENVIRONMENT": "sandbox"}, clear=False)
+    def test_no_app_id_falls_back_to_configured_env(self):
+        self.assertEqual(square_web_sdk_environment(), "sandbox")
+
+    @override_settings(SQUARE_ENVIRONMENT="production")
+    @patch.dict(os.environ, {"SQUARE_APPLICATION_ID": "", "SQUARE_ENVIRONMENT": "production"}, clear=False)
+    def test_no_app_id_production_when_configured(self):
+        self.assertEqual(square_web_sdk_environment(), "production")
+
+    @override_settings(SQUARE_ENVIRONMENT="sandbox")
+    @patch.dict(
+        os.environ,
+        {"SQUARE_APPLICATION_ID": "sq0idb-production-test", "SQUARE_ENVIRONMENT": "sandbox"},
+    )
+    def test_mismatch_warning_when_app_production_env_sandbox(self):
+        self.assertIsNotNone(square_environment_mismatch_warning())
