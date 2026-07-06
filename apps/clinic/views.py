@@ -101,6 +101,8 @@ from .square_helpers import (
     patient_saved_card_display,
     save_card_from_source,
     square_configured,
+    square_web_sdk_environment,
+    format_save_card_exception,
 )
 from .google_calendar_sync import (
     build_oauth_flow,
@@ -1593,15 +1595,12 @@ class BookingOptionsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=["get"], url_path="square-config")
     def square_config(self, request):
         """Public: whether Square is enabled + Web Payments SDK ids (https://developer.squareup.com/docs/web-payments/overview)."""
-        from django.conf import settings as dj_settings
-
-        env = (getattr(dj_settings, "SQUARE_ENVIRONMENT", None) or "sandbox").strip().lower()
         return Response(
             {
                 "enabled": square_configured(),
                 "application_id": get_application_id() if square_configured() else "",
                 "location_id": get_location_id() if square_configured() else "",
-                "environment": env if square_configured() else "",
+                "environment": square_web_sdk_environment() if square_configured() else "",
             }
         )
 
@@ -1650,7 +1649,7 @@ class BookingOptionsViewSet(viewsets.ViewSet):
         try:
             save_card_from_source(patient, src, verification_token=vtok)
         except Exception as exc:
-            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+            return Response({"detail": format_save_card_exception(exc)}, status=status.HTTP_502_BAD_GATEWAY)
         return Response(
             {
                 "detail": "Card saved.",
@@ -2058,7 +2057,7 @@ class PatientViewSet(viewsets.ModelViewSet):
         try:
             save_card_from_source(patient, src, verification_token=vtok)
         except Exception as exc:
-            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+            return Response({"detail": format_save_card_exception(exc)}, status=status.HTTP_502_BAD_GATEWAY)
         return Response(
             {
                 "detail": "Card saved.",

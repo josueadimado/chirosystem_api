@@ -44,6 +44,52 @@ def get_location_id() -> str:
     return os.environ.get("SQUARE_LOCATION_ID", "").strip()
 
 
+def square_web_sdk_environment() -> str:
+    """
+    Environment for the Web Payments SDK script (sandbox vs production).
+    Prefer the application id prefix — it must match the tokenize nonce environment.
+    """
+    app_id = get_application_id()
+    configured = (
+        getattr(settings, "SQUARE_ENVIRONMENT", None) or os.environ.get("SQUARE_ENVIRONMENT", "sandbox") or "sandbox"
+    ).strip().lower()
+    if app_id.startswith("sandbox-"):
+        return "sandbox"
+    if configured == "production":
+        return "production"
+    return "sandbox"
+
+
+def square_environment_mismatch_warning() -> str | None:
+    """Staff-facing hint when application id and access token environments disagree."""
+    app_id = get_application_id()
+    token_env = (
+        getattr(settings, "SQUARE_ENVIRONMENT", None) or os.environ.get("SQUARE_ENVIRONMENT", "sandbox") or "sandbox"
+    ).strip().lower()
+    if app_id.startswith("sandbox-") and token_env == "production":
+        return (
+            "Square is misconfigured: the application ID is sandbox but SQUARE_ENVIRONMENT is production. "
+            "Set SQUARE_ENVIRONMENT=sandbox, or switch to production application ID and access token."
+        )
+    if app_id and not app_id.startswith("sandbox-") and token_env == "sandbox":
+        return (
+            "Square is misconfigured: the application ID looks like production but SQUARE_ENVIRONMENT is sandbox. "
+            "Use matching sandbox or production credentials in Admin → Settings."
+        )
+    return None
+
+
+def assert_square_save_card_ready() -> None:
+    """Raise RuntimeError when Square cannot safely save a Web Payments card token."""
+    if not get_application_id() or not get_location_id():
+        raise RuntimeError(
+            "Square application ID or location ID is missing. Open Admin → Settings and connect Square."
+        )
+    warn = square_environment_mismatch_warning()
+    if warn:
+        raise RuntimeError(warn)
+
+
 def get_terminal_device_id() -> str:
     """Paired Square Terminal device id (from Developer Dashboard or Devices API)."""
     return os.environ.get("SQUARE_DEVICE_ID", "").strip()
@@ -381,6 +427,36 @@ def format_square_exception(exc: BaseException) -> str:
     return text[:500] if text else "Square could not process this charge."
 
 
+def format_save_card_exception(exc: BaseException) -> str:
+    """Staff-facing message when saving a card on file fails — never raw HTTP headers."""
+    msg = format_square_exception(exc)
+    upper = msg.upper()
+    if "INVALID_CARD_DATA" in upper:
+        hint = square_environment_mismatch_warning()
+        if hint:
+            return hint
+        if square_web_sdk_environment() == "sandbox":
+            return (
+                "Square could not save this card (invalid card data). "
+                "In sandbox, use test card 4111 1111 1111 1111 with any future expiry and CVV, "
+                "then tap Save card securely right away."
+            )
+        return (
+            "Square could not save this card (invalid card data). "
+            "Ask the patient to re-enter the card and save immediately. "
+            "If this continues, check Admin → Settings that sandbox vs production credentials match."
+        )
+    if looks_like_technical_square_error(msg):
+        hint = square_environment_mismatch_warning()
+        if hint:
+            return hint
+        return (
+            "Square could not save this card. Check Admin → Settings (sandbox vs production), "
+            "then try again with a fresh card entry."
+        )
+    return msg
+
+
 def _square_api_error_message(errors) -> str:
     return square_error_list_message(errors)
 
@@ -492,19 +568,28 @@ def save_card_from_source(patient, source_id: str, verification_token: str | Non
 
     from square.requests.card import CardParams
 
+    assert_square_save_card_ready()
+    token = (source_id or "").strip()
+    if not token:
+        raise RuntimeError("Card token was missing. Enter the card again and tap Save card securely.")
+
     client = get_square_client()
     cid = ensure_square_customer(patient)
     kwargs = {
         "idempotency_key": str(uuid.uuid4()),
-        "source_id": source_id.strip(),
+        "source_id": token,
         "card": CardParams(customer_id=cid),
     }
     if verification_token:
         kwargs["verification_token"] = verification_token
-    res = client.cards.create(**kwargs)
+    try:
+        res = client.cards.create(**kwargs)
+    except Exception as exc:
+        logger.warning("Square cards.create failed for patient %s: %s", patient.pk, exc)
+        raise RuntimeError(format_save_card_exception(exc)) from exc
     errs = getattr(res, "errors", None) or []
     if errs:
-        raise RuntimeError(getattr(errs[0], "detail", None) or str(errs[0]) or "Square card create failed")
+        raise RuntimeError(square_error_list_message(errs))
     card = res.card
     if not card or not card.id:
         raise RuntimeError("Square did not return a card id.")

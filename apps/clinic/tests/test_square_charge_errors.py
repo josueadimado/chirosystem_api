@@ -2,7 +2,14 @@
 
 from django.test import SimpleTestCase
 
-from apps.clinic.square_helpers import format_square_exception, looks_like_technical_square_error, square_error_list_message
+from apps.clinic.square_helpers import (
+    format_save_card_exception,
+    format_square_exception,
+    looks_like_technical_square_error,
+    square_environment_mismatch_warning,
+    square_error_list_message,
+    square_web_sdk_environment,
+)
 from apps.clinic.square_payment import charge_saved_card_error_message
 
 
@@ -55,3 +62,15 @@ class SquareChargeErrorMessageTests(SimpleTestCase):
         msg = square_error_list_message([{"code": "CARD_DECLINED", "detail": "Card declined."}])
         self.assertIn("Card declined", msg)
         self.assertIn("CARD_DECLINED", msg)
+
+    def test_format_save_card_invalid_card_data_sandbox_hint(self):
+        exc = _FakeApiError([_FakeSquareErr("INVALID_CARD_DATA", "Invalid card data.")], status_code=400)
+        msg = format_save_card_exception(exc)
+        self.assertIn("invalid card data", msg.lower())
+        self.assertNotIn("headers", msg.lower())
+
+    def test_format_save_card_hides_header_dump(self):
+        exc = Exception("headers: {'square-version': '2026-05-20', 'content-type': 'application/json'}")
+        msg = format_save_card_exception(exc)
+        self.assertNotIn("headers", msg.lower())
+        self.assertIn("could not save", msg.lower())
