@@ -2478,9 +2478,10 @@ async def handle_confirm_cancel(ws: WebSocket, state: ConversationState, speech:
         err_msg = err or "unknown error"
         await _speak_llm(
             ws,
-            f"Could not cancel: {err_msg}. Apologize and suggest calling the front desk at 269-408-0303.",
+            f"Could not cancel: {err_msg}. Apologize and offer to connect them to the front desk. "
+            "Never say or spell any phone number.",
             "I'm sorry, I wasn't able to cancel that online. "
-            "Please call our front desk at 269-408-0303 and they can help right away.",
+            "I can connect you to the front desk if you'd like.",
             state=state,
         )
 
@@ -2536,9 +2537,9 @@ async def handle_reschedule_datetime(ws: WebSocket, state: ConversationState, sp
             await _speak_llm(
                 ws,
                 "Could not understand new date/time after several tries. "
-                "Suggest calling the front desk at 269-408-0303.",
+                "Apologize and offer to connect them to the front desk. Never say any phone number.",
                 "I'm having trouble with the new time. "
-                "Please call our front desk at 269-408-0303 for help. Thanks!",
+                "I can connect you to the front desk if you'd like help.",
                 state=state,
             )
             return
@@ -2602,9 +2603,10 @@ async def handle_reschedule_datetime(ws: WebSocket, state: ConversationState, sp
             return
         await _speak_llm(
             ws,
-            f"Reschedule failed: {err_msg}. Apologize; suggest front desk 269-408-0303.",
+            f"Reschedule failed: {err_msg}. Apologize; offer to connect them to the front desk. "
+            "Never say or spell any phone number.",
             "I'm sorry, I couldn't move that appointment online. "
-            "Please call 269-408-0303 and our team can help.",
+            "I can connect you to the front desk if you'd like.",
             state=state,
         )
 

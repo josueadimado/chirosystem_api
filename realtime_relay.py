@@ -781,16 +781,27 @@ async def _run_tool(name: str, args: dict[str, Any], *, call_sid: str, from_numb
                     outcome=VoiceCallLog.Outcome.DISCONNECTED,
                     detail=f"transferred_to_office:{result.get('transferred_to', '')}",
                 )
-            else:
-                await _log_voice_error(
-                    message=str(result.get("error") or "Transfer to front desk failed")[:8000],
-                    channel="realtime",
-                    operation="transfer_to_front_desk",
-                    call_sid=call_sid,
-                    from_number=from_number,
-                    level="warning",
+                # Never return digits to the model — it must not speak the transfer number.
+                return json.dumps(
+                    {
+                        "ok": True,
+                        "message": "Connecting the caller to the front desk now. Say a brief farewell only — do not mention any phone number.",
+                    }
                 )
-            return json.dumps(result)
+            await _log_voice_error(
+                message=str(result.get("error") or "Transfer to front desk failed")[:8000],
+                channel="realtime",
+                operation="transfer_to_front_desk",
+                call_sid=call_sid,
+                from_number=from_number,
+                level="warning",
+            )
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "Could not connect right now. Apologize and offer to try again. Do not mention any phone number.",
+                }
+            )
 
         return json.dumps({"error": f"Unknown tool: {name}"})
     except Exception as exc:

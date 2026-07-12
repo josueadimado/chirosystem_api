@@ -221,6 +221,9 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "")
 TWILIO_MESSAGING_SERVICE_SID = os.getenv("TWILIO_MESSAGING_SERVICE_SID", "")
+# Live person line for voice AI transfers (E.164). Dialed only — never spoken to callers.
+# Default: (269) 921-6773. Override in Dokploy if the transfer number changes.
+VOICE_TRANSFER_PHONE_NUMBER = os.getenv("VOICE_TRANSFER_PHONE_NUMBER", "+12699216773").strip()
 # Voice webhooks: public https base as Twilio sees it (no trailing slash), e.g. https://api.yourclinic.com
 TWILIO_VOICE_PUBLIC_BASE_URL = os.getenv("TWILIO_VOICE_PUBLIC_BASE_URL", "").strip().rstrip("/")
 # Dev only: skip Twilio X-Twilio-Signature check (never enable in production).
