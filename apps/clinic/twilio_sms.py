@@ -70,6 +70,21 @@ def sms_footer() -> str:
 
 # Patient-facing self-service (public booking): clinic callback number shown in SMS.
 CLINIC_PHONE_SELF_SERVICE_DISPLAY = "+1 (269) 408-0303"
+# Shorter form for reminder SMS (matches how patients usually dial).
+CLINIC_PHONE_REMINDER_DISPLAY = "269-408-0303"
+
+
+def patient_manage_appointment_url() -> str:
+    """Public booking homepage link for cancel / reschedule (day-before reminders)."""
+    try:
+        from django.conf import settings
+
+        base = (getattr(settings, "FRONTEND_BASE_URL", None) or "").strip().rstrip("/")
+    except Exception:
+        base = ""
+    if not base:
+        base = "https://book.reliefchiropractic.net"
+    return f"{base}/"
 
 
 def patient_cancel_confirmation_sms_body(
@@ -185,11 +200,22 @@ def appointment_reminder_body(
     appt_time_display: str,
     provider_display: str,
     estimated_payment: str = "",
+    manage_url: str = "",
 ) -> str:
+    """Day-before reminder SMS with cancel/reschedule link and office phone."""
     pay = f" Est. {estimated_payment} due at visit." if estimated_payment else ""
+    link = (manage_url or "").strip() or patient_manage_appointment_url()
+    # Keep blank lines so phones show a clear “tap the link” block.
     return (
         f"Relief Chiropractic: Hi {first_name}, reminder — your {service_name} is "
-        f"tomorrow ({appt_date_display}) at {appt_time_display}.{pay}{sms_footer()}"
+        f"tomorrow ({appt_date_display}) at {appt_time_display}.{pay}\n"
+        f"\n"
+        f"If you would like to cancel, or reschedule, this appointment please click on "
+        f"the link below. Or call our office at {CLINIC_PHONE_REMINDER_DISPLAY}.\n"
+        f"\n"
+        f"{link}\n"
+        f"\n"
+        f"Reply STOP to opt out"
     )
 
 

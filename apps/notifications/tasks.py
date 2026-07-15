@@ -301,7 +301,12 @@ def send_daily_appointment_reminders() -> dict:
     Email requires SMTP configured + patient email. Each channel tracked separately on the appointment.
     """
     from apps.clinic.models import Appointment
-    from apps.clinic.twilio_sms import appointment_reminder_body, send_sms, twilio_configured
+    from apps.clinic.twilio_sms import (
+        appointment_reminder_body,
+        patient_manage_appointment_url,
+        send_sms,
+        twilio_configured,
+    )
 
     tz = _clinic_tz()
     today_local = timezone.now().astimezone(tz).date()
@@ -325,6 +330,7 @@ def send_daily_appointment_reminders() -> dict:
     email_sent = 0
     twilio_on = twilio_configured()
     smtp_on = _smtp_configured()
+    manage_url = patient_manage_appointment_url()
 
     for appt in candidates:
         patient = appt.patient
@@ -345,6 +351,7 @@ def send_daily_appointment_reminders() -> dict:
                     appt_time_display=time_disp,
                     provider_display=provider_display,
                     estimated_payment=est_pay,
+                    manage_url=manage_url,
                 )
                 sid = send_sms(to_e164=to_phone, body=body)
                 if sid:
@@ -372,7 +379,9 @@ def send_daily_appointment_reminders() -> dict:
                     f"  Time: {time_disp}\n"
                     f"  Provider: {provider_display}\n"
                     f"{pay_block}\n"
-                    f"If you need to reschedule or cancel, please call us or use our website.\n\n"
+                    f"If you would like to cancel or reschedule, use this link:\n"
+                    f"{manage_url}\n\n"
+                    f"Or call our office at 269-408-0303.\n\n"
                     f"— Relief Chiropractic"
                 )
                 if _send_reminder_email(to_email=em, subject=subject, body=msg):

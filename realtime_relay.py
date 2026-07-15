@@ -862,6 +862,12 @@ class RealtimeBridge:
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
+                        # Without this, OpenAI never emits caller transcripts — admin AI log
+                        # would only show Sarah's lines (response.*audio_transcript.done).
+                        "transcription": {
+                            "model": "gpt-4o-mini-transcribe",
+                            "language": "en",
+                        },
                         "turn_detection": {
                             "type": "server_vad",
                             "threshold": 0.5,
@@ -970,6 +976,15 @@ class RealtimeBridge:
                     text=transcript,
                     from_number=self.from_number,
                 )
+            return
+
+        if etype == "conversation.item.input_audio_transcription.failed":
+            err = event.get("error") or {}
+            logger.warning(
+                "Realtime [%s] caller transcription failed: %s",
+                self.call_sid[:8],
+                err.get("message") or err or event,
+            )
             return
 
         if etype == "response.function_call_arguments.delta":
