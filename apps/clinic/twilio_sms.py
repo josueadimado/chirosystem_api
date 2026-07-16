@@ -149,12 +149,20 @@ def booking_confirmation_body(
     appt_time_display: str,
     provider_display: str,
     estimated_payment: str = "",
+    manage_url: str = "",
 ) -> str:
     pay = f" {estimated_payment} due at visit." if estimated_payment else ""
+    link = (manage_url or "").strip() or patient_manage_appointment_url()
     return (
         f"Relief Chiropractic: Hi {first_name}, your {service_name} is confirmed for "
-        f"{appt_date_display} at {appt_time_display}.{pay} "
-        f"We'll text you a reminder the day before your visit.{sms_footer()}"
+        f"{appt_date_display} at {appt_time_display}.{pay}\n"
+        f"\n"
+        f"If you would like to cancel, or reschedule, this appointment please click on "
+        f"the link below. Or call our office at {CLINIC_PHONE_REMINDER_DISPLAY}.\n"
+        f"\n"
+        f"{link}\n"
+        f"\n"
+        f"Reply STOP to opt out"
     )
 
 
@@ -166,14 +174,22 @@ def series_booking_confirmation_body(
     provider_display: str,
     date_lines: list[str],
     estimated_payment: str = "",
+    manage_url: str = "",
 ) -> str:
     """One SMS listing all dates in a recurring online booking."""
     dates_text = "; ".join(date_lines)
     pay = f" Est. {estimated_payment} due at each visit." if estimated_payment else ""
+    link = (manage_url or "").strip() or patient_manage_appointment_url()
     return (
         f"Relief Chiropractic: Hi {first_name}, your {len(date_lines)} {service_name} visits with "
-        f"{provider_display} are confirmed at {time_display}: {dates_text}.{pay} "
-        f"We'll text you a reminder the day before each visit.{sms_footer()}"
+        f"{provider_display} are confirmed at {time_display}: {dates_text}.{pay}\n"
+        f"\n"
+        f"If you would like to cancel, or reschedule, an appointment please click on "
+        f"the link below. Or call our office at {CLINIC_PHONE_REMINDER_DISPLAY}.\n"
+        f"\n"
+        f"{link}\n"
+        f"\n"
+        f"Reply STOP to opt out"
     )
 
 
