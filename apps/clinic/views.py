@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import mimetypes
+import tempfile
 from datetime import datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -110,6 +113,7 @@ from .google_calendar_sync import (
     google_oauth_configured,
 )
 from .patient_communication_prefs import patient_communication_prefs_payload
+from .legacy_patient_import import LegacyImportError, run_legacy_patient_import
 from .patient_demographics import (
     annotate_patient_list_stats,
     annotate_patient_unpaid_balances,
@@ -4603,6 +4607,66 @@ class AdminViewSet(viewsets.ViewSet):
                 "payment_profile": (p.payment_profile or "").strip(),
             })
         return Response(data)
+
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="patients/import_legacy",
+        parser_classes=[MultiPartParser, FormParser],
+    )
+    def patients_import_legacy(self, request):
+        """
+        Upload the legacy Excel patient list from Admin → Patients.
+
+        Multipart fields:
+          - file: .xlsx workbook
+          - dry_run: "1" / "true" (default) to preview; "0" / "false" to commit
+        """
+        role = getattr(request.user, "role", None)
+        if role not in ("owner_admin", "staff"):
+            return Response(
+                {"detail": "Only clinic admin or staff can import patients."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        upload = request.FILES.get("file")
+        if not upload:
+            return Response(
+                {"detail": "Please choose an Excel .xlsx file to upload."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        name = (getattr(upload, "name", "") or "").lower()
+        if not name.endswith(".xlsx"):
+            return Response(
+                {"detail": "Please upload an .xlsx Excel file (not .xls or CSV)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        dry_raw = str(request.data.get("dry_run", "1")).strip().lower()
+        dry_run = dry_raw not in ("0", "false", "no", "commit")
+
+        # Save upload to a temp file so the shared importer can read it as a path.
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            for chunk in upload.chunks():
+                tmp.write(chunk)
+            tmp_path = Path(tmp.name)
+        try:
+            result = run_legacy_patient_import(path=tmp_path, dry_run=dry_run)
+        except LegacyImportError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception:
+            logging.getLogger(__name__).exception("Legacy patient import failed")
+            return Response(
+                {"detail": "Import failed unexpectedly. Please try again or contact support."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        return Response(result)
 
     @action(detail=False, methods=["get"], url_path="patient_detail")
     def patient_detail(self, request):
