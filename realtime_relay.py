@@ -334,6 +334,11 @@ PRIVACY AND CONFIDENTIALITY (critical):
 - Never quote tax IDs, NPI numbers, or internal billing codes.
 - Service prices from AVAILABLE SERVICES are public and OK to share.
 
+NOISE AND UNCLEAR AUDIO:
+- Phone lines often have TV, traffic, kids, or static. Do NOT invent a reply from random noise or half-heard scraps.
+- If you are not sure what the caller said, ask them once to repeat clearly (e.g. "Sorry, there was some noise — could you say that again?").
+- Never change topic, book, cancel, or transfer based on garbled/background audio.
+
 YOUR SCOPE:
 - You CAN help with: booking, rescheduling, canceling, checking availability, listing the caller's own upcoming visits (after phone verification via tools).
 - You CAN answer public questions: address, directions, location, email, hours, services and listed prices.
@@ -853,6 +858,42 @@ class RealtimeBridge:
             ping_interval=20,
             ping_timeout=20,
         )
+
+        # Turn detection: default OpenAI threshold (0.5) treats background noise as speech on
+        # phone calls. Higher threshold + noise reduction + longer silence wait = calmer Sarah.
+        vad_mode = getattr(settings, "OPENAI_REALTIME_VAD_MODE", "server_vad") or "server_vad"
+        if vad_mode == "semantic_vad":
+            turn_detection: dict[str, Any] = {
+                "type": "semantic_vad",
+                "eagerness": getattr(settings, "OPENAI_REALTIME_SEMANTIC_EAGERNESS", "low") or "low",
+                "create_response": True,
+                "interrupt_response": True,
+            }
+        else:
+            turn_detection = {
+                "type": "server_vad",
+                "threshold": float(getattr(settings, "OPENAI_REALTIME_VAD_THRESHOLD", 0.78)),
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": int(getattr(settings, "OPENAI_REALTIME_VAD_SILENCE_MS", 900)),
+                "create_response": True,
+                "interrupt_response": True,
+            }
+
+        audio_input: dict[str, Any] = {
+            "format": {"type": "audio/pcmu"},
+            # Without this, OpenAI never emits caller transcripts — admin AI log
+            # would only show Sarah's lines (response.*audio_transcript.done).
+            "transcription": {
+                "model": "gpt-4o-mini-transcribe",
+                "language": "en",
+            },
+            "turn_detection": turn_detection,
+        }
+        nr = (getattr(settings, "OPENAI_REALTIME_NOISE_REDUCTION", "far_field") or "far_field").strip().lower()
+        if nr in ("near_field", "far_field"):
+            # Filters audio before VAD — cuts false “speech started” from TV/room noise.
+            audio_input["noise_reduction"] = {"type": nr}
+
         session_update = {
             "type": "session.update",
             "session": {
@@ -860,23 +901,7 @@ class RealtimeBridge:
                 "model": OPENAI_REALTIME_MODEL,
                 "output_modalities": ["audio"],
                 "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcmu"},
-                        # Without this, OpenAI never emits caller transcripts — admin AI log
-                        # would only show Sarah's lines (response.*audio_transcript.done).
-                        "transcription": {
-                            "model": "gpt-4o-mini-transcribe",
-                            "language": "en",
-                        },
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "threshold": 0.5,
-                            "prefix_padding_ms": 300,
-                            "silence_duration_ms": 600,
-                            "create_response": True,
-                            "interrupt_response": True,
-                        },
-                    },
+                    "input": audio_input,
                     "output": {
                         "format": {"type": "audio/pcmu"},
                         "voice": settings.OPENAI_REALTIME_VOICE,
@@ -889,7 +914,14 @@ class RealtimeBridge:
             },
         }
         await self.openai_ws.send(json.dumps(session_update))
-        logger.info("Realtime [%s] OpenAI session started", self.call_sid[:8])
+        logger.info(
+            "Realtime [%s] OpenAI session started vad=%s threshold=%s silence_ms=%s noise=%s",
+            self.call_sid[:8],
+            turn_detection.get("type"),
+            turn_detection.get("threshold"),
+            turn_detection.get("silence_duration_ms"),
+            nr,
+        )
 
     async def send_greeting(self) -> None:
         """Speak the scripted opening greeting verbatim (clinic name from Admin Settings)."""

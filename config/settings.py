@@ -255,6 +255,29 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_VOICE_MODEL = os.getenv("OPENAI_VOICE_MODEL", "gpt-5.4-nano").strip() or "gpt-5.4-nano"
 # OpenAI Realtime (gpt-realtime): alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
 OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "coral").strip() or "coral"
+# How picky Sarah is about “someone is talking” vs background noise (0.0–1.0). Higher = less sensitive.
+# Default 0.5 is too reactive on phone calls with TV / kids / traffic; 0.75–0.85 works better.
+try:
+    OPENAI_REALTIME_VAD_THRESHOLD = float(os.getenv("OPENAI_REALTIME_VAD_THRESHOLD", "0.78"))
+except ValueError:
+    OPENAI_REALTIME_VAD_THRESHOLD = 0.78
+OPENAI_REALTIME_VAD_THRESHOLD = max(0.0, min(1.0, OPENAI_REALTIME_VAD_THRESHOLD))
+# How long (ms) of quiet after speech before Sarah replies. Longer = fewer jump-ins on pauses/noise.
+try:
+    OPENAI_REALTIME_VAD_SILENCE_MS = int(os.getenv("OPENAI_REALTIME_VAD_SILENCE_MS", "900"))
+except ValueError:
+    OPENAI_REALTIME_VAD_SILENCE_MS = 900
+OPENAI_REALTIME_VAD_SILENCE_MS = max(200, min(2000, OPENAI_REALTIME_VAD_SILENCE_MS))
+# near_field = handset close to mouth; far_field = speakerphone / room noise (better for background TV etc.)
+_nr = (os.getenv("OPENAI_REALTIME_NOISE_REDUCTION", "far_field") or "far_field").strip().lower()
+OPENAI_REALTIME_NOISE_REDUCTION = _nr if _nr in ("near_field", "far_field", "off", "none") else "far_field"
+# server_vad = volume-based; semantic_vad = waits for a finished thought (less choppy, still needs noise filter)
+_vad_mode = (os.getenv("OPENAI_REALTIME_VAD_MODE", "server_vad") or "server_vad").strip().lower()
+OPENAI_REALTIME_VAD_MODE = _vad_mode if _vad_mode in ("server_vad", "semantic_vad") else "server_vad"
+_eager = (os.getenv("OPENAI_REALTIME_SEMANTIC_EAGERNESS", "low") or "low").strip().lower()
+OPENAI_REALTIME_SEMANTIC_EAGERNESS = (
+    _eager if _eager in ("low", "medium", "high", "auto") else "low"
+)
 # Voice relay: stream LLM tokens to Twilio (lower perceived delay). Set VOICE_LLM_STREAM=false to disable.
 VOICE_LLM_STREAM = os.getenv("VOICE_LLM_STREAM", "true").strip().lower() in ("1", "true", "yes")
 # Public wss:// origin for Twilio Media Streams (OpenAI Realtime). Same host as API; path /ws/realtime.
