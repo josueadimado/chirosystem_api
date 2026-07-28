@@ -6,6 +6,16 @@ from celery.schedules import crontab
 from corsheaders.defaults import default_headers
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Load apps/api/.env into the process when present (local + some hosts).
+# Docker/Dokploy env_file / UI vars still win when already set in the environment.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(BASE_DIR / ".env", override=False)
+except ImportError:
+    pass
+
 DEBUG = os.environ.get("DEBUG", "true").lower() in ("true", "1", "yes")
 
 if DEBUG:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import html
 import logging
+import smtplib
+import ssl
 
 from django.conf import settings
 
@@ -15,7 +17,95 @@ class PatientBillEmailError(Exception):
 
 
 def _smtp_configured() -> bool:
-    return bool(getattr(settings, "EMAIL_HOST", None))
+    return bool((getattr(settings, "EMAIL_HOST", None) or "").strip())
+
+
+def smtp_mail_status() -> dict:
+    """
+    Safe summary for Admin (no passwords). Used to diagnose bill-email failures.
+    """
+    host = (getattr(settings, "EMAIL_HOST", "") or "").strip()
+    user = (getattr(settings, "EMAIL_HOST_USER", "") or "").strip()
+    password_set = bool((getattr(settings, "EMAIL_HOST_PASSWORD", "") or "").strip())
+    from_email = (
+        getattr(settings, "PATIENT_BILL_FROM_EMAIL", None)
+        or getattr(settings, "DEFAULT_FROM_EMAIL", "")
+        or ""
+    ).strip()
+    port = int(getattr(settings, "EMAIL_PORT", 587) or 587)
+    use_tls = bool(getattr(settings, "EMAIL_USE_TLS", True))
+    backend = (getattr(settings, "EMAIL_BACKEND", "") or "").strip()
+
+    ready = bool(host and user and password_set)
+    summary = "Patient bill email is ready."
+    if not host:
+        summary = (
+            "Email is not configured: EMAIL_HOST is missing on the API server. "
+            "Add EMAIL_HOST=smtp.gmail.com (and user/password) in Dokploy / apps/api/.env, then redeploy the API."
+        )
+    elif not user or not password_set:
+        summary = (
+            "EMAIL_HOST is set, but EMAIL_HOST_USER or EMAIL_HOST_PASSWORD is missing. "
+            "For Gmail use an App Password, not the normal login password."
+        )
+    elif "console" in backend.lower():
+        summary = (
+            "Mail is set to console (print-only) mode — bills will not reach patients. "
+            "Set EMAIL_HOST so the API uses real SMTP."
+        )
+
+    return {
+        "ready": ready and "console" not in backend.lower(),
+        "summary": summary,
+        "checks": [
+            {"id": "email_host", "label": "EMAIL_HOST set", "ok": bool(host), "value": host or None},
+            {"id": "email_user", "label": "EMAIL_HOST_USER set", "ok": bool(user), "value": user or None},
+            {"id": "email_password", "label": "EMAIL_HOST_PASSWORD set", "ok": password_set, "value": None},
+            {"id": "from_email", "label": "Bill From address", "ok": bool(from_email), "value": from_email or None},
+            {
+                "id": "port_tls",
+                "label": f"Port {port}, TLS={'on' if use_tls else 'off'}",
+                "ok": True,
+                "value": f"{port}/tls={use_tls}",
+            },
+            {
+                "id": "backend",
+                "label": "Django email backend",
+                "ok": "console" not in backend.lower(),
+                "value": backend.split(".")[-1] if backend else None,
+            },
+        ],
+    }
+
+
+def _friendly_smtp_error(exc: BaseException) -> str:
+    """Turn SMTP exceptions into staff-readable guidance."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "authentication" in text or "username and password" in text or "534" in text or "535" in text:
+        return (
+            "Gmail/SMTP rejected the login. For Gmail, use an App Password "
+            "(Google Account → Security → App passwords), set EMAIL_HOST_USER and EMAIL_HOST_PASSWORD "
+            "on the API, and redeploy."
+        )
+    if "connection refused" in text or "timed out" in text or "name or service not known" in text:
+        return (
+            "Could not connect to the mail server. Check EMAIL_HOST (e.g. smtp.gmail.com) "
+            "and that the server can reach the internet on port 587."
+        )
+    if "sender" in text or ("from" in text and ("not allowed" in text or "denied" in text)):
+        return (
+            "The From address was rejected. Set PATIENT_BILL_FROM_EMAIL to the same address as "
+            "EMAIL_HOST_USER (your Gmail), then redeploy."
+        )
+    if isinstance(exc, (smtplib.SMTPException, ssl.SSLError, OSError, TimeoutError)):
+        return (
+            f"Mail server error ({type(exc).__name__}). "
+            "Check EMAIL_HOST / App Password on the API, or see Admin → Errors for details."
+        )
+    return (
+        "Could not send the email. Check EMAIL_HOST, EMAIL_HOST_USER, and EMAIL_HOST_PASSWORD "
+        "on the API server, then try again."
+    )
 
 
 def _money_label(value: str | None) -> str:
@@ -98,52 +188,55 @@ def build_patient_bill_email_html(bill: dict) -> str:
           <p style="margin:4px 0 0;font-size:13px;color:#475569;">{addr}</p>
           {provider_line}
           <p style="margin:16px 0 6px;font-size:12px;font-weight:700;color:#0f766e;text-transform:uppercase;letter-spacing:0.06em;">Diagnosis</p>
-          <p style="margin:0;font-size:13px;color:#334155;">{diagnosis}</p>
-          <p style="margin:20px 0 8px;font-size:12px;font-weight:700;color:#0f766e;text-transform:uppercase;letter-spacing:0.06em;">Services</p>
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;border:1px solid #e2e8f0;border-radius:8px;">
-            <thead><tr style="background:#f1f5f9;">
-              <th style="padding:8px;text-align:left;font-size:11px;color:#64748b;">CPT</th>
-              <th style="padding:8px;text-align:left;font-size:11px;color:#64748b;">Description</th>
-              <th style="padding:8px;text-align:right;font-size:11px;color:#64748b;">Fees</th>
-              <th style="padding:8px;text-align:center;font-size:11px;color:#64748b;">Units</th>
-            </tr></thead>
+          <p style="margin:0 0 16px;font-size:13px;color:#334155;">{diagnosis}</p>
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;margin-bottom:16px;">
+            <thead>
+              <tr style="background:#f1f5f9;text-align:left;">
+                <th style="padding:8px;">Code</th>
+                <th style="padding:8px;">Description</th>
+                <th style="padding:8px;text-align:right;">Fee</th>
+                <th style="padding:8px;text-align:center;">Units</th>
+              </tr>
+            </thead>
             <tbody>{lines_html}</tbody>
           </table>
-          <p style="margin:20px 0 8px;font-size:12px;font-weight:700;color:#0f766e;text-transform:uppercase;letter-spacing:0.06em;">Totals</p>
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;">{totals_html}</table>
-          <p style="margin:24px 0 0;font-size:12px;line-height:1.5;color:#64748b;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;max-width:360px;margin-left:auto;">
+            {totals_html}
+          </table>
+          <p style="margin:20px 0 0;font-size:12px;color:#64748b;line-height:1.5;">
             Questions? Call {html.escape(bill.get('phone') or '')} or reply to this email.
           </p>
-        </td></tr>
-        <tr><td style="padding:16px 24px;background:#f8fafc;border-top:1px solid #e2e8f0;font-size:11px;color:#94a3b8;text-align:center;">
-          {clinic} · This message was sent at your request after payment was received.
         </td></tr>
       </table>
     </td></tr>
   </table>
 </body>
-</html>"""
+</html>
+"""
 
 
 def build_patient_bill_plain_text(bill: dict) -> str:
-    """Plain-text fallback for email clients without HTML."""
-    lines = []
+    clinic = bill.get("clinic_name") or "Relief Chiropractic"
+    lines = [
+        f"{clinic} — Patient bill / receipt",
+        f"Invoice: {bill.get('invoice_number') or ''}",
+        f"Patient: {bill.get('patient_name') or ''}",
+        f"Date of service: {bill.get('date_of_service') or ''}",
+        "",
+        "Line items:",
+    ]
     for line in bill.get("lines") or []:
         lines.append(
-            f"  - {line.get('cpt_code', '')} {line.get('description', '')} "
-            f"{_money_label(line.get('fees'))} x{line.get('units', '1')}"
+            f"  - {line.get('cpt_code') or ''} {line.get('description') or ''} "
+            f"{_money_label(line.get('fees'))} x{line.get('units') or ''}"
         )
-    return (
-        f"{bill.get('clinic_name', 'Relief Chiropractic')}\n"
-        f"Patient bill — {bill.get('invoice_number', '')}\n\n"
-        f"Hello {bill.get('patient_name', '')},\n\n"
-        f"Thank you for your visit. Below is your paid statement.\n\n"
-        f"Date of service: {bill.get('date_of_service', '')}\n"
-        f"Diagnosis: {bill.get('diagnosis', '—')}\n\n"
-        f"Services:\n" + ("\n".join(lines) or "  (none)") + "\n\n"
-        f"Total charged: {_money_label(bill.get('patient_charge_total') or bill.get('total_amount'))}\n"
-        f"Payments received: {_money_label(bill.get('payments_received_total'))}\n"
+    lines.append("")
+    lines.append(f"Bill charges: {_money_label(bill.get('bill_charges_total') or bill.get('subtotal'))}")
+    lines.append(
+        f"Patient payments (clinic charge): {_money_label(bill.get('patient_charge_total') or bill.get('total_amount'))}"
     )
+    lines.append(f"Payments received: {_money_label(bill.get('payments_received_total'))}")
+    return "\n".join(lines)
 
 
 def send_patient_bill_email(inv, bill: dict) -> str:
@@ -181,7 +274,10 @@ def send_patient_bill_email(inv, bill: dict) -> str:
 
     if not _smtp_configured():
         raise PatientBillEmailError(
-            "Email is not configured on the server (EMAIL_HOST). Contact your administrator."
+            "Email is not configured on the server (EMAIL_HOST is empty). "
+            "In Dokploy / the API environment, set EMAIL_HOST=smtp.gmail.com, "
+            "EMAIL_HOST_USER, EMAIL_HOST_PASSWORD (Gmail App Password), "
+            "and PATIENT_BILL_FROM_EMAIL to that same Gmail address. Then redeploy the API."
         )
 
     html_body = build_patient_bill_email_html(bill)
@@ -189,11 +285,21 @@ def send_patient_bill_email(inv, bill: dict) -> str:
     clinic_name = bill.get("clinic_name") or "Relief Chiropractic"
     subject = f"Your receipt from {clinic_name} — {bill.get('invoice_number', '')}"
 
-    from_email = getattr(
-        settings,
-        "PATIENT_BILL_FROM_EMAIL",
-        getattr(settings, "DEFAULT_FROM_EMAIL", "reliefchiropracticmi@gmail.com"),
+    from_email = (
+        getattr(settings, "PATIENT_BILL_FROM_EMAIL", None)
+        or getattr(settings, "DEFAULT_FROM_EMAIL", None)
+        or "reliefchiropracticmi@gmail.com"
     )
+    from_email = (from_email or "").strip()
+    smtp_user = (getattr(settings, "EMAIL_HOST_USER", "") or "").strip()
+    if smtp_user and from_email and smtp_user.lower() != from_email.lower():
+        # Gmail commonly rejects mismatched From; prefer the authenticated mailbox.
+        logger.warning(
+            "patient_bill_email From %s differs from EMAIL_HOST_USER %s — using EMAIL_HOST_USER",
+            from_email,
+            smtp_user,
+        )
+        from_email = smtp_user
 
     from django.core.mail import EmailMultiAlternatives
 
@@ -211,10 +317,25 @@ def send_patient_bill_email(inv, bill: dict) -> str:
     try:
         msg.send(fail_silently=False)
     except Exception as exc:
-        logger.exception("patient_bill_email failed invoice=%s to=%s", inv.pk, to_email)
-        raise PatientBillEmailError(
-            "Could not send the email. Check server mail settings or try again later."
-        ) from exc
+        logger.exception(
+            "patient_bill_email failed invoice=%s to=%s from=%s host=%s",
+            inv.pk,
+            to_email,
+            from_email,
+            getattr(settings, "EMAIL_HOST", ""),
+        )
+        try:
+            from apps.clinic.error_tracking import capture_application_error
+
+            capture_application_error(
+                exc=exc,
+                source="patient_bill_email",
+                message=f"patient_bill_email failed invoice={inv.pk} to={to_email}",
+                extra={"invoice_id": inv.pk, "to": to_email, "from": from_email},
+            )
+        except Exception:
+            pass
+        raise PatientBillEmailError(_friendly_smtp_error(exc)) from exc
 
     logger.info("patient_bill_email sent invoice=%s to=%s from=%s", inv.pk, to_email, from_email)
     return to_email

@@ -4560,6 +4560,13 @@ class AdminViewSet(viewsets.ViewSet):
         """Email paid patient bill to the patient's email (owner/staff/doctor)."""
         return _email_patient_bill_response(request)
 
+    @action(detail=False, methods=["get"], url_path="email_status")
+    def email_status(self, request):
+        """Safe SMTP readiness check for Admin Billing (no passwords)."""
+        from apps.clinic.patient_bill_email import smtp_mail_status
+
+        return Response(smtp_mail_status())
+
     @action(detail=False, methods=["post"], url_path="sync-invoice-payment")
     def sync_invoice_payment(self, request):
         """Pull payment status from Square for a stuck awaiting-payment invoice."""
