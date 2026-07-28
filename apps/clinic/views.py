@@ -464,6 +464,19 @@ def _email_patient_bill_response(request, *, provider=None):
         recipient = send_patient_bill_email(inv, bill)
     except PatientBillEmailError as exc:
         return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "email_patient_bill unexpected failure invoice_id=%s", invoice_id
+        )
+        return Response(
+            {
+                "detail": (
+                    "Could not build or send this patient bill. "
+                    "Confirm the invoice is paid and try again, or check Admin → Errors."
+                )
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     return Response(
         {

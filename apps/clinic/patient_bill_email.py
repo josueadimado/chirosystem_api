@@ -163,10 +163,14 @@ def send_patient_bill_email(inv, bill: dict) -> str:
 
     patient = inv.patient
     if not patient_wants_bill_email(patient):
+        if not (patient.email or "").strip():
+            raise PatientBillEmailError(
+                "This patient has no email address on file. Add an email on the patient profile, then try again."
+            )
         raise PatientBillEmailError(
-            "This patient's profile is set to receive bills by text only (or not by email). "
+            "This patient's profile has paid bills/receipts set to None. "
             "Open the patient chart → Demographics → Communication preferences and set "
-            "'Paid bills / receipts' to Email only or Text and email, and ensure an email is on file."
+            "'Paid bills / receipts' to Email only or Text and email."
         )
 
     to_email = (patient.email or "").strip()

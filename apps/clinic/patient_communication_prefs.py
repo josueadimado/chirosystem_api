@@ -29,6 +29,14 @@ def normalize_notify_channel(value: str | None, *, default: str) -> str:
     return default
 
 
+def normalize_notify_bills_channel(value: str | None) -> str:
+    """Paid receipts are email-based; coerce legacy ``sms`` to ``email``."""
+    v = normalize_notify_channel(value, default=DEFAULT_NOTIFY_BILLS)
+    if v == NOTIFY_SMS:
+        return NOTIFY_EMAIL
+    return v
+
+
 def _pref_includes_sms(pref: str) -> bool:
     return pref in (NOTIFY_SMS, NOTIFY_BOTH)
 
@@ -60,11 +68,23 @@ def patient_wants_reminder_email(patient: Patient) -> bool:
 
 
 def patient_wants_bill_email(patient: Patient) -> bool:
-    return _pref_includes_email(patient.notify_bills) and bool((patient.email or "").strip())
+    """
+    Paid receipts are email-only in the product today (SMS receipts not built yet).
+
+    ``notify_bills="sms"`` is a legacy / dead preference: the chart UI shows "Email"
+    for it but used to leave the DB value as ``sms``, which blocked sending. Treat
+    ``sms`` like ``email`` when an address is on file so staff can email bills.
+    """
+    pref = (patient.notify_bills or "").strip().lower()
+    if pref == NOTIFY_NONE:
+        return False
+    if pref == NOTIFY_SMS:
+        pref = NOTIFY_EMAIL
+    return _pref_includes_email(pref) and bool((patient.email or "").strip())
 
 
 def patient_wants_bill_sms(patient: Patient) -> bool:
-    """No-show fees, visit receipts, and other billing notices (notify_bills)."""
+    """No-show fee SMS notices (notify_bills). Visit receipt SMS is not implemented yet."""
     return _pref_includes_sms(patient.notify_bills) and bool((patient.phone or "").strip())
 
 

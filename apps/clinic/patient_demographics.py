@@ -292,9 +292,9 @@ def apply_patient_intake_validated_data(
 
     if allow_communication_prefs:
         from apps.clinic.patient_communication_prefs import (
-            DEFAULT_NOTIFY_BILLS,
             DEFAULT_NOTIFY_BOOKING,
             DEFAULT_NOTIFY_REMINDERS,
+            normalize_notify_bills_channel,
             normalize_notify_channel,
         )
 
@@ -307,9 +307,7 @@ def apply_patient_intake_validated_data(
                 data["notify_reminders"], default=DEFAULT_NOTIFY_REMINDERS
             )
         if "notify_bills" in data:
-            patient.notify_bills = normalize_notify_channel(
-                data["notify_bills"], default=DEFAULT_NOTIFY_BILLS
-            )
+            patient.notify_bills = normalize_notify_bills_channel(data["notify_bills"])
 
     return None
 
