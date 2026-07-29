@@ -4770,6 +4770,32 @@ class AdminViewSet(viewsets.ViewSet):
         patient.save()
         return Response({"detail": "Saved."})
 
+    @action(detail=False, methods=["get"], url_path="intake_forms")
+    def intake_forms(self, request):
+        """Search submitted digital intake forms (admin/staff)."""
+        from apps.clinic.digital_intake_views import staff_intake_forms_list
+
+        return staff_intake_forms_list(request)
+
+    @action(detail=False, methods=["get"], url_path="intake_form_detail")
+    def intake_form_detail(self, request):
+        from apps.clinic.digital_intake_views import staff_intake_form_detail
+
+        return staff_intake_form_detail(request)
+
+    @action(detail=False, methods=["get"], url_path="patient_intake_forms")
+    def patient_intake_forms(self, request):
+        from apps.clinic.digital_intake_views import staff_patient_intake_forms
+
+        return staff_patient_intake_forms(request)
+
+    @action(detail=False, methods=["post"], url_path="intake_send_link")
+    def intake_send_link(self, request):
+        """Create a public intake link and optionally text it to the patient."""
+        from apps.clinic.digital_intake_views import staff_intake_send_link
+
+        return staff_intake_send_link(request)
+
     @action(detail=False, methods=["patch"], url_path="appointment_handoff")
     def appointment_handoff(self, request):
         """Save per-appointment chart / handoff notes (owner/staff may edit any appointment)."""
@@ -5082,6 +5108,32 @@ class DoctorViewSet(viewsets.ViewSet):
             return Response({"detail": err}, status=status.HTTP_400_BAD_REQUEST)
         patient.save()
         return Response({"detail": "Saved."})
+
+    @action(detail=False, methods=["get"], url_path="intake_forms")
+    def intake_forms(self, request):
+        """Search submitted digital intake forms (doctor)."""
+        from apps.clinic.digital_intake_views import staff_intake_forms_list
+
+        return staff_intake_forms_list(request)
+
+    @action(detail=False, methods=["get"], url_path="intake_form_detail")
+    def intake_form_detail(self, request):
+        from apps.clinic.digital_intake_views import staff_intake_form_detail
+
+        return staff_intake_form_detail(request)
+
+    @action(detail=False, methods=["get"], url_path="patient_intake_forms")
+    def patient_intake_forms(self, request):
+        from apps.clinic.digital_intake_views import staff_patient_intake_forms
+
+        return staff_patient_intake_forms(request)
+
+    @action(detail=False, methods=["post"], url_path="intake_send_link")
+    def intake_send_link(self, request):
+        """Create a public intake link and optionally text it to the patient."""
+        from apps.clinic.digital_intake_views import staff_intake_send_link
+
+        return staff_intake_send_link(request)
 
     @action(detail=False, methods=["patch"], url_path="appointment_handoff")
     def appointment_handoff(self, request):

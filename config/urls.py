@@ -12,6 +12,7 @@ from apps.accounts.views import AuthViewSet, TeamViewSet
 from apps.clinic.square_pos_callback import square_pos_callback
 from apps.clinic.square_webhook import square_webhook
 from apps.clinic.voice_views import twilio_voice_gather, twilio_voice_incoming
+from apps.clinic.digital_intake_views import PublicDigitalIntakeViewSet
 from apps.clinic.views import (
     AdminViewSet,
     AppointmentViewSet,
@@ -48,6 +49,7 @@ router.register("visits", VisitViewSet, basename="visits")
 router.register("invoices", InvoiceViewSet, basename="invoices")
 router.register("payments", PaymentViewSet, basename="payments")
 router.register("kiosk", KioskViewSet, basename="kiosk")
+router.register("digital-intake", PublicDigitalIntakeViewSet, basename="digital-intake")
 router.register("notifications", StaffNotificationViewSet, basename="notifications")
 router.register("admin", AdminViewSet, basename="admin")
 

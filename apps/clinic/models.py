@@ -161,6 +161,99 @@ class PatientDocument(TimeStampedModel):
         return f"{self.label} — {self.patient}"
 
 
+class PatientIntakeSubmission(TimeStampedModel):
+    """Digital clinical / wellness intake form filled by the patient (or parent/guardian)."""
+
+    class FormType(models.TextChoices):
+        MASSAGE = "massage", "Massage intake"
+        PEDIATRIC = "pediatric", "Children / pediatric intake"
+        ADULT_CHIROPRACTIC = "adult_chiropractic", "Adult chiropractic new-patient paperwork"
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        SUBMITTED = "submitted", "Submitted"
+
+    patient = models.ForeignKey(Patient, on_delete=models.CASCADE, related_name="intake_submissions")
+    form_type = models.CharField(max_length=32, choices=FormType.choices, db_index=True)
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.DRAFT,
+        db_index=True,
+    )
+    # Structured answers for the chosen form (keys match digital_intake schema).
+    answers = models.JSONField(default=dict, blank=True)
+    schema_version = models.PositiveSmallIntegerField(default=1)
+    signature_name = models.CharField(max_length=200, blank=True, default="")
+    signed_at = models.DateTimeField(null=True, blank=True)
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    appointment = models.ForeignKey(
+        "Appointment",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="intake_submissions",
+        help_text="Optional appointment that triggered this form pack.",
+    )
+
+    class Meta:
+        ordering = ["-submitted_at", "-updated_at"]
+        indexes = [
+            models.Index(fields=["patient_id", "form_type", "status"], name="intake_sub_pat_type_st_idx"),
+            models.Index(fields=["status", "submitted_at"], name="intake_sub_status_sub_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.get_form_type_display()} ({self.status}) — {self.patient}"
+
+
+class PatientIntakeAccessToken(TimeStampedModel):
+    """Secret public link so a patient can open their intake forms without logging in."""
+
+    patient = models.ForeignKey(Patient, on_delete=models.CASCADE, related_name="intake_access_tokens")
+    token = models.CharField(max_length=64, unique=True, db_index=True)
+    expires_at = models.DateTimeField()
+    # If set, only these form types are offered; otherwise recommended from age + upcoming visits.
+    form_types = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Optional list of form_type strings. Empty = auto-recommend.",
+    )
+    appointment = models.ForeignKey(
+        "Appointment",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="intake_access_tokens",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    last_accessed_at = models.DateTimeField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["patient_id", "expires_at"], name="intake_tok_pat_exp_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"Intake link for {self.patient_id} ({self.token[:8]}…)"
+
+    @property
+    def is_active(self) -> bool:
+        if self.revoked_at is not None:
+            return False
+        from django.utils import timezone
+
+        return self.expires_at > timezone.now()
+
+
 class Provider(TimeStampedModel):
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     title = models.CharField(max_length=100, blank=True)
