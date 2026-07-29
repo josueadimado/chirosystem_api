@@ -45,6 +45,56 @@ def patient_intake_public_url(token: str) -> str:
     return f"{base}/intake/{token}"
 
 
+def form_types_still_needed(
+    patient: Patient,
+    *,
+    appointment: Appointment | None = None,
+    form_types: list[str] | None = None,
+) -> list[str]:
+    """Recommended forms that are not yet submitted for this patient."""
+    recommended = recommend_form_types(patient, explicit=form_types, appointment=appointment)
+    needed: list[str] = []
+    for ft in recommended:
+        prior = latest_submission(patient, ft)
+        if prior is None or prior.status != PatientIntakeSubmission.Status.SUBMITTED:
+            needed.append(ft)
+    return needed
+
+
+def intake_url_for_appointment_if_needed(appointment: Appointment) -> str:
+    """
+    Public intake link when this booking still needs paperwork.
+    Reuses a recent active token when possible (SMS + email may both call this).
+    Empty string when all recommended forms are already submitted.
+    """
+    patient = appointment.patient
+    needed = form_types_still_needed(patient, appointment=appointment)
+    if not needed:
+        return ""
+
+    now = timezone.now()
+    needed_set = set(needed)
+    recent = (
+        PatientIntakeAccessToken.objects.filter(
+            patient=patient,
+            revoked_at__isnull=True,
+            expires_at__gt=now,
+        )
+        .order_by("-created_at")[:8]
+    )
+    for row in recent:
+        existing_types = set(row.form_types or [])
+        if needed_set <= existing_types or existing_types == needed_set:
+            return patient_intake_public_url(row.token)
+
+    access = create_intake_access_token(
+        patient,
+        form_types=needed,
+        appointment=appointment,
+    )
+    return patient_intake_public_url(access.token)
+
+
 def recommend_form_types(
     patient: Patient,
     *,

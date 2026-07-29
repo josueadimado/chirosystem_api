@@ -21,13 +21,143 @@ from apps.clinic.digital_intake import (
     submit_intake_form,
 )
 from apps.clinic.models import Appointment, Patient, PatientIntakeSubmission
+from apps.clinic.patient_phone import names_equal_casefold, patients_matching_phone
+from apps.clinic.utils import normalize_phone, validate_phone
+
+
+def _public_match_payload(patient: Patient) -> dict:
+    dob = patient.date_of_birth
+    return {
+        "first_name": patient.first_name,
+        "last_name": patient.last_name,
+        "date_of_birth": dob.isoformat() if dob else None,
+    }
 
 
 class PublicDigitalIntakeViewSet(viewsets.ViewSet):
-    """Unauthenticated patient intake via secret personal link."""
+    """Unauthenticated patient intake via secret personal link or self-lookup."""
 
     permission_classes = [AllowAny]
     authentication_classes = []
+
+    @action(detail=False, methods=["get"], url_path="form-types")
+    def form_types(self, request):
+        return Response(
+            {"form_types": [{"value": k, "label": v} for k, v in FORM_TYPE_LABELS.items()]}
+        )
+
+    @action(detail=False, methods=["get"], url_path="find-patient")
+    def find_patient(self, request):
+        """
+        Public lookup for intake start: phone required.
+        Returns people on that number so the client can pick the right name.
+        """
+        phone_raw = (request.query_params.get("phone") or "").strip()
+        if not phone_raw:
+            return Response({"detail": "Phone number is required."}, status=status.HTTP_400_BAD_REQUEST)
+        valid, _ = validate_phone(phone_raw)
+        if not valid:
+            return Response({"detail": "Enter a valid phone number."}, status=status.HTTP_400_BAD_REQUEST)
+
+        patients = patients_matching_phone(normalize_phone(phone_raw))
+        if not patients:
+            return Response(
+                {
+                    "found": False,
+                    "matches": [],
+                    "detail": "We could not find a patient with that phone number. "
+                    "Book an appointment first, or call the clinic for help.",
+                }
+            )
+
+        q = (request.query_params.get("q") or request.query_params.get("name") or "").strip().lower()
+        matches = patients
+        if q:
+            filtered = []
+            for p in patients:
+                full = f"{p.first_name} {p.last_name}".lower()
+                if q in full or q in (p.first_name or "").lower() or q in (p.last_name or "").lower():
+                    filtered.append(p)
+            matches = filtered
+
+        if not matches:
+            return Response(
+                {
+                    "found": False,
+                    "matches": [],
+                    "detail": "No one with that name is on this phone number. Check the spelling or pick from the list without a name filter.",
+                }
+            )
+
+        return Response(
+            {
+                "found": True,
+                "matches": [_public_match_payload(p) for p in matches],
+            }
+        )
+
+    @action(detail=False, methods=["post"], url_path="public-start")
+    def public_start(self, request):
+        """
+        Start an intake session after the client picks form type + themselves (phone + name).
+        Returns a personal /intake/{token} URL.
+        """
+        form_type = (request.data.get("form_type") or "").strip()
+        if form_type not in FORM_TYPE_LABELS:
+            return Response({"detail": "Please choose a form type."}, status=status.HTTP_400_BAD_REQUEST)
+
+        phone_raw = (request.data.get("phone") or "").strip()
+        valid, normalized = validate_phone(phone_raw)
+        if not valid:
+            return Response({"detail": "Enter a valid phone number."}, status=status.HTTP_400_BAD_REQUEST)
+
+        first_name = (request.data.get("first_name") or "").strip()
+        last_name = (request.data.get("last_name") or "").strip()
+        if not first_name or not last_name:
+            return Response(
+                {"detail": "Select your name so we open the right chart."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        patients = patients_matching_phone(normalize_phone(phone_raw))
+        matched = [p for p in patients if names_equal_casefold(p, first_name, last_name)]
+        if not matched:
+            return Response(
+                {
+                    "detail": "We could not match that name to this phone number. "
+                    "Try again or call the clinic."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        if len(matched) > 1:
+            # Same name on one phone is rare; prefer exact DOB if provided.
+            dob_raw = (request.data.get("date_of_birth") or "").strip()
+            if dob_raw:
+                narrowed = [p for p in matched if p.date_of_birth and p.date_of_birth.isoformat() == dob_raw]
+                if len(narrowed) == 1:
+                    matched = narrowed
+            if len(matched) > 1:
+                return Response(
+                    {
+                        "detail": "More than one match — please include your date of birth, or call the clinic.",
+                        "need_date_of_birth": True,
+                        "matches": [_public_match_payload(p) for p in matched],
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        patient = matched[0]
+        access = create_intake_access_token(patient, form_types=[form_type])
+        url = patient_intake_public_url(access.token)
+        return Response(
+            {
+                "token": access.token,
+                "url": url,
+                "form_type": form_type,
+                "patient_display_name": f"{patient.first_name} {patient.last_name}".strip(),
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
     @action(detail=False, methods=["get"], url_path=r"form/(?P<token>[^/.]+)")
     def form(self, request, token=None):

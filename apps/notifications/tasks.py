@@ -46,6 +46,7 @@ def _send_reminder_email(*, to_email: str, subject: str, body: str) -> bool:
 @shared_task
 def send_booking_confirmation_sms_task(appointment_id: int) -> str:
     """Sent right after online booking commits (async)."""
+    from apps.clinic.digital_intake import intake_url_for_appointment_if_needed
     from apps.clinic.models import Appointment
     from apps.clinic.twilio_sms import booking_confirmation_body, send_sms, twilio_configured
 
@@ -74,6 +75,11 @@ def send_booking_confirmation_sms_task(appointment_id: int) -> str:
     date_disp = appt.appointment_date.strftime("%a %b %d, %Y")
     time_disp = format_time_12h(appt.start_time)
     est_pay = format_usd_plain(appt.booked_service.price) if appt.booked_service else ""
+    try:
+        intake_url = intake_url_for_appointment_if_needed(appt)
+    except Exception:
+        logger.exception("Intake link creation failed for booking SMS appt=%s", appointment_id)
+        intake_url = ""
     body = booking_confirmation_body(
         first_name=patient.first_name.strip() or "there",
         service_name=service_name,
@@ -81,6 +87,7 @@ def send_booking_confirmation_sms_task(appointment_id: int) -> str:
         appt_time_display=time_disp,
         provider_display=str(appt.provider),
         estimated_payment=est_pay,
+        intake_url=intake_url,
     )
     sid = send_sms(to_e164=to, body=body)
     logger.info("Booking SMS result: appt=%s to=%s sid=%s", appointment_id, to, sid)
@@ -93,6 +100,7 @@ def send_booking_confirmation_email_task(appointment_id: int) -> str:
     from django.conf import settings as django_settings
     from django.core.mail import send_mail
 
+    from apps.clinic.digital_intake import intake_url_for_appointment_if_needed
     from apps.clinic.models import Appointment
 
     if not (getattr(django_settings, "EMAIL_HOST", "") or "").strip():
@@ -128,6 +136,18 @@ def send_booking_confirmation_email_task(appointment_id: int) -> str:
             f"    (Estimate for this booked service; add-on services may change your final balance.)\n\n"
         )
 
+    try:
+        intake_url = intake_url_for_appointment_if_needed(appt)
+    except Exception:
+        logger.exception("Intake link creation failed for booking email appt=%s", appointment_id)
+        intake_url = ""
+    intake_block = ""
+    if intake_url:
+        intake_block = (
+            f"Please complete your intake forms before your visit:\n"
+            f"{intake_url}\n\n"
+        )
+
     subject = f"Booking Confirmed — {service_name} on {date_disp}"
     body = (
         f"Hi {first_name},\n\n"
@@ -136,6 +156,7 @@ def send_booking_confirmation_email_task(appointment_id: int) -> str:
         f"  Date: {date_disp}\n"
         f"  Time: {time_disp}\n"
         f"{est_block}"
+        f"{intake_block}"
         f"If you need to reschedule or cancel, please call us or visit our website.\n\n"
         f"We'll send appointment reminders using the contact preferences saved on your chart.\n\n"
         f"Thank you for choosing Relief Chiropractic!\n"
@@ -160,6 +181,7 @@ def send_booking_confirmation_email_task(appointment_id: int) -> str:
 @shared_task
 def send_series_booking_confirmation_sms_task(series_id: int, appointment_ids: list[int]) -> str:
     """One SMS after recurring online booking (lists all visit dates)."""
+    from apps.clinic.digital_intake import intake_url_for_appointment_if_needed
     from apps.clinic.models import Appointment, AppointmentSeries
     from apps.clinic.twilio_sms import send_sms, series_booking_confirmation_body, twilio_configured
 
@@ -176,7 +198,7 @@ def send_series_booking_confirmation_sms_task(series_id: int, appointment_ids: l
 
     appts = list(
         Appointment.objects.filter(pk__in=appointment_ids)
-        .select_related("booked_service")
+        .select_related("booked_service", "patient", "provider")
         .order_by("appointment_date")
     )
     if not appts:
@@ -197,6 +219,11 @@ def send_series_booking_confirmation_sms_task(series_id: int, appointment_ids: l
     time_disp = format_time_12h(series.start_time)
     est_pay = format_usd_plain(service.price) if service else ""
     date_lines = [a.appointment_date.strftime("%a %b %d") for a in appts]
+    try:
+        intake_url = intake_url_for_appointment_if_needed(appts[0])
+    except Exception:
+        logger.exception("Intake link creation failed for series booking SMS series=%s", series_id)
+        intake_url = ""
     body = series_booking_confirmation_body(
         first_name=patient.first_name.strip() or "there",
         service_name=service_name,
@@ -204,6 +231,7 @@ def send_series_booking_confirmation_sms_task(series_id: int, appointment_ids: l
         provider_display=str(series.provider),
         date_lines=date_lines,
         estimated_payment=est_pay,
+        intake_url=intake_url,
     )
     sid = send_sms(to_e164=to, body=body)
     logger.info("Series booking SMS: series=%s to=%s sid=%s", series_id, to, sid)
@@ -216,6 +244,7 @@ def send_series_booking_confirmation_email_task(series_id: int, appointment_ids:
     from django.conf import settings as django_settings
     from django.core.mail import send_mail
 
+    from apps.clinic.digital_intake import intake_url_for_appointment_if_needed
     from apps.clinic.models import Appointment, AppointmentSeries
 
     if not _smtp_configured():
@@ -231,7 +260,7 @@ def send_series_booking_confirmation_email_task(series_id: int, appointment_ids:
 
     appts = list(
         Appointment.objects.filter(pk__in=appointment_ids)
-        .select_related("booked_service")
+        .select_related("booked_service", "patient", "provider")
         .order_by("appointment_date")
     )
     if not appts:
@@ -263,6 +292,18 @@ def send_series_booking_confirmation_email_task(series_id: int, appointment_ids:
             f"    (Estimate for this booked service; add-on services may change your final balance.)\n"
         )
 
+    try:
+        intake_url = intake_url_for_appointment_if_needed(appts[0])
+    except Exception:
+        logger.exception("Intake link creation failed for series booking email series=%s", series_id)
+        intake_url = ""
+    intake_block = ""
+    if intake_url:
+        intake_block = (
+            f"Please complete your intake forms before your first visit:\n"
+            f"{intake_url}\n\n"
+        )
+
     subject = f"Recurring visits confirmed — {len(appts)} {service_name} appointments"
     body = (
         f"Hi {first_name},\n\n"
@@ -272,6 +313,7 @@ def send_series_booking_confirmation_email_task(series_id: int, appointment_ids:
         f"  Time: {time_disp} (same time for each visit)\n\n"
         f"Scheduled visits:\n{visit_lines}\n"
         f"{est_block}\n"
+        f"{intake_block}"
         f"We'll send a reminder the day before each visit using the contact preferences on your chart.\n\n"
         f"If you need to reschedule or cancel, please call us or visit our website.\n\n"
         f"Thank you for choosing Relief Chiropractic!\n"
