@@ -31,11 +31,8 @@ FORM_TYPE_MASSAGE = PatientIntakeSubmission.FormType.MASSAGE
 FORM_TYPE_PEDIATRIC = PatientIntakeSubmission.FormType.PEDIATRIC
 FORM_TYPE_ADULT = PatientIntakeSubmission.FormType.ADULT_CHIROPRACTIC
 
-FORM_TYPE_LABELS = {
-    FORM_TYPE_MASSAGE: "Massage intake",
-    FORM_TYPE_PEDIATRIC: "Children / pediatric intake",
-    FORM_TYPE_ADULT: "Adult chiropractic paperwork",
-}
+# Keep in sync with PatientIntakeSubmission.FormType labels.
+FORM_TYPE_LABELS = dict(PatientIntakeSubmission.FormType.choices)
 
 TOKEN_DEFAULT_DAYS = 30
 PEDIATRIC_AGE_CUTOFF = 18
