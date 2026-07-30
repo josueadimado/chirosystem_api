@@ -22,7 +22,7 @@ from apps.clinic.digital_intake import (
 )
 from apps.clinic.models import Appointment, Patient, PatientIntakeSubmission
 from apps.clinic.patient_phone import names_equal_casefold, patients_matching_phone
-from apps.clinic.utils import normalize_phone, validate_phone
+from apps.clinic.utils import validate_phone
 
 
 def _public_match_payload(patient: Patient) -> dict:
@@ -55,11 +55,11 @@ class PublicDigitalIntakeViewSet(viewsets.ViewSet):
         phone_raw = (request.query_params.get("phone") or "").strip()
         if not phone_raw:
             return Response({"detail": "Phone number is required."}, status=status.HTTP_400_BAD_REQUEST)
-        valid, _ = validate_phone(phone_raw)
+        valid, phone_e164 = validate_phone(phone_raw)
         if not valid:
             return Response({"detail": "Enter a valid phone number."}, status=status.HTTP_400_BAD_REQUEST)
 
-        patients = patients_matching_phone(normalize_phone(phone_raw))
+        patients = patients_matching_phone(phone_e164)
         if not patients:
             return Response(
                 {
@@ -107,7 +107,7 @@ class PublicDigitalIntakeViewSet(viewsets.ViewSet):
             return Response({"detail": "Please choose a form type."}, status=status.HTTP_400_BAD_REQUEST)
 
         phone_raw = (request.data.get("phone") or "").strip()
-        valid, normalized = validate_phone(phone_raw)
+        valid, phone_e164 = validate_phone(phone_raw)
         if not valid:
             return Response({"detail": "Enter a valid phone number."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -119,7 +119,7 @@ class PublicDigitalIntakeViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        patients = patients_matching_phone(normalize_phone(phone_raw))
+        patients = patients_matching_phone(phone_e164)
         matched = [p for p in patients if names_equal_casefold(p, first_name, last_name)]
         if not matched:
             return Response(
