@@ -1033,6 +1033,21 @@ class PatientIntakeUpdateSerializer(serializers.Serializer):
     date_of_birth = serializers.DateField(required=False, allow_null=True)
     date_established = serializers.DateField(required=False, allow_null=True)
     marital_status = serializers.CharField(required=False, allow_blank=True, max_length=1)
+    sex = serializers.ChoiceField(choices=["", "M", "F"], required=False, allow_blank=True)
+    insurance_payer_name = serializers.CharField(required=False, allow_blank=True, max_length=200)
+    insurance_member_id = serializers.CharField(required=False, allow_blank=True, max_length=64)
+    insurance_group_number = serializers.CharField(required=False, allow_blank=True, max_length=64)
+    insurance_plan_type = serializers.ChoiceField(
+        choices=["", "medicare", "medicaid", "tricare", "champva", "group", "feca", "other"],
+        required=False,
+        allow_blank=True,
+    )
+    insurance_relationship = serializers.ChoiceField(
+        choices=["", "self", "spouse", "child", "other"],
+        required=False,
+        allow_blank=True,
+    )
+    insured_name = serializers.CharField(required=False, allow_blank=True, max_length=200)
 
     def validate_phone(self, value):
         if value is None:

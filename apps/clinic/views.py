@@ -487,6 +487,92 @@ def _email_patient_bill_response(request, *, provider=None):
     )
 
 
+def _patient_insurance_fields(patient: Patient) -> dict:
+    return {
+        "sex": (patient.sex or "").strip(),
+        "insurance_payer_name": (patient.insurance_payer_name or "").strip(),
+        "insurance_member_id": (patient.insurance_member_id or "").strip(),
+        "insurance_group_number": (patient.insurance_group_number or "").strip(),
+        "insurance_plan_type": (patient.insurance_plan_type or "").strip() or "group",
+        "insurance_relationship": (patient.insurance_relationship or "").strip() or "self",
+        "insured_name": (patient.insured_name or "").strip(),
+    }
+
+
+def _load_invoice_for_claim(invoice_id: int) -> Invoice | None:
+    return (
+        Invoice.objects.select_related(
+            "patient",
+            "appointment__provider__user",
+            "visit",
+        )
+        .prefetch_related("visit__rendered_services__service", "visit__visit_diagnoses")
+        .filter(pk=invoice_id)
+        .first()
+    )
+
+
+def _insurance_claim_response(request, *, provider=None):
+    """GET insurance claim JSON for an invoice (visit required)."""
+    from apps.clinic.insurance_claim import build_cms1500_claim
+
+    invoice_id = request.query_params.get("invoice_id")
+    if not invoice_id:
+        return Response({"detail": "invoice_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        invoice_id = int(invoice_id)
+    except (TypeError, ValueError):
+        return Response({"detail": "Invalid invoice_id."}, status=status.HTTP_400_BAD_REQUEST)
+    inv = _load_invoice_for_claim(invoice_id)
+    if not inv:
+        return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
+    if provider is not None and inv.appointment_id and inv.appointment.provider_id != provider.id:
+        return Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
+    if not inv.visit_id:
+        return Response(
+            {"detail": "This invoice has no visit documentation to build a claim from."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return Response(build_cms1500_claim(inv, header=_clinic_settings_bill_header()))
+
+
+def _email_insurance_claim_response(request, *, provider=None):
+    """POST email CMS-1500 claim summary to a staff-entered address."""
+    from apps.clinic.insurance_claim import build_cms1500_claim
+    from apps.clinic.insurance_claim_email import send_insurance_claim_email
+
+    invoice_id = request.data.get("invoice_id")
+    to_email = (request.data.get("to_email") or request.data.get("email") or "").strip()
+    if not invoice_id:
+        return Response({"detail": "invoice_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        invoice_id = int(invoice_id)
+    except (TypeError, ValueError):
+        return Response({"detail": "Invalid invoice_id."}, status=status.HTTP_400_BAD_REQUEST)
+    inv = _load_invoice_for_claim(invoice_id)
+    if not inv:
+        return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
+    if provider is not None and inv.appointment_id and inv.appointment.provider_id != provider.id:
+        return Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
+    if not inv.visit_id:
+        return Response(
+            {"detail": "This invoice has no visit documentation to build a claim from."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    claim = build_cms1500_claim(inv, header=_clinic_settings_bill_header())
+    try:
+        recipient = send_insurance_claim_email(claim=claim, to_email=to_email)
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    except Exception:
+        logger.exception("Insurance claim email failed invoice_id=%s", invoice_id)
+        return Response(
+            {"detail": "Could not send the insurance claim email. Check email settings."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+    return Response({"detail": f"Insurance claim emailed to {recipient}.", "recipient": recipient})
+
+
 def _printable_invoice_line(rs, pos_default):
     """Bill table row: fees and line_total are documented amounts for every rendered service.
 
@@ -4560,6 +4646,16 @@ class AdminViewSet(viewsets.ViewSet):
         """Email paid patient bill to the patient's email (owner/staff/doctor)."""
         return _email_patient_bill_response(request)
 
+    @action(detail=False, methods=["get"], url_path="insurance_claim")
+    def insurance_claim(self, request):
+        """CMS-1500 claim JSON for print/email — built from a visit invoice."""
+        return _insurance_claim_response(request)
+
+    @action(detail=False, methods=["post"], url_path="email-insurance-claim")
+    def email_insurance_claim(self, request):
+        """Email CMS-1500 claim summary to a staff-entered insurance email."""
+        return _email_insurance_claim_response(request)
+
     @action(detail=False, methods=["get"], url_path="email_status")
     def email_status(self, request):
         """Safe SMTP readiness check for Admin Billing (no passwords)."""
@@ -4719,6 +4815,7 @@ class AdminViewSet(viewsets.ViewSet):
                 "city_state_zip": patient.city_state_zip or "",
                 "emergency_contact_name": patient.emergency_contact_name or "",
                 "emergency_contact_phone": patient.emergency_contact_phone or "",
+                **_patient_insurance_fields(patient),
                 **patient_saved_card_display(patient),
                 "online_chiro_intake_waived": patient.online_chiro_intake_waived,
                 "payment_profile": (patient.payment_profile or "").strip(),
@@ -5052,6 +5149,7 @@ class DoctorViewSet(viewsets.ViewSet):
                 "city_state_zip": patient.city_state_zip or "",
                 "emergency_contact_name": patient.emergency_contact_name or "",
                 "emergency_contact_phone": patient.emergency_contact_phone or "",
+                **_patient_insurance_fields(patient),
                 **patient_saved_card_display(patient),
                 "online_chiro_intake_waived": patient.online_chiro_intake_waived,
                 "payment_profile": (patient.payment_profile or "").strip(),
@@ -5322,6 +5420,22 @@ class DoctorViewSet(viewsets.ViewSet):
         if not provider:
             return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
         return _email_patient_bill_response(request, provider=provider)
+
+    @action(detail=False, methods=["get"], url_path="insurance_claim")
+    def insurance_claim(self, request):
+        """CMS-1500 claim JSON for print/email — built from a visit invoice."""
+        provider = self._get_provider(request)
+        if not provider:
+            return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
+        return _insurance_claim_response(request, provider=provider)
+
+    @action(detail=False, methods=["post"], url_path="email-insurance-claim")
+    def email_insurance_claim(self, request):
+        """Email CMS-1500 claim summary to a staff-entered insurance email."""
+        provider = self._get_provider(request)
+        if not provider:
+            return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
+        return _email_insurance_claim_response(request, provider=provider)
 
     @action(detail=False, methods=["get"], url_path="invoice_search")
     def invoice_search(self, request):

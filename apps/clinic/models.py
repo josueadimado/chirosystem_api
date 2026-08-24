@@ -35,6 +35,67 @@ class Patient(TimeStampedModel):
         choices=[("", "—"), ("Y", "Married"), ("N", "Not married")],
         help_text="Y = married, N = not married (matrimonial situation).",
     )
+    # Demographics for CMS-1500 insurance claims
+    sex = models.CharField(
+        max_length=1,
+        blank=True,
+        default="",
+        choices=[("", "—"), ("M", "Male"), ("F", "Female")],
+        help_text="Used on insurance claims (CMS-1500 box 3).",
+    )
+    insurance_payer_name = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        help_text="Insurance company / payer name for claims.",
+    )
+    insurance_member_id = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text="Insured’s ID / member number (CMS-1500 box 1a).",
+    )
+    insurance_group_number = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text="Group or plan number (CMS-1500 box 11).",
+    )
+    insurance_plan_type = models.CharField(
+        max_length=20,
+        blank=True,
+        default="group",
+        choices=[
+            ("", "—"),
+            ("medicare", "Medicare"),
+            ("medicaid", "Medicaid"),
+            ("tricare", "TRICARE"),
+            ("champva", "CHAMPVA"),
+            ("group", "Group health plan"),
+            ("feca", "FECA"),
+            ("other", "Other"),
+        ],
+        help_text="CMS-1500 box 1 insurance type.",
+    )
+    insurance_relationship = models.CharField(
+        max_length=10,
+        blank=True,
+        default="self",
+        choices=[
+            ("", "—"),
+            ("self", "Self"),
+            ("spouse", "Spouse"),
+            ("child", "Child"),
+            ("other", "Other"),
+        ],
+        help_text="Patient relationship to insured (CMS-1500 box 6).",
+    )
+    insured_name = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        help_text="Insured’s name if different from the patient. Leave blank when relationship is Self.",
+    )
     # Square — full card data never stored; only customer + card on file id and display hints
     square_customer_id = models.CharField(max_length=255, blank=True)
     square_card_id = models.CharField(max_length=255, blank=True)

@@ -255,6 +255,13 @@ def apply_patient_intake_validated_data(
         "emergency_contact_name",
         "emergency_contact_phone",
         "marital_status",
+        "sex",
+        "insurance_payer_name",
+        "insurance_member_id",
+        "insurance_group_number",
+        "insurance_plan_type",
+        "insurance_relationship",
+        "insured_name",
     ):
         if field in data:
             setattr(patient, field, data[field] or "")
