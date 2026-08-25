@@ -245,6 +245,7 @@ def _serialize_billing_invoice_row(inv: Invoice) -> dict:
         "tax": str(inv.tax),
         "issued_at": inv.issued_at.isoformat() if inv.issued_at else None,
         "paid_at": inv.paid_at.isoformat() if inv.paid_at else None,
+        "visit_id": inv.visit_id,
     }
     if inv.visit_id:
         row.update(_visit_invoice_bill_totals(inv.visit, inv))
@@ -5464,9 +5465,11 @@ class DoctorViewSet(viewsets.ViewSet):
                 "invoice_number": inv.invoice_number,
                 "patient_name": f"{inv.patient.first_name} {inv.patient.last_name}",
                 "patient_payment_profile": (inv.patient.payment_profile or "").strip(),
-                "date_of_service": str(inv.appointment.appointment_date),
+                "date_of_service": str(inv.appointment.appointment_date) if inv.appointment_id else None,
                 "total_amount": str(inv.total_amount),
                 "status": inv.status,
+                "kind": inv.kind,
+                "visit_id": inv.visit_id,
             }
             for inv in qs
         ])
