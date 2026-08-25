@@ -891,8 +891,9 @@ class SystemErrorLog(TimeStampedModel):
     class Meta:
         ordering = ["-created_at"]
         indexes = [
-            models.Index(fields=["resolved_at", "created_at"]),
-            models.Index(fields=["source", "created_at"]),
+            # Names must match production (Django auto-names after an earlier RenameIndex migration).
+            models.Index(fields=["resolved_at", "created_at"], name="clinic_syst_resolve_bd6693_idx"),
+            models.Index(fields=["source", "created_at"], name="clinic_syst_source_a6a647_idx"),
         ]
 
     def __str__(self) -> str:
