@@ -96,6 +96,14 @@ class Patient(TimeStampedModel):
         default="",
         help_text="Insured’s name if different from the patient. Leave blank when relationship is Self.",
     )
+    insurance_company = models.ForeignKey(
+        "InsuranceCompany",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="patients",
+        help_text="Catalog insurance payer assigned to this patient (optional). Name is copied to insurance_payer_name for claims.",
+    )
     # Square — full card data never stored; only customer + card on file id and display hints
     square_customer_id = models.CharField(max_length=255, blank=True)
     square_card_id = models.CharField(max_length=255, blank=True)
@@ -607,6 +615,44 @@ class DiagnosisCode(TimeStampedModel):
 
     def __str__(self) -> str:
         return f"{self.code} — {self.description}"
+
+
+class InsuranceCompany(TimeStampedModel):
+    """Clinic insurance payer catalog — add once, then assign to patients."""
+
+    name = models.CharField(max_length=200, unique=True)
+    claim_email = models.EmailField(
+        blank=True,
+        default="",
+        help_text="Default email for sending CMS-1500 claims to this payer.",
+    )
+    phone = models.CharField(max_length=40, blank=True, default="")
+    notes = models.CharField(max_length=500, blank=True, default="")
+    default_plan_type = models.CharField(
+        max_length=20,
+        blank=True,
+        default="group",
+        choices=[
+            ("", "—"),
+            ("medicare", "Medicare"),
+            ("medicaid", "Medicaid"),
+            ("tricare", "TRICARE"),
+            ("champva", "CHAMPVA"),
+            ("group", "Group health plan"),
+            ("feca", "FECA"),
+            ("other", "Other"),
+        ],
+        help_text="Suggested CMS-1500 box 1 type when this payer is assigned to a patient.",
+    )
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name = "Insurance company"
+        verbose_name_plural = "Insurance companies"
+
+    def __str__(self) -> str:
+        return self.name
 
 
 class VisitDiagnosis(TimeStampedModel):

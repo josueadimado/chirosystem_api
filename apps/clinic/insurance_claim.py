@@ -12,8 +12,7 @@ from decimal import Decimal
 from django.utils import timezone
 
 from apps.clinic.digital_intake import _split_city_state_zip
-from apps.clinic.models import Invoice, Visit
-from apps.clinic.visit_diagnosis import serialize_visit_diagnoses
+from apps.clinic.models import Invoice, Visit, VisitDiagnosis
 
 
 def _mmddyy(d) -> str:
@@ -77,6 +76,70 @@ def _clinic_header() -> dict:
     }
 
 
+# ICD-10-CM-ish token (letter + digits, optional decimal section).
+_ICD_TOKEN_RE = re.compile(
+    r"\b([A-TV-Z][0-9][0-9A-Z](?:\.[0-9A-Z]{1,4})?)\b",
+    re.IGNORECASE,
+)
+
+
+def _format_dx_for_claim(code: str) -> str:
+    """CMS-1500 box 21 often prints codes with a space instead of the decimal point."""
+    cleaned = re.sub(r"[^A-Za-z0-9.]", "", (code or "").strip().upper())
+    if not cleaned:
+        return ""
+    return cleaned.replace(".", " ")
+
+
+def _diagnosis_codes_for_visit(visit: Visit) -> list[str]:
+    """
+    Collect up to 12 ICD codes for CMS-1500 box 21.
+
+    Prefer VisitDiagnosis catalog rows; fall back to parsing visit.diagnosis text
+    (handles em dashes, hyphens, and codes embedded in sentences).
+    """
+    codes: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        display = _format_dx_for_claim(raw)
+        if not display:
+            return
+        key = display.replace(" ", "")
+        if key in seen:
+            return
+        seen.add(key)
+        codes.append(display)
+
+    # Direct query so we never miss rows if prefetch was skipped/stale.
+    for row in VisitDiagnosis.objects.filter(visit_id=visit.pk).order_by("id"):
+        add(row.code)
+
+    text = (visit.diagnosis or "").strip()
+    if text in {"—", "–", "-", "n/a", "N/A", "none", "None"}:
+        text = ""
+
+    if not codes and text:
+        for line in re.split(r"[\r\n]+", text):
+            line = line.strip()
+            if not line:
+                continue
+            # "M54.13 — Cervicalgia" / "M54.13 - Cervicalgia" / "M54.13: ..."
+            head = re.split(r"\s*[—–\-:|/]\s*", line, maxsplit=1)[0].strip()
+            if _ICD_TOKEN_RE.match(head) or re.match(r"^[A-TV-Z]\d", head, re.I):
+                add(head)
+                continue
+            embedded = _ICD_TOKEN_RE.search(line)
+            if embedded:
+                add(embedded.group(1))
+
+        if not codes:
+            for match in _ICD_TOKEN_RE.finditer(text):
+                add(match.group(1))
+
+    return codes[:12]
+
+
 def build_cms1500_claim(inv: Invoice, *, header: dict | None = None) -> dict:
     """
     Build a CMS-1500 claim dict from a visit invoice.
@@ -97,23 +160,9 @@ def build_cms1500_claim(inv: Invoice, *, header: dict | None = None) -> dict:
     phone_area = phone_digits[-10:-7] if len(phone_digits) >= 10 else ""
     phone_rest = phone_digits[-7:] if len(phone_digits) >= 7 else phone_digits
 
-    dx_rows = serialize_visit_diagnoses(visit)
-    diagnosis_codes: list[str] = []
-    for row in dx_rows:
-        code = (row.get("code") or "").strip().replace(".", " ")
-        if code and code not in diagnosis_codes:
-            diagnosis_codes.append(code)
-    # Fallback: parse free-text diagnosis lines "M54.13 — ..."
-    if not diagnosis_codes and (visit.diagnosis or "").strip():
-        for line in (visit.diagnosis or "").splitlines():
-            token = line.split("—")[0].split("-")[0].strip()
-            token = re.sub(r"[^A-Za-z0-9.]", "", token)
-            if token:
-                diagnosis_codes.append(token.replace(".", " "))
-
-    diagnosis_codes = diagnosis_codes[:12]
-    # Pointers A–L for up to 12 diagnoses
-    pointer_letters = "".join(chr(ord("A") + i) for i in range(min(4, len(diagnosis_codes))) ) or "A"
+    diagnosis_codes = _diagnosis_codes_for_visit(visit)
+    # Pointers A–L for up to 12 diagnoses (service lines use first 4).
+    pointer_letters = "".join(chr(ord("A") + i) for i in range(min(4, len(diagnosis_codes)))) or "A"
 
     lines_out: list[dict] = []
     total = Decimal("0.00")
@@ -157,8 +206,15 @@ def build_cms1500_claim(inv: Invoice, *, header: dict | None = None) -> dict:
         "champva": plan == "champva",
         "group": plan == "group",
         "feca": plan == "feca",
-        "other": plan == "other" or plan not in {
-            "medicare", "medicaid", "tricare", "champva", "group", "feca",
+        "other": plan == "other"
+        or plan
+        not in {
+            "medicare",
+            "medicaid",
+            "tricare",
+            "champva",
+            "group",
+            "feca",
         },
     }
 
@@ -186,6 +242,11 @@ def build_cms1500_claim(inv: Invoice, *, header: dict | None = None) -> dict:
         "plan_checks": plan_checks,
         "insured_id": (pat.insurance_member_id or "").strip().upper(),
         "payer_name": (pat.insurance_payer_name or "").strip().upper(),
+        "payer_email": (
+            (pat.insurance_company.claim_email or "").strip()
+            if getattr(pat, "insurance_company", None)
+            else ""
+        ),
         # Box 2–7 patient / insured
         "patient_name": patient_name,
         "patient_dob": _mmddyy(pat.date_of_birth),
@@ -247,10 +308,13 @@ def _claim_warnings(patient, lines: list[dict], diagnosis_codes: list[str]) -> l
         notes.append("Insurance company name is blank.")
     if not (patient.sex or "").strip():
         notes.append("Patient sex is blank (needed for box 3).")
-    if not (patient.date_of_birth):
+    if not patient.date_of_birth:
         notes.append("Patient date of birth is blank.")
     if not diagnosis_codes:
-        notes.append("No diagnosis codes on this visit — add ICD codes before filing.")
+        notes.append(
+            "No diagnosis codes on this visit — open the visit in Billing (Edit billing) or the "
+            "doctor chart and add ICD codes, then generate the claim again."
+        )
     if not lines:
         notes.append("No service lines on this visit.")
     return notes

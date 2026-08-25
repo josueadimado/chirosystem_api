@@ -10,6 +10,7 @@ from .utils import validate_phone
 from .models import (
     Appointment,
     DiagnosisCode,
+    InsuranceCompany,
     Invoice,
     Patient,
     PatientCreditTransaction,
@@ -293,6 +294,26 @@ class DiagnosisCodeSerializer(serializers.ModelSerializer):
         model = DiagnosisCode
         # `created_at` / `updated_at` are not used by the diagnoses management page or billing modals.
         fields = ("id", "code", "description", "is_active")
+
+
+class InsuranceCompanySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = InsuranceCompany
+        fields = (
+            "id",
+            "name",
+            "claim_email",
+            "phone",
+            "notes",
+            "default_plan_type",
+            "is_active",
+        )
+
+    def validate_name(self, value):
+        name = (value or "").strip()
+        if not name:
+            raise serializers.ValidationError("Company name is required.")
+        return name
 
 
 class StaffNotificationSerializer(serializers.ModelSerializer):
@@ -1034,6 +1055,7 @@ class PatientIntakeUpdateSerializer(serializers.Serializer):
     date_established = serializers.DateField(required=False, allow_null=True)
     marital_status = serializers.CharField(required=False, allow_blank=True, max_length=1)
     sex = serializers.ChoiceField(choices=["", "M", "F"], required=False, allow_blank=True)
+    insurance_company_id = serializers.IntegerField(required=False, allow_null=True)
     insurance_payer_name = serializers.CharField(required=False, allow_blank=True, max_length=200)
     insurance_member_id = serializers.CharField(required=False, allow_blank=True, max_length=64)
     insurance_group_number = serializers.CharField(required=False, allow_blank=True, max_length=64)

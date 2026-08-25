@@ -28,6 +28,7 @@ from .models import (
     Appointment,
     ClinicSettings,
     DiagnosisCode,
+    InsuranceCompany,
     Invoice,
     Patient,
     PatientCreditTransaction,
@@ -82,6 +83,7 @@ from .serializers import (
     ProviderUnavailabilityBulkSerializer,
     ProviderUnavailabilitySerializer,
     DiagnosisCodeSerializer,
+    InsuranceCompanySerializer,
     ServiceSerializer,
     StaffNotificationSerializer,
     VisitCompleteSerializer,
@@ -489,8 +491,12 @@ def _email_patient_bill_response(request, *, provider=None):
 
 
 def _patient_insurance_fields(patient: Patient) -> dict:
+    company = getattr(patient, "insurance_company", None)
     return {
         "sex": (patient.sex or "").strip(),
+        "insurance_company_id": patient.insurance_company_id,
+        "insurance_company_name": (company.name if company else "").strip(),
+        "insurance_company_claim_email": (company.claim_email if company else "").strip(),
         "insurance_payer_name": (patient.insurance_payer_name or "").strip(),
         "insurance_member_id": (patient.insurance_member_id or "").strip(),
         "insurance_group_number": (patient.insurance_group_number or "").strip(),
@@ -504,6 +510,7 @@ def _load_invoice_for_claim(invoice_id: int) -> Invoice | None:
     return (
         Invoice.objects.select_related(
             "patient",
+            "patient__insurance_company",
             "appointment__provider__user",
             "visit",
         )
@@ -2370,6 +2377,33 @@ class DiagnosisCodeViewSet(viewsets.ModelViewSet):
         qs = super().get_queryset()
         role = getattr(self.request.user, "role", None)
         if role == "doctor":
+            return qs.filter(is_active=True)
+        return qs
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsOwnerOrDoctor()]
+        return [IsStaffOrOwnerAdmin()]
+
+
+class InsuranceCompanyViewSet(viewsets.ModelViewSet):
+    """Insurance payer catalog — admin/staff maintain; doctors read active payers for patient charts."""
+
+    queryset = InsuranceCompany.objects.all().order_by("name")
+    serializer_class = InsuranceCompanySerializer
+    permission_classes = [IsOwnerOrDoctor]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        role = getattr(self.request.user, "role", None)
+        if role == "doctor":
+            return qs.filter(is_active=True)
+        # Staff/admin list can include inactive unless ?active_only=1
+        if str(self.request.query_params.get("active_only") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
             return qs.filter(is_active=True)
         return qs
 
@@ -4795,7 +4829,7 @@ class AdminViewSet(viewsets.ViewSet):
             patient_id = int(patient_id)
         except (ValueError, TypeError):
             return Response({"detail": "Invalid patient_id."}, status=status.HTTP_400_BAD_REQUEST)
-        patient = Patient.objects.filter(pk=patient_id).first()
+        patient = Patient.objects.filter(pk=patient_id).select_related("insurance_company").first()
         if not patient:
             return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
         appointments = (
@@ -5127,7 +5161,7 @@ class DoctorViewSet(viewsets.ViewSet):
             patient_id = int(patient_id)
         except (ValueError, TypeError):
             return Response({"detail": "Invalid patient_id."}, status=status.HTTP_400_BAD_REQUEST)
-        patient = Patient.objects.filter(pk=patient_id).select_related().first()
+        patient = Patient.objects.filter(pk=patient_id).select_related("insurance_company").first()
         if not patient:
             return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
         provider = self._get_provider(request)

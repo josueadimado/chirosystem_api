@@ -266,6 +266,23 @@ def apply_patient_intake_validated_data(
         if field in data:
             setattr(patient, field, data[field] or "")
 
+    if "insurance_company_id" in data:
+        from apps.clinic.models import InsuranceCompany
+
+        raw_id = data.get("insurance_company_id")
+        if raw_id in (None, "", 0, "0"):
+            patient.insurance_company = None
+        else:
+            company = InsuranceCompany.objects.filter(pk=int(raw_id), is_active=True).first()
+            if not company:
+                return "That insurance company was not found or is inactive."
+            patient.insurance_company = company
+            # Auto-fill claim snapshot fields only when the client did not send them.
+            if "insurance_payer_name" not in data:
+                patient.insurance_payer_name = company.name
+            if company.default_plan_type and "insurance_plan_type" not in data:
+                patient.insurance_plan_type = company.default_plan_type
+
     if "date_of_birth" in data:
         patient.date_of_birth = data["date_of_birth"]
 
