@@ -363,8 +363,8 @@ class Provider(TimeStampedModel):
         max_length=32,
         blank=True,
         default="",
-        help_text="Optional. Billing provider ID (e.g. NPI) printed on this doctor's patient bills. "
-        "When blank, the clinic-wide Provider ID from Settings is used.",
+        help_text="Optional. This doctor's NPI on patient bills. "
+        "When blank, the clinic-wide NPI from Settings is used.",
     )
 
     class Meta:
@@ -954,14 +954,15 @@ class ClinicSettings(TimeStampedModel):
         max_length=32,
         blank=True,
         default="",
-        help_text="Employer / office tax ID printed on patient bills (e.g. EIN). Optional.",
+        help_text="Provider/Office Employer ID printed on patient bills and emailed receipts "
+        "(not the same as NPI). Example: 453798678.",
     )
     provider_billing_id = models.CharField(
         max_length=32,
         blank=True,
         default="",
-        help_text="Clinic-wide billing provider ID printed on all patient bills (e.g. NPI). "
-        "Used when a doctor has no per-provider ID set.",
+        help_text="Clinic-wide NPI printed on patient bills when a doctor has no per-provider NPI set. "
+        "Example: 1700186277.",
     )
     pos_default = models.CharField(
         max_length=10,

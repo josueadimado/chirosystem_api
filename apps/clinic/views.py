@@ -200,15 +200,19 @@ def _clinic_settings_bill_header():
     }
 
 
-def _bill_provider_id_display(inv: Invoice, header: dict) -> str:
-    """Provider ID on patient bills: per-doctor override, else clinic setting, else legacy employer ID."""
+def _bill_provider_npi_display(inv: Invoice, header: dict) -> str:
+    """NPI on patient bills: per-doctor override, else clinic-wide provider billing ID."""
     prov = inv.appointment.provider if inv.appointment_id else None
     if prov is not None:
         per = (getattr(prov, "billing_provider_id", None) or "").strip()
         if per:
             return per
-    clinic_id = (header.get("provider_billing_id") or header.get("employer_tax_id") or "").strip()
-    return clinic_id
+    return (header.get("provider_billing_id") or "").strip()
+
+
+def _bill_provider_id_display(inv: Invoice, header: dict) -> str:
+    """Backward-compatible single ID (prefer NPI, else office employer ID)."""
+    return _bill_provider_npi_display(inv, header) or (header.get("employer_tax_id") or "").strip()
 
 
 def _format_bill_display_date(d) -> str:
@@ -352,7 +356,11 @@ def _invoice_bill_dict(inv: Invoice, *, preview: bool) -> dict:
             if inv.appointment and inv.appointment.provider
             else ""
         ),
-        "provider_billing_id": _bill_provider_id_display(inv, header),
+        # NPI (per-doctor override, else clinic provider_billing_id)
+        "provider_npi": _bill_provider_npi_display(inv, header),
+        "provider_billing_id": _bill_provider_npi_display(inv, header),
+        # Office employer / employee ID from clinic settings (separate from NPI)
+        "office_employer_id": (header.get("employer_tax_id") or "").strip(),
         "lines": lines,
         # Bill Charges row = all documented line amounts (patient + insurance-only).
         "subtotal": totals["bill_charges_total"],

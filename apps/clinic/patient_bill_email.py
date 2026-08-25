@@ -118,6 +118,16 @@ def _money_label(value: str | None) -> str:
 def build_patient_bill_email_html(bill: dict) -> str:
     """Email-safe HTML patient bill (table layout, inline styles)."""
     clinic = html.escape(bill.get("clinic_name") or "Relief Chiropractic")
+    clinic_street = html.escape((bill.get("address_line1") or "").strip())
+    clinic_csz = html.escape((bill.get("city_state_zip") or "").strip())
+    clinic_phone = html.escape((bill.get("phone") or "").strip())
+    clinic_email = html.escape((bill.get("email") or "").strip())
+    office_employer_id = html.escape(
+        (bill.get("office_employer_id") or bill.get("employer_tax_id") or "").strip()
+    )
+    provider_npi = html.escape(
+        (bill.get("provider_npi") or bill.get("provider_billing_id") or "").strip()
+    )
     inv_no = html.escape(bill.get("invoice_number") or "")
     patient = html.escape(bill.get("patient_name") or "")
     addr = html.escape(bill.get("patient_address") or "")
@@ -154,12 +164,22 @@ def build_patient_bill_email_html(bill: dict) -> str:
         for label, val in totals_rows
     )
 
-    provider_line = ""
+    clinic_address_lines = "<br/>".join(part for part in (clinic_street, clinic_csz) if part)
+    provider_bits = []
     if provider:
-        provider_line = f"<p style=\"margin:8px 0 0;font-size:13px;color:#334155;\"><strong>Provider:</strong> {provider}"
-        if cred:
-            provider_line += f", {cred}"
-        provider_line += "</p>"
+        provider_bits.append(provider + (f", {cred}" if cred else ""))
+    if clinic_address_lines:
+        provider_bits.append(f"Office: {clinic_street}{', ' + clinic_csz if clinic_csz else ''}")
+    provider_bits.append(f"Provider/Office Employer ID#: {office_employer_id or '—'}")
+    provider_bits.append(f"NPI: {provider_npi or '—'}")
+    provider_block = (
+        "<p style=\"margin:12px 0 0;font-size:12px;font-weight:700;color:#0f766e;"
+        "text-transform:uppercase;letter-spacing:0.06em;\">Provider / clinic</p>"
+        + "".join(
+            f"<p style=\"margin:4px 0 0;font-size:13px;color:#334155;\">{bit}</p>"
+            for bit in provider_bits
+        )
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -171,6 +191,11 @@ def build_patient_bill_email_html(bill: dict) -> str:
         <tr><td style="background:#0f766e;padding:20px 24px;color:#ffffff;">
           <p style="margin:0;font-size:12px;letter-spacing:0.08em;text-transform:uppercase;opacity:0.9;">Patient bill / receipt</p>
           <h1 style="margin:8px 0 0;font-size:22px;font-weight:700;">{clinic}</h1>
+          <p style="margin:10px 0 0;font-size:13px;line-height:1.45;opacity:0.95;">
+            {clinic_address_lines or "—"}
+            {f"<br/>{clinic_phone}" if clinic_phone else ""}
+            {f"<br/>{clinic_email}" if clinic_email else ""}
+          </p>
         </td></tr>
         <tr><td style="padding:24px;">
           <p style="margin:0 0 16px;font-size:14px;line-height:1.5;color:#334155;">
@@ -178,15 +203,17 @@ def build_patient_bill_email_html(bill: dict) -> str:
             Thank you for your visit. Attached below is your paid statement for your records.
           </p>
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px;font-size:13px;">
-            <tr><td style="padding:4px 0;color:#64748b;width:140px;">Invoice</td><td style="padding:4px 0;font-weight:600;">{inv_no}</td></tr>
+            <tr><td style="padding:4px 0;color:#64748b;width:180px;">Invoice</td><td style="padding:4px 0;font-weight:600;">{inv_no}</td></tr>
             <tr><td style="padding:4px 0;color:#64748b;">Date of service</td><td style="padding:4px 0;">{dos}</td></tr>
             <tr><td style="padding:4px 0;color:#64748b;">Billing date</td><td style="padding:4px 0;">{billing_date}</td></tr>
             <tr><td style="padding:4px 0;color:#64748b;">Statement date</td><td style="padding:4px 0;">{stmt_date}</td></tr>
+            <tr><td style="padding:4px 0;color:#64748b;">Provider/Office Employer ID#</td><td style="padding:4px 0;font-weight:600;">{office_employer_id or "—"}</td></tr>
+            <tr><td style="padding:4px 0;color:#64748b;">NPI</td><td style="padding:4px 0;font-weight:600;">{provider_npi or "—"}</td></tr>
           </table>
           <p style="margin:0 0 4px;font-size:12px;font-weight:700;color:#0f766e;text-transform:uppercase;letter-spacing:0.06em;">Patient</p>
           <p style="margin:0;font-size:14px;font-weight:600;">{patient}</p>
           <p style="margin:4px 0 0;font-size:13px;color:#475569;">{addr}</p>
-          {provider_line}
+          {provider_block}
           <p style="margin:16px 0 6px;font-size:12px;font-weight:700;color:#0f766e;text-transform:uppercase;letter-spacing:0.06em;">Diagnosis</p>
           <p style="margin:0 0 16px;font-size:13px;color:#334155;">{diagnosis}</p>
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;margin-bottom:16px;">
@@ -204,7 +231,7 @@ def build_patient_bill_email_html(bill: dict) -> str:
             {totals_html}
           </table>
           <p style="margin:20px 0 0;font-size:12px;color:#64748b;line-height:1.5;">
-            Questions? Call {html.escape(bill.get('phone') or '')} or reply to this email.
+            Questions? Call {clinic_phone or "the clinic"} or reply to this email.
           </p>
         </td></tr>
       </table>
@@ -217,11 +244,18 @@ def build_patient_bill_email_html(bill: dict) -> str:
 
 def build_patient_bill_plain_text(bill: dict) -> str:
     clinic = bill.get("clinic_name") or "Relief Chiropractic"
+    office_employer_id = (bill.get("office_employer_id") or bill.get("employer_tax_id") or "").strip()
+    provider_npi = (bill.get("provider_npi") or bill.get("provider_billing_id") or "").strip()
     lines = [
         f"{clinic} — Patient bill / receipt",
+        f"{(bill.get('address_line1') or '').strip()} {(bill.get('city_state_zip') or '').strip()}".strip(),
+        f"Phone: {(bill.get('phone') or '').strip()}",
         f"Invoice: {bill.get('invoice_number') or ''}",
         f"Patient: {bill.get('patient_name') or ''}",
         f"Date of service: {bill.get('date_of_service') or ''}",
+        f"Provider/Office Employer ID#: {office_employer_id or '—'}",
+        f"NPI: {provider_npi or '—'}",
+        f"Provider: {bill.get('provider_name') or ''}",
         "",
         "Line items:",
     ]
