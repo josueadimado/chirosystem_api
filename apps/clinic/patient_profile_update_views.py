@@ -18,6 +18,12 @@ from apps.clinic.patient_profile_update import (
     send_profile_update_link_sms,
     update_patient_profile_from_payload,
 )
+from apps.clinic.patient_profile_update_otp import (
+    public_patient_match,
+    request_sms_code,
+    resolve_patients_for_phone,
+    verify_sms_code,
+)
 from apps.clinic.square_helpers import (
     format_save_card_exception,
     patient_saved_card_display,
@@ -27,10 +33,73 @@ from apps.clinic.square_helpers import (
 
 
 class PublicPatientProfileUpdateViewSet(viewsets.ViewSet):
-    """Unauthenticated patient self-update via secret personal link."""
+    """Unauthenticated patient self-update via secret personal link or SMS code."""
 
     permission_classes = [AllowAny]
     authentication_classes = []
+
+    @action(detail=False, methods=["get"], url_path="find-patients")
+    def find_patients(self, request):
+        """Look up people on a phone number so the booking UI can pick the right chart."""
+        phone_raw = (request.query_params.get("phone") or "").strip()
+        if not phone_raw:
+            return Response({"detail": "Phone number is required."}, status=status.HTTP_400_BAD_REQUEST)
+        patients, err = resolve_patients_for_phone(phone_raw)
+        if err:
+            return Response({"detail": err}, status=status.HTTP_400_BAD_REQUEST)
+        if not patients:
+            return Response(
+                {
+                    "found": False,
+                    "matches": [],
+                    "detail": "We could not find a patient with that phone number. "
+                    "Book an appointment first, or call the clinic for help.",
+                }
+            )
+        return Response(
+            {
+                "found": True,
+                "matches": [public_patient_match(p) for p in patients],
+            }
+        )
+
+    @action(detail=False, methods=["post"], url_path="request-sms-code")
+    def request_sms_code_action(self, request):
+        """Send a 6-digit SMS code after resolving the patient by phone (+ name if shared)."""
+        phone = (request.data.get("phone") or "").strip()
+        first_name = (request.data.get("first_name") or "").strip()
+        last_name = (request.data.get("last_name") or "").strip()
+        payload, err, code = request_sms_code(phone, first_name=first_name, last_name=last_name)
+        if err:
+            return Response({"detail": err}, status=code)
+        return Response(payload, status=code)
+
+    @action(detail=False, methods=["post"], url_path="verify-sms-code")
+    def verify_sms_code_action(self, request):
+        """Verify SMS code and return a short-lived /update-info/{token} URL."""
+        challenge = (request.data.get("challenge_token") or "").strip()
+        code = (request.data.get("code") or "").strip()
+        if not challenge or not code:
+            return Response(
+                {"detail": "Enter the verification code from your text message."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        patient = verify_sms_code(challenge, code)
+        if not patient:
+            return Response(
+                {"detail": "That code is incorrect or expired. Request a new code and try again."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        access = create_profile_update_token(patient, days_valid=1)
+        url = patient_profile_update_public_url(access.token)
+        return Response(
+            {
+                "detail": "Verified. Opening your secure update page.",
+                "url": url,
+                "token": access.token,
+                "expires_at": access.expires_at.isoformat(),
+            }
+        )
 
     @action(detail=False, methods=["get"], url_path=r"session/(?P<token>[^/.]+)")
     def session(self, request, token=None):
