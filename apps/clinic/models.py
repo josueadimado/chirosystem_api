@@ -323,6 +323,40 @@ class PatientIntakeAccessToken(TimeStampedModel):
         return self.expires_at > timezone.now()
 
 
+class PatientProfileUpdateToken(TimeStampedModel):
+    """Secret public link so a patient can update contact info and card on file without logging in."""
+
+    patient = models.ForeignKey(Patient, on_delete=models.CASCADE, related_name="profile_update_tokens")
+    token = models.CharField(max_length=64, unique=True, db_index=True)
+    expires_at = models.DateTimeField()
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    last_accessed_at = models.DateTimeField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["patient_id", "expires_at"], name="prof_upd_tok_pat_exp_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"Profile update link for {self.patient_id} ({self.token[:8]}…)"
+
+    @property
+    def is_active(self) -> bool:
+        if self.revoked_at is not None:
+            return False
+        from django.utils import timezone
+
+        return self.expires_at > timezone.now()
+
+
 class Provider(TimeStampedModel):
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     title = models.CharField(max_length=100, blank=True)

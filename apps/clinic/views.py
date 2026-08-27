@@ -4936,6 +4936,13 @@ class AdminViewSet(viewsets.ViewSet):
 
         return staff_intake_send_link(request)
 
+    @action(detail=False, methods=["post"], url_path="profile_update_send_link")
+    def profile_update_send_link(self, request):
+        """Create a public update-info link and optionally text/email it to the patient."""
+        from apps.clinic.patient_profile_update_views import staff_profile_update_send_link
+
+        return staff_profile_update_send_link(request)
+
     @action(detail=False, methods=["patch"], url_path="appointment_handoff")
     def appointment_handoff(self, request):
         """Save per-appointment chart / handoff notes (owner/staff may edit any appointment)."""
@@ -5275,6 +5282,13 @@ class DoctorViewSet(viewsets.ViewSet):
         from apps.clinic.digital_intake_views import staff_intake_send_link
 
         return staff_intake_send_link(request)
+
+    @action(detail=False, methods=["post"], url_path="profile_update_send_link")
+    def profile_update_send_link(self, request):
+        """Create a public update-info link and optionally text/email it to the patient."""
+        from apps.clinic.patient_profile_update_views import staff_profile_update_send_link
+
+        return staff_profile_update_send_link(request)
 
     @action(detail=False, methods=["patch"], url_path="appointment_handoff")
     def appointment_handoff(self, request):
