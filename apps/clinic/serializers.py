@@ -1247,8 +1247,18 @@ def complete_visit_with_services(visit: Visit, payload: dict) -> Invoice:
     )
 
     appointment = visit.appointment
-    appointment.status = Appointment.Status.AWAITING_PAYMENT
-    appointment.save(update_fields=["status", "updated_at"])
+    # Full professional discount (or $0 bill) — nothing to collect; do not leave
+    # the visit stuck on "awaiting payment".
+    if total_amount <= Decimal("0"):
+        invoice.status = Invoice.Status.PAID
+        invoice.paid_at = timezone.now()
+        invoice.save(update_fields=["status", "paid_at", "updated_at"])
+        from apps.clinic.invoice_collection import set_appointment_status_after_invoice_paid
+
+        set_appointment_status_after_invoice_paid(invoice)
+    else:
+        appointment.status = Appointment.Status.AWAITING_PAYMENT
+        appointment.save(update_fields=["status", "updated_at"])
     return invoice
 
 
@@ -1364,7 +1374,11 @@ def revise_unpaid_visit_billing(visit: Visit, payload: dict) -> Invoice:
     if invoice.status not in (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT):
         raise ValueError("This invoice cannot be revised in its current state.")
 
-    return _apply_visit_billing_revision(visit, invoice, payload)
+    invoice = _apply_visit_billing_revision(visit, invoice, payload)
+    # Editing to a full discount (or payments already covering) should close the bill.
+    _reconcile_invoice_status_after_admin_revision(invoice)
+    invoice.refresh_from_db()
+    return invoice
 
 
 def revise_visit_billing_admin(visit: Visit, payload: dict) -> Invoice:

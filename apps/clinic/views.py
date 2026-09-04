@@ -5860,11 +5860,16 @@ class DoctorViewSet(viewsets.ViewSet):
             )
         payload = _complete_visit_payload_from_validated(data, rendered_payload)
         invoice = complete_visit_with_services(visit, payload)
-        visit.appointment.status = Appointment.Status.AWAITING_PAYMENT
-        visit.appointment.completed_at = timezone.now()
+        invoice.refresh_from_db()
+        visit.appointment.refresh_from_db()
+        # Zero-balance bills (full discount) are already marked paid/completed above.
+        # Only force awaiting_payment when money is still owed.
+        if invoice.status != Invoice.Status.PAID:
+            visit.appointment.status = Appointment.Status.AWAITING_PAYMENT
+        if not visit.appointment.completed_at:
+            visit.appointment.completed_at = timezone.now()
         visit.appointment.save(update_fields=["status", "completed_at", "updated_at"])
 
-        invoice.refresh_from_db()
         followup = _doctor_collect_payment_followup(
             invoice, try_saved_card=data.get("charge_saved_card_if_present", True)
         )

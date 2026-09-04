@@ -216,7 +216,7 @@ def build_payment_reconciliation_payload(*, q: str = "", page: int = 1, page_siz
         "partial_payment": paginate(partial_rows),
         "open_unpaid": paginate(open_unpaid_rows),
         "hints": [
-            "Fully paid but still open: cash/card was recorded in the clinic system, but the invoice status was never flipped to paid — use Close as paid.",
+            "Fully paid but still open: cash/card was recorded, or a full professional discount brought the bill to $0, but the invoice stayed Issued — use Close as paid.",
             "Partial payment: some cash/card is on file; remaining balance is still due.",
             "Open unpaid: no local cash/card payment yet — use Check Square, Mark paid (if Square app shows paid), or Record cash on Billing.",
         ],
