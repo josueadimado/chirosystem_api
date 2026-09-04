@@ -1,5 +1,7 @@
 from decimal import Decimal
 
+import logging
+
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.utils import timezone
@@ -27,6 +29,7 @@ from .models import (
 from .visit_diagnosis import update_visit_diagnosis_fields
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
 
 
 class PatientSerializer(serializers.ModelSerializer):
@@ -924,6 +927,23 @@ class PaymentCompleteSerializer(serializers.Serializer):
 
             self._result_invoice = inv
             self._remaining_due = due_after
+
+            # Mirror cash into Square after commit so Dashboard/reports match — never blocks local pay.
+            if payment.payment_method == Payment.Method.CASH:
+                cash_payment_id = payment.id
+
+                def _mirror_cash() -> None:
+                    try:
+                        from apps.clinic.square_payment import record_local_cash_payment_in_square
+
+                        record_local_cash_payment_in_square(cash_payment_id)
+                    except Exception:
+                        logger.exception(
+                            "Square cash mirror on_commit failed for payment %s", cash_payment_id
+                        )
+
+                transaction.on_commit(_mirror_cash)
+
             return payment
 
     @property
@@ -1019,6 +1039,7 @@ class StaffSavePatientCardSerializer(serializers.Serializer):
 
     source_id = serializers.CharField(max_length=255)
     verification_token = serializers.CharField(required=False, allow_blank=True, max_length=512)
+    set_as_default = serializers.BooleanField(required=False, default=True)
 
 
 class TerminalCheckoutSerializer(serializers.Serializer):

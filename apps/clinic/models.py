@@ -187,6 +187,36 @@ class Patient(TimeStampedModel):
         return f"{self.first_name} {self.last_name}"
 
 
+class PatientSavedCard(TimeStampedModel):
+    """One Square card on file for a patient (patients may have several)."""
+
+    patient = models.ForeignKey(Patient, on_delete=models.CASCADE, related_name="saved_cards")
+    square_card_id = models.CharField(max_length=255, db_index=True)
+    card_brand = models.CharField(max_length=40, blank=True, default="")
+    card_last4 = models.CharField(max_length=4, blank=True, default="")
+    is_default = models.BooleanField(default=False, db_index=True)
+    enabled = models.BooleanField(
+        default=True,
+        help_text="False when staff removed the card or Square disabled it.",
+    )
+
+    class Meta:
+        ordering = ["-is_default", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["patient", "square_card_id"],
+                name="uniq_patient_square_card",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["patient", "enabled", "is_default"], name="pat_card_en_def_idx"),
+        ]
+
+    def __str__(self) -> str:
+        label = f"{self.card_brand} •••• {self.card_last4}".strip() or self.square_card_id
+        return f"{self.patient_id}: {label}"
+
+
 def _patient_document_upload_path(instance: "PatientDocument", filename: str) -> str:
     return f"patient_documents/{instance.patient_id}/{filename}"
 

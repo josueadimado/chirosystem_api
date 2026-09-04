@@ -85,6 +85,12 @@ def _handle_payment_object(payment: dict) -> None:
         return
     if (payment.get("status") or "").upper() != "COMPLETED":
         return
+    # Clinic-recorded cash mirrors use lcash-* refs; never settle invoices from Square CASH rows.
+    if (payment.get("source_type") or "").upper() == "CASH":
+        return
+    ref = (payment.get("reference_id") or "").strip()
+    if ref.startswith("lcash-"):
+        return
     pid = payment.get("id")
     if not pid:
         return

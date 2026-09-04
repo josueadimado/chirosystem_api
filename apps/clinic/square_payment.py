@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 _MIN_AMOUNT_CENTS = 100
 _CREDIT_TOPUP_REF_PREFIX = "ct_"
 _BUNDLE_REF_PREFIX = "bundle-"
+# Clinic "Record cash" mirrored into Square — must not look like an invoice reference_id.
+_LOCAL_CASH_REF_PREFIX = "lcash-"
 _OPEN_INVOICE_STATUSES = (Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT)
 
 
@@ -243,6 +245,9 @@ def _order_obj_matches_invoice(order, invoice: Invoice) -> bool:
 def _square_payment_matches_invoice(client, pay, invoice: Invoice) -> bool:
     if (getattr(pay, "status", None) or "").upper() != "COMPLETED":
         return False
+    # Cash mirrors recorded by our clinic app must not auto-settle invoices (breaks partial cash).
+    if _square_payment_is_recorded_cash(pay):
+        return False
     if _payment_reference_matches_invoice(getattr(pay, "reference_id", None), invoice.pk):
         return True
     if _payment_note_matches_invoice(getattr(pay, "note", None), invoice):
@@ -253,12 +258,27 @@ def _square_payment_matches_invoice(client, pay, invoice: Invoice) -> bool:
     return False
 
 
+def _square_payment_is_recorded_cash(pay) -> bool:
+    """True for Square CASH payments (including our clinic cash mirrors)."""
+    source = (getattr(pay, "source_type", None) or "").upper()
+    if source == "CASH":
+        return True
+    if isinstance(pay, dict) and (pay.get("source_type") or "").upper() == "CASH":
+        return True
+    ref = (getattr(pay, "reference_id", None) or "").strip()
+    if isinstance(pay, dict):
+        ref = (pay.get("reference_id") or ref or "").strip()
+    return ref.startswith(_LOCAL_CASH_REF_PREFIX)
+
+
 def _payment_relaxed_cross_device_match(pay, invoice: Invoice, patient: Patient) -> bool:
     """
     Match a payment taken on another Square device (iPad, phone app, second reader) that may
     not include our invoice reference — same patient, amount, and visit day only.
     """
     if (getattr(pay, "status", None) or "").upper() != "COMPLETED":
+        return False
+    if _square_payment_is_recorded_cash(pay):
         return False
     amount_cents = _money_cents(invoice)
     am = getattr(pay, "amount_money", None)
@@ -650,6 +670,106 @@ def _square_payment_error_message(errors) -> str:
     return square_error_list_message(errors)
 
 
+def record_local_cash_payment_in_square(payment_id: int) -> dict:
+    """
+    Best-effort: mirror a clinic "Record cash" Payment into Square (Payments API, source_id=CASH)
+    so cash appears in Square Dashboard / reports for reconciliation.
+
+    Does not change invoice status (that already happened locally). Safe if Square is down —
+    returns ok=False and never raises. Uses a non-invoice reference_id so webhooks / Check Square
+    do not treat this cash row as a card settlement.
+    """
+    from square.requests.money import MoneyParams
+
+    if not square_configured():
+        return {"ok": False, "skipped": True, "error": "square_not_configured", "payment_id": None}
+
+    payment = (
+        Payment.objects.select_related("invoice", "patient")
+        .filter(pk=payment_id, payment_method=Payment.Method.CASH, status=Payment.Status.SUCCESSFUL)
+        .first()
+    )
+    if not payment:
+        return {"ok": False, "skipped": True, "error": "payment_not_found", "payment_id": None}
+
+    existing_ref = (payment.payment_reference or "").strip()
+    # Already linked to a Square payment id (retry / double on_commit).
+    if existing_ref and not existing_ref.startswith(_LOCAL_CASH_REF_PREFIX) and len(existing_ref) >= 10:
+        if ":" not in existing_ref and " " not in existing_ref:
+            return {"ok": True, "skipped": True, "error": None, "payment_id": existing_ref}
+
+    loc = get_location_id()
+    if not loc:
+        return {"ok": False, "skipped": True, "error": "square_location_not_configured", "payment_id": None}
+
+    amount = Decimal(payment.amount or "0").quantize(Decimal("0.01"))
+    amount_cents = int((amount * 100).quantize(Decimal("1")))
+    if amount_cents <= 0:
+        return {"ok": False, "skipped": True, "error": "nothing_due", "payment_id": None}
+
+    inv = payment.invoice
+    patient = payment.patient
+    patient_name = f"{(patient.first_name or '').strip()} {(patient.last_name or '').strip()}".strip()
+    note = f"Cash · Invoice {inv.invoice_number}"
+    if patient_name:
+        note = f"{note} · {patient_name}"
+    note = note[:500]
+
+    # Stable key so Django on_commit retries do not create duplicate Square cash rows.
+    idempotency_key = f"clinic-cash-{payment.id}"[:45]
+    reference_id = f"{_LOCAL_CASH_REF_PREFIX}{payment.id}"[:40]
+
+    client = get_square_client()
+    try:
+        res = client.payments.create(
+            source_id="CASH",
+            idempotency_key=idempotency_key,
+            amount_money=MoneyParams(amount=amount_cents, currency="USD"),
+            cash_details={
+                "buyer_supplied_money": MoneyParams(amount=amount_cents, currency="USD"),
+            },
+            location_id=loc,
+            reference_id=reference_id,
+            autocomplete=True,
+            note=note,
+        )
+        if res.errors:
+            err = _square_payment_error_message(res.errors)
+            logger.warning(
+                "Square cash mirror failed for local payment %s (invoice %s): %s",
+                payment.id,
+                inv.pk,
+                err,
+            )
+            return {"ok": False, "skipped": False, "error": err, "payment_id": None}
+
+        pay = res.payment
+        pay_status = (getattr(pay, "status", None) or "").upper()
+        pay_id = (getattr(pay, "id", None) or "").strip()
+        if pay_id and pay_status in ("COMPLETED", "APPROVED", "CAPTURED"):
+            if not existing_ref:
+                Payment.objects.filter(pk=payment.id).update(payment_reference=pay_id[:120])
+            logger.info(
+                "Mirrored cash payment %s to Square payment %s (invoice %s, $%s)",
+                payment.id,
+                pay_id,
+                inv.pk,
+                amount,
+            )
+            return {"ok": True, "skipped": False, "error": None, "payment_id": pay_id}
+
+        err = f"payment_status_{getattr(pay, 'status', 'unknown')}"
+        logger.warning("Square cash mirror unexpected status for payment %s: %s", payment.id, err)
+        return {"ok": False, "skipped": False, "error": err, "payment_id": pay_id or None}
+    except Exception as exc:
+        logger.warning(
+            "Square cash mirror exception for local payment %s: %s",
+            payment.id,
+            exc,
+        )
+        return {"ok": False, "skipped": False, "error": format_square_exception(exc), "payment_id": None}
+
+
 _SQUARE_CHARGE_CODE_MESSAGES: dict[str, str] = {
     "CARD_DECLINED": "The card was declined by the bank. Use another card, cash, or Square Terminal.",
     "GENERIC_DECLINE": "The card was declined. Use another card, cash, or Square Terminal.",
@@ -782,9 +902,10 @@ def apply_credit_topup_from_square_payment(
     return True
 
 
-def try_charge_saved_card(invoice: Invoice) -> dict:
+def try_charge_saved_card(invoice: Invoice, *, saved_card_id: int | None = None) -> dict:
     """
-    Charge the patient's Square card on file (card-present not required).
+    Charge a Square card on file for this patient (card-present not required).
+    When saved_card_id is set, charge that card; otherwise the patient's default card.
     Returns {"ok": bool, "error": str | None, "payment_intent_id": str | None}
     (payment_intent_id holds Square payment id for API compatibility with the web UI.)
     """
@@ -793,7 +914,9 @@ def try_charge_saved_card(invoice: Invoice) -> dict:
     from .square_helpers import resolve_chargeable_card_for_patient
 
     patient = invoice.patient
-    card_id, customer_id, card_err = resolve_chargeable_card_for_patient(patient)
+    card_id, customer_id, card_err = resolve_chargeable_card_for_patient(
+        patient, saved_card_id=saved_card_id
+    )
     if card_err or not card_id or not customer_id:
         err = card_err or (
             "card_on_file_not_chargeable" if (patient.card_last4 or "").strip() else "no_saved_card"

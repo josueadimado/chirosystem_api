@@ -823,7 +823,7 @@ def _sync_invoice_payment_api_response(request) -> Response:
 
 
 def _charge_saved_card_api_response(request) -> Response:
-    """Charge the patient's Square card on file for an open invoice."""
+    """Charge a patient's Square card on file for an open invoice (optional saved_card_id)."""
     from .square_helpers import square_configured
     from .square_payment import charge_saved_card_error_message, try_charge_saved_card
 
@@ -851,7 +851,17 @@ def _charge_saved_card_api_response(request) -> Response:
             {"detail": "Square payments are not configured. Connect Square in Admin Settings."},
             status=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
-    charge = try_charge_saved_card(inv)
+    saved_card_id = None
+    raw_card = request.data.get("saved_card_id")
+    if raw_card not in (None, "", 0, "0"):
+        try:
+            saved_card_id = int(raw_card)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "saved_card_id must be a number."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+    charge = try_charge_saved_card(inv, saved_card_id=saved_card_id)
     inv.refresh_from_db()
     if charge["ok"]:
         if inv.appointment_id:
@@ -1769,11 +1779,11 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             save_card_from_source(patient, src, verification_token=vtok)
         except Exception as exc:
             return Response({"detail": format_save_card_exception(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        patient.refresh_from_db()
         return Response(
             {
                 "detail": "Card saved.",
-                "card_brand": patient.card_brand,
-                "card_last4": patient.card_last4,
+                **patient_saved_card_display(patient),
             }
         )
 
@@ -2161,7 +2171,7 @@ class PatientViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="save-card")
     def save_card(self, request, pk=None):
-        """Owner, staff, or doctor: save a payment card on file for this patient (Square Web Payments token)."""
+        """Owner, staff, or doctor: add a payment card on file for this patient (Square Web Payments token)."""
         if not square_configured():
             return Response(
                 {"detail": "Square payments are not configured. Ask your administrator to connect Square in Settings."},
@@ -2173,16 +2183,50 @@ class PatientViewSet(viewsets.ModelViewSet):
         data = ser.validated_data
         src = data["source_id"]
         vtok = (data.get("verification_token") or "").strip() or None
+        set_default = bool(data.get("set_as_default", True))
         try:
-            save_card_from_source(patient, src, verification_token=vtok)
+            display = save_card_from_source(
+                patient, src, verification_token=vtok, set_as_default=set_default
+            )
         except Exception as exc:
             return Response({"detail": format_save_card_exception(exc)}, status=status.HTTP_502_BAD_GATEWAY)
-        return Response(
-            {
-                "detail": "Card saved.",
-                **patient_saved_card_display(patient),
-            }
-        )
+        return Response({"detail": "Card saved.", **display})
+
+    @action(detail=True, methods=["get"], url_path="saved-cards")
+    def saved_cards(self, request, pk=None):
+        """List enabled cards on file for this patient."""
+        patient = self.get_object()
+        return Response(patient_saved_card_display(patient))
+
+    @action(detail=True, methods=["post"], url_path=r"saved-cards/(?P<card_pk>[^/.]+)/set-default")
+    def saved_card_set_default(self, request, pk=None, card_pk=None):
+        from apps.clinic.square_helpers import set_default_saved_card
+
+        patient = self.get_object()
+        try:
+            card_id = int(card_pk)
+        except (TypeError, ValueError):
+            return Response({"detail": "Invalid card id."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            set_default_saved_card(patient, card_id)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"detail": "Default card updated.", **patient_saved_card_display(patient)})
+
+    @action(detail=True, methods=["delete"], url_path=r"saved-cards/(?P<card_pk>[^/.]+)")
+    def saved_card_delete(self, request, pk=None, card_pk=None):
+        from apps.clinic.square_helpers import disable_saved_card
+
+        patient = self.get_object()
+        try:
+            card_id = int(card_pk)
+        except (TypeError, ValueError):
+            return Response({"detail": "Invalid card id."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            disable_saved_card(patient, card_id)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"detail": "Card removed.", **patient_saved_card_display(patient)})
 
 
 class ProviderViewSet(viewsets.ModelViewSet):
@@ -4767,6 +4811,73 @@ class AdminViewSet(viewsets.ViewSet):
             })
         return Response(data)
 
+    @action(detail=False, methods=["post"], url_path="patients/merge_preview")
+    def patients_merge_preview(self, request):
+        """Preview merging discard chart into keep chart (no changes written)."""
+        role = getattr(request.user, "role", None)
+        if role not in ("owner_admin", "staff"):
+            return Response(
+                {"detail": "Only clinic admin or staff can merge patient charts."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        from apps.clinic.patient_merge import preview_patient_merge
+
+        try:
+            keep_id = int(request.data.get("keep_patient_id"))
+            discard_id = int(request.data.get("discard_patient_id"))
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "keep_patient_id and discard_patient_id are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            return Response(preview_patient_merge(keep_patient_id=keep_id, discard_patient_id=discard_id))
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="patients/merge_confirm")
+    def patients_merge_confirm(self, request):
+        """Merge discard chart into keep chart (moves history, then deletes the duplicate)."""
+        role = getattr(request.user, "role", None)
+        if role not in ("owner_admin", "staff"):
+            return Response(
+                {"detail": "Only clinic admin or staff can merge patient charts."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        from apps.clinic.patient_merge import execute_patient_merge
+
+        try:
+            keep_id = int(request.data.get("keep_patient_id"))
+            discard_id = int(request.data.get("discard_patient_id"))
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "keep_patient_id and discard_patient_id are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        confirm = str(request.data.get("confirm") or "").strip().lower()
+        if confirm not in ("1", "true", "yes", "merge"):
+            return Response(
+                {
+                    "detail": 'To merge, send confirm: "merge" after reviewing the preview. '
+                    "This cannot be undone."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            result = execute_patient_merge(
+                keep_patient_id=keep_id,
+                discard_patient_id=discard_id,
+                merged_by=request.user,
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Patient.DoesNotExist:
+            return Response(
+                {"detail": "One of the patients was not found (maybe already merged)."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(result)
+
     @action(
         detail=False,
         methods=["post"],
@@ -5289,6 +5400,61 @@ class DoctorViewSet(viewsets.ViewSet):
         from apps.clinic.patient_profile_update_views import staff_profile_update_send_link
 
         return staff_profile_update_send_link(request)
+
+    @action(detail=False, methods=["post"], url_path="patients/merge_preview")
+    def patients_merge_preview(self, request):
+        """Preview merging discard chart into keep chart (no changes written)."""
+        from apps.clinic.patient_merge import preview_patient_merge
+
+        try:
+            keep_id = int(request.data.get("keep_patient_id"))
+            discard_id = int(request.data.get("discard_patient_id"))
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "keep_patient_id and discard_patient_id are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            return Response(preview_patient_merge(keep_patient_id=keep_id, discard_patient_id=discard_id))
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="patients/merge_confirm")
+    def patients_merge_confirm(self, request):
+        """Merge discard chart into keep chart (moves history, then deletes the duplicate)."""
+        from apps.clinic.patient_merge import execute_patient_merge
+
+        try:
+            keep_id = int(request.data.get("keep_patient_id"))
+            discard_id = int(request.data.get("discard_patient_id"))
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "keep_patient_id and discard_patient_id are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        confirm = str(request.data.get("confirm") or "").strip().lower()
+        if confirm not in ("1", "true", "yes", "merge"):
+            return Response(
+                {
+                    "detail": 'To merge, send confirm: "merge" after reviewing the preview. '
+                    "This cannot be undone."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            result = execute_patient_merge(
+                keep_patient_id=keep_id,
+                discard_patient_id=discard_id,
+                merged_by=request.user,
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Patient.DoesNotExist:
+            return Response(
+                {"detail": "One of the patients was not found (maybe already merged)."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(result)
 
     @action(detail=False, methods=["patch"], url_path="appointment_handoff")
     def appointment_handoff(self, request):

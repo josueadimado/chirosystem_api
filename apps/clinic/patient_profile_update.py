@@ -91,6 +91,8 @@ def profile_update_payload(access: PatientProfileUpdateToken) -> dict[str, Any]:
             "card_brand": card.get("card_brand") or "",
             "card_last4": card.get("card_last4") or "",
             "card_display_only": bool(card.get("card_display_only")),
+            "saved_cards": card.get("saved_cards") or [],
+            "default_saved_card_id": card.get("default_saved_card_id"),
         },
     }
 

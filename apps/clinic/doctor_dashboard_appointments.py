@@ -115,6 +115,8 @@ def serialize_doctor_dashboard_appointments(appt_list: list[Appointment]) -> lis
                     "has_card_on_file",
                     "has_chargeable_saved_card",
                     "card_display_only",
+                    "saved_cards",
+                    "default_saved_card_id",
                 )
             },
             "patient_payment_profile": (a.patient.payment_profile or "").strip(),

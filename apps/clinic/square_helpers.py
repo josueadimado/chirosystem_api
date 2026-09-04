@@ -322,30 +322,129 @@ def get_square_payment_status_for_admin() -> dict:
 
 def patient_has_chargeable_saved_card(patient) -> bool:
     """True when Square has both customer + card ids needed for card-not-present charges."""
+    from apps.clinic.models import PatientSavedCard
+
+    if PatientSavedCard.objects.filter(patient=patient, enabled=True).exclude(square_card_id="").exists():
+        cid = (getattr(patient, "square_customer_id", "") or "").strip()
+        if cid:
+            return True
+        # Legacy: customer id may still be missing but default card fields exist
     return bool(
         (getattr(patient, "square_customer_id", "") or "").strip()
         and (getattr(patient, "square_card_id", "") or "").strip()
     )
 
 
+def serialize_saved_card_row(row) -> dict:
+    return {
+        "id": row.id,
+        "square_card_id": row.square_card_id,
+        "card_brand": row.card_brand or "",
+        "card_last4": row.card_last4 or "",
+        "is_default": bool(row.is_default),
+    }
+
+
+def list_enabled_saved_cards(patient) -> list[dict]:
+    from apps.clinic.models import PatientSavedCard
+
+    rows = list(
+        PatientSavedCard.objects.filter(patient=patient, enabled=True)
+        .exclude(square_card_id="")
+        .order_by("-is_default", "-created_at")
+    )
+    return [serialize_saved_card_row(r) for r in rows]
+
+
+def sync_patient_default_card_cache(patient) -> None:
+    """Mirror the default PatientSavedCard onto Patient.square_card_id / brand / last4."""
+    from apps.clinic.models import PatientSavedCard
+
+    default = (
+        PatientSavedCard.objects.filter(patient=patient, enabled=True, is_default=True)
+        .exclude(square_card_id="")
+        .first()
+    )
+    if default is None:
+        default = (
+            PatientSavedCard.objects.filter(patient=patient, enabled=True)
+            .exclude(square_card_id="")
+            .order_by("-created_at")
+            .first()
+        )
+        if default:
+            PatientSavedCard.objects.filter(patient=patient, enabled=True).update(is_default=False)
+            default.is_default = True
+            default.save(update_fields=["is_default", "updated_at"])
+
+    if default:
+        patient.square_card_id = default.square_card_id
+        patient.card_brand = default.card_brand or ""
+        patient.card_last4 = default.card_last4 or ""
+    else:
+        patient.square_card_id = ""
+        patient.card_brand = ""
+        patient.card_last4 = ""
+    patient.save(update_fields=["square_card_id", "card_brand", "card_last4", "updated_at"])
+
+
+def set_default_saved_card(patient, saved_card_id: int) -> dict:
+    from apps.clinic.models import PatientSavedCard
+
+    row = PatientSavedCard.objects.filter(pk=saved_card_id, patient=patient, enabled=True).first()
+    if not row:
+        raise ValueError("That card was not found on this patient.")
+    PatientSavedCard.objects.filter(patient=patient, enabled=True).update(is_default=False)
+    row.is_default = True
+    row.save(update_fields=["is_default", "updated_at"])
+    sync_patient_default_card_cache(patient)
+    return serialize_saved_card_row(row)
+
+
+def disable_saved_card(patient, saved_card_id: int) -> None:
+    """Soft-disable locally and ask Square to disable the card when possible."""
+    from apps.clinic.models import PatientSavedCard
+
+    row = PatientSavedCard.objects.filter(pk=saved_card_id, patient=patient, enabled=True).first()
+    if not row:
+        raise ValueError("That card was not found on this patient.")
+
+    square_id = (row.square_card_id or "").strip()
+    if square_id and square_configured():
+        try:
+            client = get_square_client()
+            # Square Cards API: disable keeps history but blocks charges.
+            if hasattr(client.cards, "disable"):
+                client.cards.disable(card_id=square_id)
+        except Exception as exc:
+            logger.warning("Square card disable failed for patient %s card %s: %s", patient.pk, square_id, exc)
+
+    row.enabled = False
+    row.is_default = False
+    row.save(update_fields=["enabled", "is_default", "updated_at"])
+    sync_patient_default_card_cache(patient)
+
+
 def patient_saved_card_display(patient) -> dict:
     """
     Card-on-file hints for UI.
-    card_last4 may exist without chargeable Square ids (legacy/partial save) — flag that case.
+    Includes saved_cards[] for multi-card pickers while keeping legacy single-card keys.
     """
-    last4 = (getattr(patient, "card_last4", "") or "").strip()
-    brand = (getattr(patient, "card_brand", "") or "").strip()
-    card_id = (getattr(patient, "square_card_id", "") or "").strip()
+    cards = list_enabled_saved_cards(patient)
+    default = next((c for c in cards if c.get("is_default")), cards[0] if cards else None)
+    last4 = (default or {}).get("card_last4") or (getattr(patient, "card_last4", "") or "").strip()
+    brand = (default or {}).get("card_brand") or (getattr(patient, "card_brand", "") or "").strip()
+    card_id = (default or {}).get("square_card_id") or (getattr(patient, "square_card_id", "") or "").strip()
     chargeable = patient_has_chargeable_saved_card(patient)
     return {
         "card_brand": brand,
         "card_last4": last4,
-        # Display: card on file when Square card id + last4 exist (legacy rows may lack customer_id).
-        "has_saved_card": bool(card_id and last4),
-        # Broader UI hint — show card section when digits or Square card id exist on the profile.
-        "has_card_on_file": bool(last4 or card_id),
+        "has_saved_card": bool(cards) or bool(card_id and last4),
+        "has_card_on_file": bool(cards) or bool(last4 or card_id),
         "has_chargeable_saved_card": chargeable,
         "card_display_only": bool(last4 and not chargeable),
+        "saved_cards": cards,
+        "default_saved_card_id": (default or {}).get("id"),
     }
 
 
@@ -462,37 +561,51 @@ def _square_api_error_message(errors) -> str:
     return square_error_list_message(errors)
 
 
-def _persist_patient_square_card(patient, card) -> None:
-    """Update patient row from a Square Card object."""
+def _persist_patient_square_card(patient, card, *, make_default: bool = True) -> None:
+    """Update PatientSavedCard + default Patient cache from a Square Card object."""
+    from apps.clinic.models import PatientSavedCard
+
     last4 = getattr(card, "last_4", None) or getattr(card, "last4", None)
-    patient.square_card_id = card.id
-    patient.card_brand = (getattr(card, "card_brand", None) or "") or ""
-    patient.card_last4 = (str(last4) if last4 else "")[-4:] if last4 else ""
+    brand = (getattr(card, "card_brand", None) or "") or ""
+    last4_s = (str(last4) if last4 else "")[-4:] if last4 else ""
     cid = (getattr(card, "customer_id", None) or patient.square_customer_id or "").strip()
     if cid:
         patient.square_customer_id = cid
-    patient.save(
-        update_fields=[
-            "square_customer_id",
-            "square_card_id",
-            "card_brand",
-            "card_last4",
-            "updated_at",
-        ]
+        patient.save(update_fields=["square_customer_id", "updated_at"])
+
+    row, _created = PatientSavedCard.objects.update_or_create(
+        patient=patient,
+        square_card_id=card.id,
+        defaults={
+            "card_brand": brand[:40],
+            "card_last4": last4_s,
+            "enabled": True,
+        },
     )
+    if make_default or not PatientSavedCard.objects.filter(patient=patient, enabled=True, is_default=True).exists():
+        PatientSavedCard.objects.filter(patient=patient, enabled=True).exclude(pk=row.pk).update(is_default=False)
+        if not row.is_default:
+            row.is_default = True
+            row.save(update_fields=["is_default", "updated_at"])
+    sync_patient_default_card_cache(patient)
 
 
-def resolve_chargeable_card_for_patient(patient) -> tuple[str | None, str | None, str | None]:
+def resolve_chargeable_card_for_patient(
+    patient,
+    *,
+    saved_card_id: int | None = None,
+) -> tuple[str | None, str | None, str | None]:
     """
-    Verify the saved card still exists in Square before charging.
+    Verify a saved card still exists in Square before charging.
     Returns (card_id, customer_id, error_code).
-    Refreshes stale card ids on the patient when Square has a newer enabled card.
+    When saved_card_id is set, charge that card; otherwise use the default.
     """
+    from apps.clinic.models import PatientSavedCard
+
     if not square_configured():
         return None, None, "square_not_configured"
 
     cid = (getattr(patient, "square_customer_id", "") or "").strip()
-    card_id = (getattr(patient, "square_card_id", "") or "").strip()
     client = get_square_client()
 
     def _card_usable(card) -> bool:
@@ -502,33 +615,58 @@ def resolve_chargeable_card_for_patient(patient) -> tuple[str | None, str | None
             return False
         return True
 
-    if card_id:
+    preferred_square_id = ""
+    if saved_card_id is not None:
+        row = PatientSavedCard.objects.filter(pk=saved_card_id, patient=patient, enabled=True).first()
+        if not row:
+            return None, None, "no_saved_card"
+        preferred_square_id = (row.square_card_id or "").strip()
+    else:
+        default_row = (
+            PatientSavedCard.objects.filter(patient=patient, enabled=True, is_default=True)
+            .exclude(square_card_id="")
+            .first()
+        )
+        if default_row:
+            preferred_square_id = default_row.square_card_id
+        else:
+            preferred_square_id = (getattr(patient, "square_card_id", "") or "").strip()
+
+    if preferred_square_id:
         try:
-            res = client.cards.get(card_id=card_id)
+            res = client.cards.get(card_id=preferred_square_id)
             if res.errors:
                 logger.info(
                     "Square card lookup failed for patient %s card %s: %s",
                     patient.pk,
-                    card_id,
+                    preferred_square_id,
                     _square_api_error_message(res.errors),
                 )
             elif _card_usable(res.card):
-                _persist_patient_square_card(patient, res.card)
-                return patient.square_card_id, patient.square_customer_id, None
+                _persist_patient_square_card(patient, res.card, make_default=(saved_card_id is None))
+                return preferred_square_id, (patient.square_customer_id or cid or None), None
         except Exception as exc:
             logger.warning("Square card get failed for patient %s: %s", patient.pk, exc)
+
+    # Explicit card requested but not usable — do not silently charge another card
+    if saved_card_id is not None:
+        if (getattr(patient, "card_last4", "") or "").strip():
+            return None, None, "card_on_file_not_chargeable"
+        return None, None, "no_saved_card"
 
     if cid:
         try:
             pager = client.cards.list(customer_id=cid, include_disabled=False)
             for card in pager:
                 if _card_usable(card):
-                    _persist_patient_square_card(patient, card)
+                    _persist_patient_square_card(patient, card, make_default=True)
                     return patient.square_card_id, patient.square_customer_id, None
         except Exception as exc:
             logger.warning("Square card list failed for patient %s: %s", patient.pk, exc)
 
-    if (getattr(patient, "card_last4", "") or "").strip():
+    if (getattr(patient, "card_last4", "") or "").strip() or PatientSavedCard.objects.filter(
+        patient=patient, enabled=True
+    ).exists():
         return None, None, "card_on_file_not_chargeable"
     return None, None, "no_saved_card"
 
@@ -563,11 +701,23 @@ def ensure_square_customer(patient):
     return cust.id
 
 
-def save_card_from_source(patient, source_id: str, verification_token: str | None = None) -> None:
-    """Attach a card to the customer using a Web Payments token (source_id)."""
+def save_card_from_source(
+    patient,
+    source_id: str,
+    verification_token: str | None = None,
+    *,
+    set_as_default: bool = True,
+) -> dict:
+    """
+    Attach a card to the customer using a Web Payments token (source_id).
+    Adds a PatientSavedCard row (does not remove other cards).
+    Returns patient_saved_card_display(patient).
+    """
     import uuid
 
     from square.requests.card import CardParams
+
+    from apps.clinic.models import PatientSavedCard
 
     assert_square_save_card_ready()
     token = (source_id or "").strip()
@@ -594,16 +744,29 @@ def save_card_from_source(patient, source_id: str, verification_token: str | Non
     card = res.card
     if not card or not card.id:
         raise RuntimeError("Square did not return a card id.")
-    patient.square_card_id = card.id
-    patient.card_brand = (getattr(card, "card_brand", None) or "") or ""
+
     last4 = getattr(card, "last_4", None) or getattr(card, "last4", None)
-    patient.card_last4 = (str(last4) if last4 else "")[-4:] if last4 else ""
-    patient.save(
-        update_fields=[
-            "square_customer_id",
-            "square_card_id",
-            "card_brand",
-            "card_last4",
-            "updated_at",
-        ]
+    brand = (getattr(card, "card_brand", None) or "") or ""
+    last4_s = (str(last4) if last4 else "")[-4:] if last4 else ""
+
+    existing_defaults = PatientSavedCard.objects.filter(patient=patient, enabled=True, is_default=True).exists()
+    make_default = set_as_default or not existing_defaults
+
+    row, _created = PatientSavedCard.objects.update_or_create(
+        patient=patient,
+        square_card_id=card.id,
+        defaults={
+            "card_brand": brand[:40],
+            "card_last4": last4_s,
+            "enabled": True,
+        },
     )
+    if make_default:
+        PatientSavedCard.objects.filter(patient=patient, enabled=True).exclude(pk=row.pk).update(is_default=False)
+        row.is_default = True
+        row.save(update_fields=["is_default", "card_brand", "card_last4", "enabled", "updated_at"])
+    else:
+        row.save(update_fields=["card_brand", "card_last4", "enabled", "updated_at"])
+
+    sync_patient_default_card_cache(patient)
+    return patient_saved_card_display(patient)
