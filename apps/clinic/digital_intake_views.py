@@ -207,6 +207,8 @@ def staff_intake_forms_list(request):
     q = (request.query_params.get("q") or "").strip()
     form_type = (request.query_params.get("form_type") or "").strip()
     status_filter = (request.query_params.get("status") or "submitted").strip()
+    latest_raw = (request.query_params.get("latest_only") or "1").strip().lower()
+    latest_only = latest_raw not in ("0", "false", "no", "all")
     try:
         page = int(request.query_params.get("page") or 1)
     except (TypeError, ValueError):
@@ -226,12 +228,14 @@ def staff_intake_forms_list(request):
         status=status_filter,
         limit=page_size,
         offset=offset,
+        latest_only=latest_only,
     )
     return Response(
         {
             "count": total,
             "page": page,
             "page_size": page_size,
+            "latest_only": latest_only,
             "results": [serialize_submission(r) for r in rows],
             "form_types": [{"value": k, "label": v} for k, v in FORM_TYPE_LABELS.items()],
         }

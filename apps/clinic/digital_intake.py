@@ -493,10 +493,13 @@ def search_submissions(
     status: str = "submitted",
     limit: int = 50,
     offset: int = 0,
+    latest_only: bool = True,
 ):
     """
     Return (rows, total_count).
     ``limit`` / ``offset`` paginate; total_count is the full filtered set.
+    When ``latest_only`` is True (staff browser default), keep only the newest
+    submission per patient + form type so resubmits do not clutter the list.
     """
     qs = PatientIntakeSubmission.objects.select_related("patient").all()
     status = (status or "").strip()
@@ -517,7 +520,35 @@ def search_submissions(
         if phone_digits:
             name_q |= Q(patient__phone__icontains=phone_digits[-10:])
         qs = qs.filter(name_q)
-    qs = qs.order_by("-submitted_at", "-updated_at")
+    qs = qs.order_by("-submitted_at", "-updated_at", "-id")
+
+    if latest_only:
+        # Postgres: one newest row per patient + form type.
+        latest_ids = (
+            qs.order_by("patient_id", "form_type", "-submitted_at", "-updated_at", "-id")
+            .distinct("patient_id", "form_type")
+            .values_list("pk", flat=True)
+        )
+        id_list = list(latest_ids)
+        total = len(id_list)
+        page_size = max(1, min(int(limit or 50), 100))
+        start = max(0, int(offset or 0))
+        page_ids = id_list[start : start + page_size]
+        if not page_ids:
+            return [], total
+        by_id = {
+            row.pk: row
+            for row in PatientIntakeSubmission.objects.select_related("patient").filter(pk__in=page_ids)
+        }
+        # Preserve newest-first among the page (same order as id_list, which is not global date order).
+        # Re-sort page by submitted_at for a stable staff list.
+        rows = sorted(
+            (by_id[i] for i in page_ids if i in by_id),
+            key=lambda r: (r.submitted_at or r.updated_at, r.pk),
+            reverse=True,
+        )
+        return rows, total
+
     total = qs.count()
     page_size = max(1, min(int(limit or 50), 100))
     start = max(0, int(offset or 0))
