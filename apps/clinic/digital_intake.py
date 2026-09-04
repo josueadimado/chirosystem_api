@@ -486,7 +486,18 @@ def serialize_submission(sub: PatientIntakeSubmission) -> dict[str, Any]:
     }
 
 
-def search_submissions(*, q: str = "", form_type: str = "", status: str = "submitted", limit: int = 50):
+def search_submissions(
+    *,
+    q: str = "",
+    form_type: str = "",
+    status: str = "submitted",
+    limit: int = 50,
+    offset: int = 0,
+):
+    """
+    Return (rows, total_count).
+    ``limit`` / ``offset`` paginate; total_count is the full filtered set.
+    """
     qs = PatientIntakeSubmission.objects.select_related("patient").all()
     status = (status or "").strip()
     if status:
@@ -506,7 +517,12 @@ def search_submissions(*, q: str = "", form_type: str = "", status: str = "submi
         if phone_digits:
             name_q |= Q(patient__phone__icontains=phone_digits[-10:])
         qs = qs.filter(name_q)
-    return list(qs.order_by("-submitted_at", "-updated_at")[: max(1, min(limit, 100))])
+    qs = qs.order_by("-submitted_at", "-updated_at")
+    total = qs.count()
+    page_size = max(1, min(int(limit or 50), 100))
+    start = max(0, int(offset or 0))
+    rows = list(qs[start : start + page_size])
+    return rows, total
 
 
 def patient_submissions_summary(patient: Patient) -> list[dict[str, Any]]:

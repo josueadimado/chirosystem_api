@@ -208,12 +208,30 @@ def staff_intake_forms_list(request):
     form_type = (request.query_params.get("form_type") or "").strip()
     status_filter = (request.query_params.get("status") or "submitted").strip()
     try:
-        limit = int(request.query_params.get("limit") or 50)
+        page = int(request.query_params.get("page") or 1)
     except (TypeError, ValueError):
-        limit = 50
-    rows = search_submissions(q=q, form_type=form_type, status=status_filter, limit=limit)
+        page = 1
+    try:
+        # Prefer page_size; keep limit as a back-compat alias.
+        raw_size = request.query_params.get("page_size") or request.query_params.get("limit") or 30
+        page_size = int(raw_size)
+    except (TypeError, ValueError):
+        page_size = 30
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
+    offset = (page - 1) * page_size
+    rows, total = search_submissions(
+        q=q,
+        form_type=form_type,
+        status=status_filter,
+        limit=page_size,
+        offset=offset,
+    )
     return Response(
         {
+            "count": total,
+            "page": page,
+            "page_size": page_size,
             "results": [serialize_submission(r) for r in rows],
             "form_types": [{"value": k, "label": v} for k, v in FORM_TYPE_LABELS.items()],
         }
