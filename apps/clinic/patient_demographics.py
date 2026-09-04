@@ -6,11 +6,11 @@ from datetime import timedelta
 
 from decimal import Decimal
 
-from django.db.models import Count, Exists, F, Min, OuterRef, Q, Subquery, Sum, Value
-from django.db.models.functions import Coalesce, TruncDate
+from django.db.models import Count, DecimalField, Exists, ExpressionWrapper, F, Min, OuterRef, Q, Subquery, Sum, Value
+from django.db.models.functions import Coalesce, Greatest, TruncDate
 from django.utils import timezone
 
-from .models import Appointment, Invoice, Patient, Visit
+from .models import Appointment, Invoice, Patient, Payment, Visit
 from .patient_phone import duplicate_patient_message, resolve_patient_profile_duplicate
 
 _UNPAID_INVOICE_STATUSES = (Invoice.Status.ISSUED, Invoice.Status.OVERDUE)
@@ -73,10 +73,11 @@ def annotate_patient_list_stats(qs):
 
 def _unpaid_invoice_total_subquery(*, kind: str | None):
     """
-    Per-patient sum of unpaid invoice totals.
+    Per-patient sum of amounts still owed on open invoices (total minus cash/card paid).
 
     Uses a subquery so totals stay correct when combined with appointment/visit
     counts on the same queryset (plain Sum() on invoice__ would multiply rows).
+    Fully covered invoices that are still marked open contribute $0.
     """
     filters = {
         "patient_id": OuterRef("pk"),
@@ -84,10 +85,28 @@ def _unpaid_invoice_total_subquery(*, kind: str | None):
     }
     if kind is not None:
         filters["kind"] = kind
+    paid_sub = (
+        Payment.objects.filter(
+            invoice_id=OuterRef("pk"),
+            status=Payment.Status.SUCCESSFUL,
+        )
+        .exclude(payment_reference__startswith="patient_credit:")
+        .values("invoice_id")
+        .annotate(s=Sum("amount"))
+        .values("s")[:1]
+    )
+    money = DecimalField(max_digits=12, decimal_places=2)
     return (
         Invoice.objects.filter(**filters)
+        .annotate(paid=Coalesce(Subquery(paid_sub), Value(Decimal("0.00"))))
+        .annotate(
+            due=Greatest(
+                ExpressionWrapper(F("total_amount") - F("paid"), output_field=money),
+                Value(Decimal("0.00")),
+            )
+        )
         .values("patient_id")
-        .annotate(_sum=Sum("total_amount"))
+        .annotate(_sum=Sum("due"))
         .values("_sum")[:1]
     )
 

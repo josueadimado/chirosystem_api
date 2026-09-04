@@ -79,24 +79,30 @@ def _payments_collected_between(start: datetime, end: datetime) -> Decimal:
 
 
 def _invoice_outstanding(inv: Invoice) -> Decimal:
-    paid = inv.payments.filter(status=Payment.Status.SUCCESSFUL).aggregate(s=Sum("amount"))["s"]
+    paid = (
+        inv.payments.filter(status=Payment.Status.SUCCESSFUL)
+        .exclude(payment_reference__startswith="patient_credit:")
+        .aggregate(s=Sum("amount"))["s"]
+    )
     paid = _quantize_money(paid)
     due = _quantize_money(inv.total_amount) - paid
     return max(due, Decimal("0.00"))
 
 
 def _global_outstanding_balance() -> Decimal:
+    """Sum of amounts still owed on open invoices (excludes patient-credit ledger rows)."""
     paid_sub = (
         Payment.objects.filter(
             invoice_id=OuterRef("pk"),
             status=Payment.Status.SUCCESSFUL,
         )
+        .exclude(payment_reference__startswith="patient_credit:")
         .values("invoice_id")
         .annotate(s=Sum("amount"))
         .values("s")[:1]
     )
     rows = (
-        Invoice.objects.filter(status__in=(Invoice.Status.ISSUED, Invoice.Status.OVERDUE))
+        Invoice.objects.filter(status__in=(Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT))
         .annotate(paid=Coalesce(Subquery(paid_sub), Decimal("0.00")))
         .values_list("total_amount", "paid")
     )
@@ -201,10 +207,31 @@ def _today_snapshot(today: date, cur_start: datetime, cur_end: datetime) -> dict
         "completed": all_today.filter(status=Appointment.Status.COMPLETED).count(),
         "no_shows": all_today.filter(status=Appointment.Status.NO_SHOW).count(),
         "revenue_today": _money_str(revenue_today),
-        "unpaid_invoices": Invoice.objects.filter(
-            status__in=(Invoice.Status.ISSUED, Invoice.Status.OVERDUE)
-        ).count(),
+        "unpaid_invoices": _count_open_invoices_with_balance(),
     }
+
+
+def _count_open_invoices_with_balance() -> int:
+    """Open invoices that still have money due (ignores fully covered cash/card)."""
+    paid_sub = (
+        Payment.objects.filter(
+            invoice_id=OuterRef("pk"),
+            status=Payment.Status.SUCCESSFUL,
+        )
+        .exclude(payment_reference__startswith="patient_credit:")
+        .values("invoice_id")
+        .annotate(s=Sum("amount"))
+        .values("s")[:1]
+    )
+    n = 0
+    for amount, paid in (
+        Invoice.objects.filter(status__in=(Invoice.Status.ISSUED, Invoice.Status.OVERDUE, Invoice.Status.DRAFT))
+        .annotate(paid=Coalesce(Subquery(paid_sub), Decimal("0.00")))
+        .values_list("total_amount", "paid")
+    ):
+        if _quantize_money(amount) - _quantize_money(paid) > 0:
+            n += 1
+    return n
 
 
 def _provider_stats_month(start: datetime, end: datetime) -> list[dict]:

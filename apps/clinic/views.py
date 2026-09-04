@@ -4770,6 +4770,51 @@ class AdminViewSet(viewsets.ViewSet):
         """Mark invoice paid when staff verified payment in the Square app (sync could not match)."""
         return _confirm_invoice_paid_api_response(request)
 
+    @action(detail=False, methods=["get"], url_path="payment_reconciliation")
+    def payment_reconciliation(self, request):
+        """List open invoices that need cash/Square reconciliation (owner/staff)."""
+        denied = self._admin_staff_only(request)
+        if denied:
+            return denied
+        from apps.clinic.payment_reconciliation import build_payment_reconciliation_payload
+
+        try:
+            page = int(request.query_params.get("page") or 1)
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            page_size = int(request.query_params.get("page_size") or 30)
+        except (TypeError, ValueError):
+            page_size = 30
+        q = (request.query_params.get("q") or "").strip()
+        return Response(build_payment_reconciliation_payload(q=q, page=page, page_size=page_size))
+
+    @action(detail=False, methods=["post"], url_path="close_zero_due_invoice")
+    def close_zero_due_invoice(self, request):
+        """
+        Mark an open invoice paid when local cash/card payments already cover the balance.
+        Body: { invoice_id } or { all: true } to batch-fix fully covered invoices.
+        """
+        denied = self._admin_staff_only(request)
+        if denied:
+            return denied
+        from apps.clinic.payment_reconciliation import (
+            close_all_zero_due_open_invoices,
+            close_invoice_if_zero_due,
+        )
+
+        if str(request.data.get("all") or "").lower() in ("1", "true", "yes"):
+            return Response(close_all_zero_due_open_invoices())
+        invoice_id, err = _parse_invoice_id_from_body(request)
+        if err:
+            return err
+        inv = Invoice.objects.filter(pk=invoice_id).first()
+        if not inv:
+            return Response({"detail": "Invoice not found."}, status=status.HTTP_404_NOT_FOUND)
+        out = close_invoice_if_zero_due(inv)
+        code = status.HTTP_200_OK if out.get("ok") else status.HTTP_400_BAD_REQUEST
+        return Response(out, status=code)
+
     @action(detail=False, methods=["get"])
     def patients(self, request):
         """List all patients with directory stats and open invoice balance for admin."""
