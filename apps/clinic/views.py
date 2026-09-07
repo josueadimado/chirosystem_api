@@ -553,7 +553,7 @@ def _insurance_claim_response(request, *, provider=None):
 
 
 def _email_insurance_claim_response(request, *, provider=None):
-    """POST email CMS-1500 claim summary to a staff-entered address."""
+    """POST email CMS-1500 claim (PDF attachment) to a staff-entered address."""
     from apps.clinic.insurance_claim import build_cms1500_claim
     from apps.clinic.insurance_claim_email import send_insurance_claim_email
 
@@ -586,7 +586,13 @@ def _email_insurance_claim_response(request, *, provider=None):
             {"detail": "Could not send the insurance claim email. Check email settings."},
             status=status.HTTP_502_BAD_GATEWAY,
         )
-    return Response({"detail": f"Insurance claim emailed to {recipient}.", "recipient": recipient})
+    return Response(
+        {
+            "detail": f"Insurance claim PDF emailed to {recipient}.",
+            "recipient": recipient,
+            "attached_pdf": True,
+        }
+    )
 
 
 def _printable_invoice_line(rs, pos_default):
@@ -4740,7 +4746,7 @@ class AdminViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"], url_path="email-insurance-claim")
     def email_insurance_claim(self, request):
-        """Email CMS-1500 claim summary to a staff-entered insurance email."""
+        """Email CMS-1500 claim PDF to a staff-entered insurance email."""
         return _email_insurance_claim_response(request)
 
     @action(detail=False, methods=["get"], url_path="email_status")
@@ -5699,7 +5705,7 @@ class DoctorViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"], url_path="email-insurance-claim")
     def email_insurance_claim(self, request):
-        """Email CMS-1500 claim summary to a staff-entered insurance email."""
+        """Email CMS-1500 claim PDF to a staff-entered insurance email."""
         provider = self._get_provider(request)
         if not provider:
             return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
