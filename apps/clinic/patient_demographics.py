@@ -236,6 +236,7 @@ def patient_demographics_summary(patient: Patient) -> dict:
         "marital_status": (patient.marital_status or "").strip(),
         "age": _patient_age_years(patient.date_of_birth),
         "payment_profile": (patient.payment_profile or "").strip(),
+        "iris_tag": bool(patient.iris_tag),
         "date_established": str(effective) if effective else None,
         "date_established_override": str(manual) if manual else None,
         "first_appointment_date": str(first_date) if first_date else None,
@@ -332,6 +333,15 @@ def apply_patient_intake_validated_data(
         profile = (data.get("payment_profile") or "").strip().lower()
         if profile in ("", "insurance", "cash"):
             patient.payment_profile = profile
+
+    if "iris_tag" in data:
+        want = bool(data.get("iris_tag"))
+        if want and not patient.iris_tag:
+            patient.iris_tag = True
+            patient.iris_tagged_at = timezone.now()
+        elif not want and patient.iris_tag:
+            patient.iris_tag = False
+            # Keep iris_tagged_at history for past referral analytics.
 
     if allow_communication_prefs:
         from apps.clinic.patient_communication_prefs import (

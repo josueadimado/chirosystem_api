@@ -120,6 +120,7 @@ def serialize_doctor_dashboard_appointments(appt_list: list[Appointment]) -> lis
                 )
             },
             "patient_payment_profile": (a.patient.payment_profile or "").strip(),
+            "patient_iris_tag": bool(getattr(a.patient, "iris_tag", False)),
             "patient_balance_due": balance_by_patient.get(a.patient_id, "0.00"),
         }
         collectible = open_invoice_for_appointment_payment(a)

@@ -182,6 +182,17 @@ class Patient(TimeStampedModel):
         default="",
         help_text="Shown on the schedule: insurance (eye icon) or cash. Set by staff during a visit.",
     )
+    # Independent of cash/insurance: Iris nutritionist referral / Iris patient tag (orange on calendar).
+    iris_tag = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="True when this patient is referred by Iris or is an Iris (nutrition) patient. Can combine with cash or insurance.",
+    )
+    iris_tagged_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When iris_tag was last turned on (for analytics).",
+    )
 
     def __str__(self) -> str:
         return f"{self.first_name} {self.last_name}"

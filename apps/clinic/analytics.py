@@ -355,6 +355,51 @@ def parse_analytics_months(raw: str | None, *, default: int = 6) -> int:
     return n if n in (3, 6, 12) else default
 
 
+def _quarter_date_bounds(today: date) -> tuple[date, date]:
+    """Inclusive calendar-quarter [start, end] dates for clinic local today."""
+    q0 = (today.month - 1) // 3
+    start_month = q0 * 3 + 1
+    start = date(today.year, start_month, 1)
+    end_month = start_month + 2
+    end_day = calendar.monthrange(today.year, end_month)[1]
+    end = date(today.year, end_month, end_day)
+    return start, end
+
+
+def _unique_iris_patients_with_appt(start_d: date, end_d: date) -> int:
+    """Unique patients currently tagged IRIS who had ≥1 appointment in the date range."""
+    return (
+        Appointment.objects.filter(
+            appointment_date__gte=start_d,
+            appointment_date__lte=end_d,
+            patient__iris_tag=True,
+        )
+        .values("patient_id")
+        .distinct()
+        .count()
+    )
+
+
+def _iris_clients_summary(today: date) -> dict:
+    week_start = today - timedelta(days=today.weekday())
+    week_end = week_start + timedelta(days=6)
+    month_start = date(today.year, today.month, 1)
+    month_end = date(today.year, today.month, calendar.monthrange(today.year, today.month)[1])
+    quarter_start, quarter_end = _quarter_date_bounds(today)
+    return {
+        "tagged_total": Patient.objects.filter(iris_tag=True).count(),
+        "unique_this_week": _unique_iris_patients_with_appt(week_start, week_end),
+        "unique_this_month": _unique_iris_patients_with_appt(month_start, month_end),
+        "unique_this_quarter": _unique_iris_patients_with_appt(quarter_start, quarter_end),
+        "week_start": week_start.isoformat(),
+        "week_end": week_end.isoformat(),
+        "month_start": month_start.isoformat(),
+        "month_end": month_end.isoformat(),
+        "quarter_start": quarter_start.isoformat(),
+        "quarter_end": quarter_end.isoformat(),
+    }
+
+
 def build_admin_analytics_payload(*, months: int = 6) -> dict:
     tz = _clinic_tz()
     now = timezone.now().astimezone(tz)
@@ -470,6 +515,7 @@ def build_admin_analytics_payload(*, months: int = 6) -> dict:
         "provider_stats": _provider_stats_month(cur_start, cur_end),
         "at_risk_patients": _at_risk_patients(today),
         "client_health": client_health,
+        "iris_clients": _iris_clients_summary(today),
         "voice_summary": voice_summary,
         "generated_at": now.isoformat(),
     }

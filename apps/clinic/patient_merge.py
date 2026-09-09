@@ -44,6 +44,8 @@ _STRING_FILL_FIELDS = (
     "insurance_relationship",
     "insured_name",
     "payment_profile",
+    "iris_tag",
+    "iris_tagged_at",
 )
 
 
@@ -63,6 +65,7 @@ def _patient_summary(p: Patient) -> dict[str, Any]:
         "card_brand": p.card_brand or "",
         "card_last4": p.card_last4 or "",
         "payment_profile": p.payment_profile or "",
+        "iris_tag": bool(p.iris_tag),
     }
 
 

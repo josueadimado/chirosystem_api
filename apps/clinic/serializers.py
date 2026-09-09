@@ -61,6 +61,8 @@ class PatientSerializer(serializers.ModelSerializer):
             "notify_bills",
             "online_chiro_intake_waived",
             "payment_profile",
+            "iris_tag",
+            "iris_tagged_at",
             "credit_balance",
             "created_at",
             "updated_at",
@@ -132,6 +134,7 @@ class PatientListSerializer(serializers.ModelSerializer):
             "email",
             "date_of_birth",
             "payment_profile",
+            "iris_tag",
             "no_show_count",
             "visit_count",
             "last_visit",
@@ -539,6 +542,7 @@ class AppointmentListSerializer(serializers.ModelSerializer):
     reason_for_visit = serializers.SerializerMethodField()
     patient_date_of_birth = serializers.SerializerMethodField()
     patient_payment_profile = serializers.SerializerMethodField()
+    patient_iris_tag = serializers.SerializerMethodField()
     invoice_kind = serializers.SerializerMethodField()
     display_status = serializers.SerializerMethodField()
     auto_no_show_processed_at = serializers.DateTimeField(read_only=True)
@@ -557,6 +561,7 @@ class AppointmentListSerializer(serializers.ModelSerializer):
             "patient_name",
             "patient_date_of_birth",
             "patient_payment_profile",
+            "patient_iris_tag",
             "provider",
             "provider_name",
             "booked_service",
@@ -607,6 +612,9 @@ class AppointmentListSerializer(serializers.ModelSerializer):
 
     def get_patient_payment_profile(self, obj):
         return (obj.patient.payment_profile or "").strip()
+
+    def get_patient_iris_tag(self, obj):
+        return bool(getattr(obj.patient, "iris_tag", False))
 
     def get_invoice_kind(self, obj):
         try:
@@ -1120,6 +1128,7 @@ class PatientIntakeUpdateSerializer(serializers.Serializer):
         required=False,
         allow_blank=True,
     )
+    iris_tag = serializers.BooleanField(required=False)
 
 
 class ClinicProfileUpdateSerializer(serializers.Serializer):
