@@ -84,7 +84,7 @@ def patient_manage_appointment_url() -> str:
         base = ""
     if not base:
         base = "https://book.reliefchiropractic.net"
-    return f"{base}/"
+    return f"{base}/book?manage=1"
 
 
 def patient_cancel_confirmation_sms_body(

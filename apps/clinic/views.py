@@ -5717,6 +5717,58 @@ class DoctorViewSet(viewsets.ViewSet):
             return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
         return _email_insurance_claim_response(request, provider=provider)
 
+    @action(detail=False, methods=["get"], url_path="billing_invoices")
+    def billing_invoices(self, request):
+        """
+        Visit invoices for this doctor's patients (CMS-1500 claims browser).
+        Same list shape as admin billing_invoices, scoped to the logged-in provider.
+        """
+        provider = self._get_provider(request)
+        if not provider:
+            return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)
+
+        qs = (
+            _defer_patient_card_fields(
+                Invoice.objects.filter(appointment__provider=provider)
+                .select_related("patient", "appointment", "visit")
+                .order_by("-appointment__appointment_date", "-id"),
+                patient_prefix="patient",
+            )
+        )
+        kind = (request.query_params.get("kind") or "").strip()
+        if kind:
+            qs = qs.filter(kind=kind)
+        else:
+            qs = qs.filter(kind=Invoice.Kind.VISIT)
+
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            search_q = (
+                Q(patient__first_name__icontains=search)
+                | Q(patient__last_name__icontains=search)
+                | Q(invoice_number__icontains=search)
+            )
+            if search.isdigit():
+                search_q |= Q(patient_id=int(search))
+            qs = qs.filter(search_q)
+
+        paginator = StandardPageNumberPagination()
+        page = paginator.paginate_queryset(qs, request)
+        rows = [
+            {
+                "id": inv.id,
+                "invoice_number": inv.invoice_number,
+                "patient_name": f"{inv.patient.first_name} {inv.patient.last_name}",
+                "appointment_date": str(inv.appointment.appointment_date) if inv.appointment_id else None,
+                "status": inv.status,
+                "kind": inv.kind,
+                "total_amount": str(inv.total_amount),
+                "visit_id": inv.visit_id,
+            }
+            for inv in page
+        ]
+        return paginator.get_paginated_response(rows)
+
     @action(detail=False, methods=["get"], url_path="invoice_search")
     def invoice_search(self, request):
         """Search invoices by patient name, invoice number, or date for bill reprinting."""
