@@ -450,7 +450,7 @@ def _invoice_for_bill_email(invoice_id):
 
 
 def _email_patient_bill_response(request, *, provider=None):
-    """POST body: { invoice_id }. Emails paid bill to patient email on file."""
+    """POST body: { invoice_id }. Emails the bill even when a balance is still due."""
     from apps.clinic.patient_bill_email import PatientBillEmailError, send_patient_bill_email
 
     raw = request.data.get("invoice_id")
@@ -473,7 +473,8 @@ def _email_patient_bill_response(request, *, provider=None):
             )
 
     try:
-        bill = _invoice_bill_dict(inv, preview=False)
+        still_owed = inv.status != Invoice.Status.PAID
+        bill = _invoice_bill_dict(inv, preview=still_owed)
         recipient = send_patient_bill_email(inv, bill)
     except PatientBillEmailError as exc:
         return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
@@ -4739,7 +4740,7 @@ class AdminViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"], url_path="email-patient-bill")
     def email_patient_bill(self, request):
-        """Email paid patient bill to the patient's email (owner/staff/doctor)."""
+        """Email the patient bill even when a balance is still due (owner/staff/doctor)."""
         return _email_patient_bill_response(request)
 
     @action(detail=False, methods=["get"], url_path="insurance_claim")
@@ -5695,7 +5696,7 @@ class DoctorViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"], url_path="email-patient-bill")
     def email_patient_bill(self, request):
-        """Email paid patient bill to the patient's email on file."""
+        """Email the patient bill even when a balance is still due."""
         provider = self._get_provider(request)
         if not provider:
             return Response({"detail": "No provider linked."}, status=status.HTTP_403_FORBIDDEN)

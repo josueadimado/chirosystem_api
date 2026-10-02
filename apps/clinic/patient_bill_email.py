@@ -1,4 +1,7 @@
-"""Email paid patient bills to patients (HTML statement matching print data)."""
+"""Email patient bills to patients (HTML statement matching print data).
+
+A bill can be emailed while money is still owed. Paid invoices are worded as a receipt.
+"""
 
 from __future__ import annotations
 
@@ -115,6 +118,13 @@ def _money_label(value: str | None) -> str:
     return v if v.startswith("$") else f"${v}"
 
 
+def _bill_still_owed(bill: dict) -> bool:
+    """True when this email is a bill, not a paid receipt."""
+    if bill.get("is_preview"):
+        return True
+    return (bill.get("status") or "") != "paid"
+
+
 def build_patient_bill_email_html(bill: dict) -> str:
     """Email-safe HTML patient bill (table layout, inline styles)."""
     clinic = html.escape(bill.get("clinic_name") or "Relief Chiropractic")
@@ -181,6 +191,14 @@ def build_patient_bill_email_html(bill: dict) -> str:
         )
     )
 
+    still_owed = _bill_still_owed(bill)
+    intro = (
+        "Thank you for your visit. Below is your bill. A balance is still due."
+        if still_owed
+        else "Thank you for your visit. Attached below is your paid statement for your records."
+    )
+    eyebrow = "Patient bill — balance due" if still_owed else "Patient bill / receipt"
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"/><title>Patient Bill {inv_no}</title></head>
@@ -189,7 +207,7 @@ def build_patient_bill_email_html(bill: dict) -> str:
     <tr><td align="center">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">
         <tr><td style="background:#0f766e;padding:20px 24px;color:#ffffff;">
-          <p style="margin:0;font-size:12px;letter-spacing:0.08em;text-transform:uppercase;opacity:0.9;">Patient bill / receipt</p>
+          <p style="margin:0;font-size:12px;letter-spacing:0.08em;text-transform:uppercase;opacity:0.9;">{eyebrow}</p>
           <h1 style="margin:8px 0 0;font-size:22px;font-weight:700;">{clinic}</h1>
           <p style="margin:10px 0 0;font-size:13px;line-height:1.45;opacity:0.95;">
             {clinic_address_lines or "—"}
@@ -200,7 +218,7 @@ def build_patient_bill_email_html(bill: dict) -> str:
         <tr><td style="padding:24px;">
           <p style="margin:0 0 16px;font-size:14px;line-height:1.5;color:#334155;">
             Hello {patient},<br/><br/>
-            Thank you for your visit. Attached below is your paid statement for your records.
+            {intro}
           </p>
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px;font-size:13px;">
             <tr><td style="padding:4px 0;color:#64748b;width:180px;">Invoice</td><td style="padding:4px 0;font-weight:600;">{inv_no}</td></tr>
@@ -246,8 +264,10 @@ def build_patient_bill_plain_text(bill: dict) -> str:
     clinic = bill.get("clinic_name") or "Relief Chiropractic"
     office_employer_id = (bill.get("office_employer_id") or bill.get("employer_tax_id") or "").strip()
     provider_npi = (bill.get("provider_npi") or bill.get("provider_billing_id") or "").strip()
+    still_owed = _bill_still_owed(bill)
+    heading = "Patient bill — balance due" if still_owed else "Patient bill / receipt"
     lines = [
-        f"{clinic} — Patient bill / receipt",
+        f"{clinic} — {heading}",
         f"{(bill.get('address_line1') or '').strip()} {(bill.get('city_state_zip') or '').strip()}".strip(),
         f"Phone: {(bill.get('phone') or '').strip()}",
         f"Invoice: {bill.get('invoice_number') or ''}",
@@ -270,20 +290,31 @@ def build_patient_bill_plain_text(bill: dict) -> str:
         f"Patient payments (clinic charge): {_money_label(bill.get('patient_charge_total') or bill.get('total_amount'))}"
     )
     lines.append(f"Payments received: {_money_label(bill.get('payments_received_total'))}")
+    lines.append(
+        f"Remaining due: {_money_label(str(bill.get('remaining_client_responsibility_total') or ''))}"
+    )
+    if still_owed:
+        lines.append("")
+        lines.append("A balance is still due on this visit.")
     return "\n".join(lines)
 
 
 def send_patient_bill_email(inv, bill: dict) -> str:
     """
-    Email the paid patient bill to the patient's email on file.
+    Email the patient bill to the patient's email on file.
+    Issued, overdue, and paid invoices can be sent. Paid invoices are worded as a receipt.
     ``bill`` must be the same payload as print/PDF (_invoice_bill_dict).
     Returns the recipient address on success.
     """
     from apps.clinic.models import Invoice
 
-    if inv.status != Invoice.Status.PAID:
+    if inv.status not in (
+        Invoice.Status.ISSUED,
+        Invoice.Status.OVERDUE,
+        Invoice.Status.PAID,
+    ):
         raise PatientBillEmailError(
-            "Patient bill can only be emailed after the invoice is paid."
+            "This invoice cannot be emailed in its current state."
         )
 
     from apps.clinic.patient_communication_prefs import patient_wants_bill_email
@@ -317,7 +348,8 @@ def send_patient_bill_email(inv, bill: dict) -> str:
     html_body = build_patient_bill_email_html(bill)
     text_body = build_patient_bill_plain_text(bill)
     clinic_name = bill.get("clinic_name") or "Relief Chiropractic"
-    subject = f"Your receipt from {clinic_name} — {bill.get('invoice_number', '')}"
+    kind = "bill" if _bill_still_owed(bill) else "receipt"
+    subject = f"Your {kind} from {clinic_name} — {bill.get('invoice_number', '')}"
 
     from_email = (
         getattr(settings, "PATIENT_BILL_FROM_EMAIL", None)
