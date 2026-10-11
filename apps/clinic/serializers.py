@@ -135,6 +135,7 @@ class PatientListSerializer(serializers.ModelSerializer):
             "date_of_birth",
             "payment_profile",
             "iris_tag",
+            "credit_balance",
             "no_show_count",
             "visit_count",
             "last_visit",
