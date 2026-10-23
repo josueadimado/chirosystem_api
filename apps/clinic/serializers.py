@@ -68,6 +68,20 @@ class PatientSerializer(serializers.ModelSerializer):
             "updated_at",
         )
 
+    def create(self, validated_data):
+        """New charts start with messages on: text for booking and reminders, email for receipts."""
+        from .patient_communication_prefs import (
+            DEFAULT_NOTIFY_BILLS,
+            DEFAULT_NOTIFY_BOOKING,
+            DEFAULT_NOTIFY_REMINDERS,
+        )
+
+        validated_data.setdefault("notify_booking", DEFAULT_NOTIFY_BOOKING)
+        validated_data.setdefault("notify_reminders", DEFAULT_NOTIFY_REMINDERS)
+        validated_data.setdefault("notify_bills", DEFAULT_NOTIFY_BILLS)
+        validated_data.setdefault("sms_consent", True)
+        return super().create(validated_data)
+
     def validate_phone(self, value):
         valid, result = validate_phone(value or "")
         if not valid:

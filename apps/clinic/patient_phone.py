@@ -162,10 +162,20 @@ def get_or_create_patient_for_public_booking(
                 p.save(update_fields=["email", "updated_at"])
             return p
 
+    from .patient_communication_prefs import (
+        DEFAULT_NOTIFY_BILLS,
+        DEFAULT_NOTIFY_BOOKING,
+        DEFAULT_NOTIFY_REMINDERS,
+    )
+
     return Patient.objects.create(
         phone=phone_normalized,
         first_name=fn,
         last_name=ln,
         email=em,
         date_of_birth=date_of_birth,
+        sms_consent=True,
+        notify_booking=DEFAULT_NOTIFY_BOOKING,
+        notify_reminders=DEFAULT_NOTIFY_REMINDERS,
+        notify_bills=DEFAULT_NOTIFY_BILLS,
     )
