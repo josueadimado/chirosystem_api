@@ -41,6 +41,19 @@ class SquareChargeErrorMessageTests(SimpleTestCase):
     def test_square_card_declined_code(self):
         msg = charge_saved_card_error_message("Authorization error: card_declined (CARD_DECLINED)")
         self.assertIn("declined", msg.lower())
+        self.assertIn("not a software problem", msg.lower())
+
+    def test_square_generic_decline_quoted(self):
+        """Live Square / tracker shape: Authorization error: 'GENERIC_DECLINE'."""
+        msg = charge_saved_card_error_message("Authorization error: 'GENERIC_DECLINE'")
+        self.assertIn("declined", msg.lower())
+        self.assertIn("bank", msg.lower())
+        self.assertNotIn("GENERIC_DECLINE", msg)
+
+    def test_square_generic_decline_bare(self):
+        msg = charge_saved_card_error_message("GENERIC_DECLINE")
+        self.assertIn("declined", msg.lower())
+        self.assertNotIn("GENERIC_DECLINE", msg)
 
     def test_technical_headers_never_shown(self):
         raw = "headers: {'date': 'Wed', 'square-version': '2026-05-20', 'cf-ray': 'abc'}"

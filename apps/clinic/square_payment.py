@@ -770,10 +770,20 @@ def record_local_cash_payment_in_square(payment_id: int) -> dict:
         return {"ok": False, "skipped": False, "error": format_square_exception(exc), "payment_id": None}
 
 
+_CARD_BANK_DECLINED_MESSAGE = (
+    "The patient's bank declined this card — this is not a software problem. "
+    "Ask for another card, take cash, or use Square Terminal. "
+    "If it keeps happening, the patient should call their bank."
+)
+
 _SQUARE_CHARGE_CODE_MESSAGES: dict[str, str] = {
-    "CARD_DECLINED": "The card was declined by the bank. Use another card, cash, or Square Terminal.",
-    "GENERIC_DECLINE": "The card was declined. Use another card, cash, or Square Terminal.",
-    "CARD_EXPIRED": "This card has expired. Re-save a current card on the patient chart.",
+    "CARD_DECLINED": _CARD_BANK_DECLINED_MESSAGE,
+    "GENERIC_DECLINE": _CARD_BANK_DECLINED_MESSAGE,
+    "INSUFFICIENT_FUNDS": (
+        "The bank declined this card (insufficient funds). "
+        "Ask for another card, take cash, or use Square Terminal."
+    ),
+    "CARD_EXPIRED": "This card has expired. Re-save a current card on the patient chart, then try again.",
     "CVV_FAILURE": "Square could not verify this saved card. Re-save the card on the patient chart.",
     "INVALID_CARD": "This saved card is no longer valid in Square. Re-save the card on the patient chart.",
     "INVALID_CARD_DATA": "This saved card is no longer valid in Square. Re-save the card on the patient chart.",
@@ -791,15 +801,30 @@ _SQUARE_CHARGE_CODE_MESSAGES: dict[str, str] = {
 
 
 def _extract_square_error_code(raw: str) -> str | None:
-    """Pull a Square error code from 'detail (CODE)' or a bare code string."""
+    """Pull a Square error code from common SDK / log string shapes."""
     text = (raw or "").strip()
     if not text:
         return None
+    # detail (CODE)
     m = re.search(r"\(([A-Z0-9_]+)\)\s*$", text)
     if m:
         return m.group(1)
+    # Bare CODE
     if re.fullmatch(r"[A-Z0-9_]+", text):
         return text
+    # Authorization error: 'GENERIC_DECLINE'  or  ...: "CARD_DECLINED"
+    m = re.search(r"['\"]([A-Z][A-Z0-9_]+)['\"]", text)
+    if m:
+        return m.group(1)
+    # Authorization error: GENERIC_DECLINE
+    m = re.search(r":\s*([A-Z][A-Z0-9_]+)\s*$", text)
+    if m:
+        return m.group(1)
+    # Known code anywhere in the string (longest first to avoid partials)
+    upper = text.upper()
+    for code in sorted(_SQUARE_CHARGE_CODE_MESSAGES.keys(), key=len, reverse=True):
+        if code in upper:
+            return code
     return None
 
 
@@ -838,8 +863,15 @@ def charge_saved_card_error_message(error_code: str | None) -> str:
     if square_code and square_code in _SQUARE_CHARGE_CODE_MESSAGES:
         return _SQUARE_CHARGE_CODE_MESSAGES[square_code]
     if square_code:
-        return f"Square could not charge the saved card ({square_code.replace('_', ' ').lower()}). Try cash or Terminal."
+        return (
+            f"Square could not charge the saved card ({square_code.replace('_', ' ').lower()}). "
+            "Try another card, cash, or Terminal."
+        )
     if code:
+        # Last resort: never show opaque Square jargon alone if we can soften it
+        lower = code.lower()
+        if "declin" in lower or "authorization error" in lower:
+            return _CARD_BANK_DECLINED_MESSAGE
         return code
     return "Could not charge the saved card. Try Square Terminal or the desk pay screen."
 
