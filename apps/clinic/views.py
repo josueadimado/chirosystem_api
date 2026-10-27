@@ -21,7 +21,7 @@ from django.utils import timezone
 from rest_framework import mixins, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
-from rest_framework.parsers import FormParser, MultiPartParser
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 
 from .models import (
@@ -1027,9 +1027,53 @@ def _serialize_patient_document(doc: "PatientDocument", request, *, files_base: 
     }
 
 
+def _patient_document_from_request(request):
+    """
+    Build an uploaded file from multipart OR JSON (base64).
+
+    Production browsers call the API cross-origin; some proxies drop multipart
+    bodies while JSON posts work. Prefer request.FILES, then file_base64 JSON.
+    """
+    import base64
+    import re
+
+    from django.core.files.base import ContentFile
+
+    uploaded = request.FILES.get("file")
+    if uploaded:
+        return uploaded, uploaded.name
+
+    raw_b64 = request.data.get("file_base64")
+    if not raw_b64 or not isinstance(raw_b64, str):
+        return None, None
+
+    filename = (
+        (request.data.get("filename") or request.data.get("original_filename") or "upload.bin")
+        .strip()
+        or "upload.bin"
+    )
+    # Allow data URLs: data:image/png;base64,AAAA...
+    b64 = raw_b64.strip()
+    if b64.startswith("data:") and "," in b64:
+        b64 = b64.split(",", 1)[1]
+    b64 = re.sub(r"\s+", "", b64)
+    try:
+        raw = base64.b64decode(b64, validate=False)
+    except Exception:
+        return None, None
+    max_bytes = 20 * 1024 * 1024
+    if len(raw) > max_bytes:
+        raise ValueError(f"File must be under {max_bytes // (1024 * 1024)} MB.")
+    if not raw:
+        return None, None
+    # Keep filename safe for storage
+    safe_name = Path(filename).name[:200] or "upload.bin"
+    return ContentFile(raw, name=safe_name), safe_name
+
+
 def _patient_document_upload_response(request, *, files_base: str) -> Response:
     """Shared upload handler for admin and doctor portals."""
-    # Prefer query string (reliable across proxies); FormData field is also accepted.
+    # Prefer query string (reliable across proxies); FormData/JSON field is also accepted.
     raw_patient_id = request.query_params.get("patient_id") or request.data.get("patient_id")
     if raw_patient_id is None or str(raw_patient_id).strip() == "":
         return Response({"detail": "patient_id is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -1040,12 +1084,15 @@ def _patient_document_upload_response(request, *, files_base: str) -> Response:
     patient = Patient.objects.filter(pk=patient_id).first()
     if not patient:
         return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
-    file = request.FILES.get("file")
+    try:
+        file, original_filename = _patient_document_from_request(request)
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
     if not file:
         return Response({"detail": "No file was uploaded."}, status=status.HTTP_400_BAD_REQUEST)
     label = (request.data.get("label") or "").strip()
     if not label:
-        label = file.name
+        label = original_filename or getattr(file, "name", None) or "Document"
     doc_type = request.data.get("doc_type") or "other"
     valid_types = {k for k, _ in PatientDocument.DOC_TYPES}
     if doc_type not in valid_types:
@@ -1054,7 +1101,7 @@ def _patient_document_upload_response(request, *, files_base: str) -> Response:
         patient=patient,
         uploaded_by=request.user,
         file=file,
-        original_filename=file.name,
+        original_filename=original_filename or getattr(file, "name", "upload.bin"),
         label=label,
         doc_type=doc_type,
     )
@@ -5180,10 +5227,10 @@ class AdminViewSet(viewsets.ViewSet):
         detail=False,
         methods=["post"],
         url_path="patient_document_upload",
-        parser_classes=[MultiPartParser, FormParser],
+        parser_classes=[JSONParser, MultiPartParser, FormParser],
     )
     def patient_document_upload(self, request):
-        """Upload a new document to a patient's record (multipart/form-data)."""
+        """Upload a patient document (JSON base64 preferred; multipart also accepted)."""
         return _patient_document_upload_response(request, files_base="/admin")
 
     @action(detail=False, methods=["delete"], url_path="patient_document_delete")
@@ -5545,10 +5592,10 @@ class DoctorViewSet(viewsets.ViewSet):
         detail=False,
         methods=["post"],
         url_path="patient_document_upload",
-        parser_classes=[MultiPartParser, FormParser],
+        parser_classes=[JSONParser, MultiPartParser, FormParser],
     )
     def patient_document_upload(self, request):
-        """Upload a new document to a patient's record (multipart/form-data)."""
+        """Upload a patient document (JSON base64 preferred; multipart also accepted)."""
         return _patient_document_upload_response(request, files_base="/doctor")
 
     @action(detail=False, methods=["delete"], url_path="patient_document_delete")
