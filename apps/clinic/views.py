@@ -1029,9 +1029,14 @@ def _serialize_patient_document(doc: "PatientDocument", request, *, files_base: 
 
 def _patient_document_upload_response(request, *, files_base: str) -> Response:
     """Shared upload handler for admin and doctor portals."""
-    patient_id = request.data.get("patient_id")
-    if not patient_id:
+    # Prefer query string (reliable across proxies); FormData field is also accepted.
+    raw_patient_id = request.query_params.get("patient_id") or request.data.get("patient_id")
+    if raw_patient_id is None or str(raw_patient_id).strip() == "":
         return Response({"detail": "patient_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        patient_id = int(str(raw_patient_id).strip())
+    except (TypeError, ValueError):
+        return Response({"detail": "Invalid patient_id."}, status=status.HTTP_400_BAD_REQUEST)
     patient = Patient.objects.filter(pk=patient_id).first()
     if not patient:
         return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
