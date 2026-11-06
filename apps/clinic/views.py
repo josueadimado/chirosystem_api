@@ -3751,8 +3751,13 @@ class InvoiceViewSet(viewsets.ModelViewSet):
             if due <= 0:
                 return Response({"detail": "No remaining amount due on this invoice."}, status=status.HTTP_400_BAD_REQUEST)
             if available <= 0:
+                from .square_payment import patient_credit_ui_fields
+
                 return Response(
-                    {"detail": "No patient credit available to apply.", "patient_credit_balance": str(patient.credit_balance)},
+                    {
+                        "detail": "No patient credit available to apply.",
+                        **patient_credit_ui_fields(patient),
+                    },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
@@ -3798,13 +3803,15 @@ class InvoiceViewSet(viewsets.ModelViewSet):
             else:
                 inv.save(update_fields=["credit_applied_total", "total_amount", "updated_at"])
 
+        from .square_payment import patient_credit_ui_fields
+
         return Response(
             {
                 "invoice_id": inv.id,
                 "invoice_number": inv.invoice_number,
                 "applied_credit": str(applied),
                 "remaining_due": str(inv.total_amount),
-                "patient_credit_balance": str(patient.credit_balance),
+                **patient_credit_ui_fields(patient),
                 "invoice_status": inv.status,
                 "already_paid": paid_now,
             }
@@ -6185,12 +6192,14 @@ class DoctorViewSet(viewsets.ViewSet):
             appt.refresh_from_db()
 
         if inv.status == Invoice.Status.PAID:
+            from .square_payment import patient_credit_ui_fields
+
             return Response(
                 {
                     "invoice_id": inv.id,
                     "invoice_number": inv.invoice_number,
                     "total_amount": str(inv.total_amount),
-                    "patient_credit_balance": str(inv.patient.credit_balance),
+                    **patient_credit_ui_fields(inv.patient),
                     "already_paid": True,
                     "payment": {
                         "status": "charged_saved_card",

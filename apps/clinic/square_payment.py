@@ -1566,17 +1566,69 @@ def get_frontend_base_url() -> str:
     return str(base).rstrip("/")
 
 
+def patient_credit_notes_for_ui(patient: Patient, *, limit: int = 8) -> list[dict]:
+    """
+    Recent credit top-up notes for staff screens (payment banner, etc.).
+
+    Additive helper only — older clients ignore the field. Returns [] when the
+    wallet balance is zero or no useful notes exist. Internal Square markers
+    (square_payment:…) become a short friendly label.
+    """
+    try:
+        balance = Decimal(str(getattr(patient, "credit_balance", None) or "0"))
+    except Exception:
+        balance = Decimal("0")
+    if balance <= 0:
+        return []
+
+    rows = (
+        PatientCreditTransaction.objects.filter(
+            patient_id=patient.pk,
+            kind=PatientCreditTransaction.Kind.TOP_UP,
+        )
+        .order_by("-created_at")[:40]
+    )
+    out: list[dict] = []
+    for tx in rows:
+        raw = (tx.note or "").strip()
+        if not raw:
+            continue
+        if raw.startswith("square_payment:"):
+            display = "Card reader payment"
+        else:
+            display = raw
+        out.append(
+            {
+                "amount": str(tx.amount),
+                "note": display,
+                "created_at": tx.created_at.isoformat() if getattr(tx, "created_at", None) else None,
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
+def patient_credit_ui_fields(patient: Patient) -> dict:
+    """Balance + optional notes — safe to merge into any payment/credit response."""
+    return {
+        "patient_credit_balance": str(patient.credit_balance),
+        "patient_credit_notes": patient_credit_notes_for_ui(patient),
+    }
+
+
 def build_invoice_payment_followup_dict(invoice: Invoice, *, try_saved_card: bool) -> dict:
     from .invoice_collection import invoice_payment_summary
     from .square_helpers import square_configured
 
     invoice.refresh_from_db()
+    credit_fields = patient_credit_ui_fields(invoice.patient)
     if invoice.status == Invoice.Status.PAID:
         return {
             "invoice_id": invoice.id,
             "invoice_number": invoice.invoice_number,
             "total_amount": str(invoice.total_amount),
-            "patient_credit_balance": str(invoice.patient.credit_balance),
+            **credit_fields,
             "already_paid": True,
             "payment": {
                 "status": "charged_saved_card",
@@ -1601,7 +1653,7 @@ def build_invoice_payment_followup_dict(invoice: Invoice, *, try_saved_card: boo
             "invoice_id": invoice.id,
             "invoice_number": invoice.invoice_number,
             "total_amount": str(invoice.total_amount),
-            "patient_credit_balance": str(invoice.patient.credit_balance),
+            **credit_fields,
             "already_paid": False,
             "payment": payment,
         }
@@ -1618,7 +1670,7 @@ def build_invoice_payment_followup_dict(invoice: Invoice, *, try_saved_card: boo
                 "invoice_id": invoice.id,
                 "invoice_number": invoice.invoice_number,
                 "total_amount": str(invoice.total_amount),
-                "patient_credit_balance": str(invoice.patient.credit_balance),
+                **patient_credit_ui_fields(invoice.patient),
                 "already_paid": True,
                 "payment": {
                     "status": "charged_saved_card",
@@ -1642,7 +1694,7 @@ def build_invoice_payment_followup_dict(invoice: Invoice, *, try_saved_card: boo
         "invoice_id": invoice.id,
         "invoice_number": invoice.invoice_number,
         "total_amount": str(invoice.total_amount),
-        "patient_credit_balance": str(invoice.patient.credit_balance),
+        **credit_fields,
         "already_paid": False,
         "payment": payment,
         **invoice_payment_summary(invoice),
