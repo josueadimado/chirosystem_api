@@ -302,6 +302,7 @@ class ServiceSerializer(serializers.ModelSerializer):
             "billing_code",
             "is_active",
             "show_in_public_booking",
+            "calendar_highlight",
             "visible_to_chiropractic_staff",
             "visible_to_massage_staff",
             "service_type",
@@ -552,6 +553,7 @@ class AppointmentListSerializer(serializers.ModelSerializer):
     provider_name = serializers.SerializerMethodField()
     service_name = serializers.SerializerMethodField()
     service_type = serializers.SerializerMethodField()
+    calendar_highlight = serializers.SerializerMethodField()
     start_time_display = serializers.SerializerMethodField()
     end_time_display = serializers.SerializerMethodField()
     reason_for_visit = serializers.SerializerMethodField()
@@ -582,6 +584,7 @@ class AppointmentListSerializer(serializers.ModelSerializer):
             "booked_service",
             "service_name",
             "service_type",
+            "calendar_highlight",
             "appointment_date",
             "start_time",
             "end_time",
@@ -611,6 +614,10 @@ class AppointmentListSerializer(serializers.ModelSerializer):
 
     def get_service_type(self, obj):
         return obj.booked_service.service_type if obj.booked_service else ""
+
+    def get_calendar_highlight(self, obj):
+        svc = obj.booked_service
+        return bool(svc and getattr(svc, "calendar_highlight", False))
 
     def get_start_time_display(self, obj):
         return obj.start_time.strftime("%I:%M %p")
@@ -797,10 +804,10 @@ class DeskRecurringBookingPreviewSerializer(serializers.Serializer):
     occurrence_count = serializers.IntegerField(min_value=2, max_value=12, default=4)
 
     def validate(self, attrs):
+        # Desk may book staff-only visit types (hidden from public online booking).
         svc = Service.objects.filter(
             pk=attrs["service_id"],
             is_active=True,
-            show_in_public_booking=True,
         ).first()
         if not svc:
             raise serializers.ValidationError(

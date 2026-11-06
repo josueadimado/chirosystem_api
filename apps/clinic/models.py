@@ -471,6 +471,11 @@ class Service(TimeStampedModel):
     is_active = models.BooleanField(default=True)
     # If False: still billable in the doctor visit UI, but hidden from public online booking.
     show_in_public_booking = models.BooleanField(default=True)
+    # Staff-only visit types (e.g. care-plan / 2nd visit) can use a distinct calendar color.
+    calendar_highlight = models.BooleanField(
+        default=False,
+        help_text="If True, admin/doctor calendars show this visit type in a distinct teal color.",
+    )
     # In-room bill picker: which provider roles may add this line (owner/staff still see all in admin).
     visible_to_chiropractic_staff = models.BooleanField(
         default=True,

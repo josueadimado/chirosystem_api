@@ -73,15 +73,30 @@ def generate_recurring_dates(
     return out
 
 
-def _resolve_service_and_provider(data: dict) -> tuple[Service | None, Provider | None, str | None]:
+def _resolve_service_and_provider(
+    data: dict,
+    *,
+    for_desk: bool = False,
+) -> tuple[Service | None, Provider | None, str | None]:
     if not data.get("service_id"):
         return None, None, "service_id is required."
 
     try:
         service = Service.objects.get(pk=data["service_id"])
     except Service.DoesNotExist:
-        return None, None, "That service is not available for online booking."
-    if not service.is_active or not service.show_in_public_booking:
+        return None, None, (
+            "That service is not available for booking."
+            if for_desk
+            else "That service is not available for online booking."
+        )
+    if not service.is_active:
+        return None, None, (
+            "That service is not available for booking."
+            if for_desk
+            else "That service is not available for online booking."
+        )
+    # Public online booking never offers staff-only visit types (e.g. care plan / 2nd visit).
+    if not for_desk and not service.show_in_public_booking:
         return None, None, "That service is not available for online booking."
 
     if not data.get("provider_id"):
@@ -429,7 +444,7 @@ def preview_recurring_slots_desk(data: dict) -> dict:
     if not patient:
         return {"ok": False, "detail": "Patient not found."}
 
-    service, provider, err = _resolve_service_and_provider(data)
+    service, provider, err = _resolve_service_and_provider(data, for_desk=True)
     if err:
         return {"ok": False, "detail": err}
 
@@ -530,7 +545,7 @@ def book_recurring_from_desk(data: dict) -> tuple[list[Appointment] | None, str 
     if not patient:
         return None, "Patient not found."
 
-    service, provider, err = _resolve_service_and_provider(data)
+    service, provider, err = _resolve_service_and_provider(data, for_desk=True)
     if err:
         return None, err
 

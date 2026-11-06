@@ -1342,6 +1342,69 @@ class BookingOptionsViewSet(viewsets.ViewSet):
     def list(self, request):
         from apps.clinic.cache_utils import CACHE_KEY_BOOKING_OPTIONS, TTL_BOOKING
 
+        desk = (request.query_params.get("desk") or "").strip().lower() in ("1", "true", "yes")
+        if desk:
+            if not request.user.is_authenticated or getattr(request.user, "role", None) not in (
+                "owner_admin",
+                "staff",
+                "doctor",
+            ):
+                return Response(
+                    {"detail": "Desk booking options require staff sign-in."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            # Include staff-only visit types (show_in_public_booking=False) that still have providers.
+            # Bill-only CPT rows have no providers and stay out of this list.
+            bookable_qs = (
+                Service.objects.filter(is_active=True)
+                .annotate(
+                    _active_provider_count=Count(
+                        "providers",
+                        filter=Q(providers__active=True),
+                        distinct=True,
+                    ),
+                    _book_order=Case(
+                        When(service_type=Service.ServiceType.CHIROPRACTIC, then=Value(0)),
+                        When(service_type=Service.ServiceType.MASSAGE, then=Value(1)),
+                        default=Value(2),
+                        output_field=IntegerField(),
+                    ),
+                )
+                .filter(_active_provider_count__gt=0)
+                .order_by("_book_order", "name")
+            )
+            bookable_list = list(
+                bookable_qs.prefetch_related(
+                    Prefetch(
+                        "providers",
+                        queryset=Provider.objects.filter(active=True).select_related("user"),
+                        to_attr="_active_providers",
+                    )
+                )
+            )
+            services = [
+                {
+                    "id": s.id,
+                    "name": s.name,
+                    "description": s.description or "",
+                    "duration_minutes": s.duration_minutes,
+                    "price": str(s.price),
+                    "service_type": s.service_type,
+                    "is_new_client_intake": s.is_new_client_intake,
+                    "allow_provider_choice": s.service_type == "massage",
+                    "show_in_public_booking": bool(s.show_in_public_booking),
+                    "calendar_highlight": bool(getattr(s, "calendar_highlight", False)),
+                    "staff_only": not bool(s.show_in_public_booking),
+                }
+                for s in bookable_list
+            ]
+            providers_by_service = {
+                svc.id: [{"id": p.id, "provider_name": str(p)} for p in svc._active_providers]
+                for svc in bookable_list
+            }
+            apply_intake_chiropractic_provider_fallback(bookable_list, providers_by_service)
+            return Response({"services": services, "providers_by_service": providers_by_service})
+
         cached = cache.get(CACHE_KEY_BOOKING_OPTIONS)
         if cached is not None:
             return Response(cached)
@@ -1444,39 +1507,6 @@ class BookingOptionsViewSet(viewsets.ViewSet):
             ):
                 reschedule_self_service = True
 
-        if reschedule_self_service and ex_appt_for_reschedule:
-            service = ex_appt_for_reschedule.booked_service
-            if not service or not service.is_active:
-                return Response({"detail": "Invalid provider or service."}, status=status.HTTP_400_BAD_REQUEST)
-            try:
-                if int(service_id) != service.pk:
-                    return Response(
-                        {"detail": "That visit does not match this service."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-            except (TypeError, ValueError):
-                return Response({"detail": "Invalid service_id."}, status=status.HTTP_400_BAD_REQUEST)
-        else:
-            service = Service.objects.filter(pk=service_id, is_active=True, show_in_public_booking=True).first()
-            if not service:
-                return Response({"detail": "Invalid provider or service."}, status=status.HTTP_400_BAD_REQUEST)
-            if not provider_can_offer_service_online(provider, service):
-                return Response(
-                    {"detail": "Provider does not offer this service."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-        from datetime import time as time_cls
-
-        from .online_booking_hours import (
-            CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES,
-            desk_booking_last_slot_start_minute,
-            effective_desk_booking_window_minutes,
-            effective_public_booking_window_minutes,
-            public_booking_last_slot_start_minute,
-            public_booking_treatment_duration_minutes,
-        )
-
         desk_mode = (request.query_params.get("desk") or "").strip().lower() in ("1", "true", "yes")
         double_book_mode = (request.query_params.get("double_book") or "").strip().lower() in (
             "1",
@@ -1502,6 +1532,47 @@ class BookingOptionsViewSet(viewsets.ViewSet):
                     {"detail": "Desk availability requires staff sign-in."},
                     status=status.HTTP_403_FORBIDDEN,
                 )
+
+        if reschedule_self_service and ex_appt_for_reschedule:
+            service = ex_appt_for_reschedule.booked_service
+            if not service or not service.is_active:
+                return Response({"detail": "Invalid provider or service."}, status=status.HTTP_400_BAD_REQUEST)
+            try:
+                if int(service_id) != service.pk:
+                    return Response(
+                        {"detail": "That visit does not match this service."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            except (TypeError, ValueError):
+                return Response({"detail": "Invalid service_id."}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            # Desk may book staff-only visit types (e.g. care plan / 2nd visit).
+            if desk_mode:
+                service = Service.objects.filter(pk=service_id, is_active=True).first()
+            else:
+                service = Service.objects.filter(
+                    pk=service_id, is_active=True, show_in_public_booking=True
+                ).first()
+            if not service:
+                return Response({"detail": "Invalid provider or service."}, status=status.HTTP_400_BAD_REQUEST)
+            if not provider_can_offer_service_online(provider, service):
+                return Response(
+                    {"detail": "Provider does not offer this service."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        from datetime import time as time_cls
+
+        from .online_booking_hours import (
+            CHIRO_PUBLIC_BOOKING_SLOT_STEP_MINUTES,
+            desk_booking_last_slot_start_minute,
+            effective_desk_booking_window_minutes,
+            effective_public_booking_window_minutes,
+            public_booking_last_slot_start_minute,
+            public_booking_treatment_duration_minutes,
+        )
+
+        if desk_mode:
             win = effective_desk_booking_window_minutes(appt_date, service)
         else:
             win = effective_public_booking_window_minutes(appt_date, service)
@@ -3343,7 +3414,8 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         if not start_t:
             return Response({"detail": "Invalid or missing start_time."}, status=status.HTTP_400_BAD_REQUEST)
 
-        service = Service.objects.filter(pk=service_id, is_active=True, show_in_public_booking=True).first()
+        # Staff may book staff-only visit types (care plan / 2nd visit) that are hidden from public booking.
+        service = Service.objects.filter(pk=service_id, is_active=True).first()
         provider = Provider.objects.filter(pk=provider_id, active=True).first()
         if not service or not provider:
             return Response({"detail": "Invalid service or provider."}, status=status.HTTP_400_BAD_REQUEST)
@@ -3492,7 +3564,8 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         if not patient:
             return Response({"detail": "Patient not found."}, status=status.HTTP_400_BAD_REQUEST)
 
-        service = Service.objects.filter(pk=service_id, is_active=True, show_in_public_booking=True).first()
+        # Staff may book staff-only visit types (care plan / 2nd visit) that are hidden from public booking.
+        service = Service.objects.filter(pk=service_id, is_active=True).first()
         provider = Provider.objects.filter(pk=provider_id, active=True).first()
         if not service or not provider:
             return Response({"detail": "Invalid service or provider."}, status=status.HTTP_400_BAD_REQUEST)

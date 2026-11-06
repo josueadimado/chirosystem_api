@@ -149,10 +149,34 @@ class Command(BaseCommand):
                     "price": price,
                     "is_active": True,
                     "show_in_public_booking": True,
+                    "calendar_highlight": False,
                     "service_type": "chiropractic",
                 },
             )
             svc.providers.set([chiropractor])
+
+        # Staff-only: 30-min second visit for care/treatment plan review + treatment.
+        # Hidden from the public patient booking site; visible on admin/doctor desk booking.
+        care_plan, _ = Service.objects.update_or_create(
+            name="Care plan visit (2nd visit)",
+            defaults={
+                "description": (
+                    "Staff-only 30-minute visit for a new patient's second appointment — "
+                    "review the care/treatment plan and treat. Not offered on the public booking site."
+                ),
+                "billing_code": "98941",
+                "duration_minutes": 30,
+                "price": "55.00",
+                "is_active": True,
+                "show_in_public_booking": False,
+                "calendar_highlight": True,
+                "service_type": "chiropractic",
+                "visible_to_chiropractic_staff": True,
+                "visible_to_massage_staff": False,
+                "is_new_client_intake": False,
+            },
+        )
+        care_plan.providers.set([chiropractor])
 
         for name, billing_code, duration, price in massage_services:
             svc, _ = Service.objects.update_or_create(
@@ -164,6 +188,7 @@ class Command(BaseCommand):
                     "price": price,
                     "is_active": True,
                     "show_in_public_booking": True,
+                    "calendar_highlight": False,
                     "service_type": "massage",
                 },
             )
