@@ -360,18 +360,30 @@ def create_appointment_from_public_booking(validated: dict) -> tuple[Appointment
         )
 
     def queue_after_book():
-        from apps.clinic.patient_appointment_notifications import queue_patient_booking_confirmations
+        try:
+            from apps.clinic.patient_appointment_notifications import queue_patient_booking_confirmations
 
-        queue_patient_booking_confirmations(
-            appointment.id,
-            include_provider_notify=True,
-            include_gcal=True,
-        )
+            queue_patient_booking_confirmations(
+                appointment.id,
+                include_provider_notify=True,
+                include_gcal=True,
+            )
+        except Exception:
+            logger.exception(
+                "Post-commit booking notifications failed appt=%s (booking still saved)",
+                appointment.id,
+            )
 
     def queue_in_app():
-        from apps.clinic.in_app_notify import create_new_booking_in_app_notification
+        try:
+            from apps.clinic.in_app_notify import create_new_booking_in_app_notification
 
-        create_new_booking_in_app_notification(appointment.id)
+            create_new_booking_in_app_notification(appointment.id)
+        except Exception:
+            logger.exception(
+                "Post-commit in-app notify failed appt=%s (booking still saved)",
+                appointment.id,
+            )
 
     transaction.on_commit(queue_after_book)
     transaction.on_commit(queue_in_app)
@@ -508,32 +520,51 @@ def reschedule_appointment_public(
         old_time_iso = old["start_time"].isoformat()
 
     def queue_calendar():
-        from apps.notifications.tasks import sync_appointment_google_calendar_task
+        # Never let Celery/broker outages turn a successful reschedule into HTTP 500.
+        try:
+            from apps.notifications.tasks import sync_appointment_google_calendar_task
 
-        sync_appointment_google_calendar_task.delay(aid)
+            sync_appointment_google_calendar_task.delay(aid)
+        except Exception:
+            logger.exception(
+                "Post-commit calendar queue failed after public reschedule appt=%s (reschedule still saved)",
+                aid,
+            )
 
     def queue_doctor_alerts():
-        from apps.notifications.tasks import notify_provider_schedule_change_task
+        try:
+            from apps.notifications.tasks import notify_provider_schedule_change_task
 
-        if change_lines:
-            notify_provider_schedule_change_task.delay(
+            if change_lines:
+                notify_provider_schedule_change_task.delay(
+                    aid,
+                    change_lines,
+                    old_provider_id=old_provider_id,
+                    old_date_iso=old_date_iso,
+                    old_time_iso=old_time_iso,
+                )
+        except Exception:
+            logger.exception(
+                "Post-commit doctor alert queue failed after public reschedule appt=%s",
                 aid,
-                change_lines,
-                old_provider_id=old_provider_id,
-                old_date_iso=old_date_iso,
-                old_time_iso=old_time_iso,
             )
 
     def queue_in_app():
-        from apps.clinic.in_app_notify import create_schedule_change_in_app_notifications
+        try:
+            from apps.clinic.in_app_notify import create_schedule_change_in_app_notifications
 
-        if change_lines:
-            create_schedule_change_in_app_notifications(
+            if change_lines:
+                create_schedule_change_in_app_notifications(
+                    aid,
+                    change_lines,
+                    old_provider_id,
+                    old_date_iso,
+                    old_time_iso,
+                )
+        except Exception:
+            logger.exception(
+                "Post-commit in-app notify failed after public reschedule appt=%s",
                 aid,
-                change_lines,
-                old_provider_id,
-                old_date_iso,
-                old_time_iso,
             )
 
     transaction.on_commit(queue_calendar)
@@ -541,9 +572,15 @@ def reschedule_appointment_public(
     transaction.on_commit(queue_in_app)
 
     def queue_patient_confirmations():
-        from apps.clinic.patient_appointment_notifications import queue_patient_reschedule_confirmations
+        try:
+            from apps.clinic.patient_appointment_notifications import queue_patient_reschedule_confirmations
 
-        queue_patient_reschedule_confirmations(aid, staff_initiated=False)
+            queue_patient_reschedule_confirmations(aid, staff_initiated=False)
+        except Exception:
+            logger.exception(
+                "Post-commit patient reschedule confirmations failed appt=%s",
+                aid,
+            )
 
     transaction.on_commit(queue_patient_confirmations)
 
